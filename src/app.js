@@ -16,8 +16,13 @@ const feeCategoriesRouter = require('./routes/feeCategories');
 const app = express();
 
 app.use(express.json());
+app.options('*', cors());
+
 app.use(cors({
-  origin: process.env.ORIGIN || 'http://localhost:3000',
+  origin: [
+    "https://sis-snowy.vercel.app",
+    process.env.ORIGIN || "http://localhost:3000"
+  ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
