@@ -44,4 +44,4 @@ app.use('/settings', settingsRouter);
 app.use('/fee-categories', feeCategoriesRouter);
 app.use('/auth', authRouter);
 
-module.exports = app;
+module.exports = (req, res) => app(req, res);
