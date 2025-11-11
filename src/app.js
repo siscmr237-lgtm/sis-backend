@@ -18,23 +18,25 @@ const app = express();
 app.use(express.json());
 app.use(cors({
   origin: process.env.ORIGIN || 'http://localhost:3000',
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 }));
 
-app.get('/api/health', (_req, res) => {
+app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use('/api/students', studentsRouter);
-app.use('/api/staff', staffRouter);
-app.use('/api/fees', feesRouter);
-app.use('/api/expenses', expensesRouter);
-app.use('/api/attendance', attendanceRouter);
-app.use('/api/work-records', workRecordsRouter);
-app.use('/api/report-cards', reportCardsRouter);
-app.use('/api/timetable', timetableRouter);
-app.use('/api/settings', settingsRouter);
-app.use('/api/fee-categories', feeCategoriesRouter);
-app.use('/api/auth', authRouter);
+app.use('/students', studentsRouter);
+app.use('/staff', staffRouter);
+app.use('/fees', feesRouter);
+app.use('/expenses', expensesRouter);
+app.use('/attendance', attendanceRouter);
+app.use('/work-records', workRecordsRouter);
+app.use('/report-cards', reportCardsRouter);
+app.use('/timetable', timetableRouter);
+app.use('/settings', settingsRouter);
+app.use('/fee-categories', feeCategoriesRouter);
+app.use('/auth', authRouter);
 
 module.exports = app;
