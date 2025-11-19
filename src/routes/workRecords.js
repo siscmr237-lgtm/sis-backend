@@ -6,11 +6,12 @@ const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 router.get('/', async (req, res) => {
+  const schoolId = req.user.schoolId;
   const { staffId, date } = req.query;
-  let where = {};
+  let where = { schoolId };
   if (staffId) {
-    const staff = await prisma.staff.findFirst({ where: { OR: [{ code: String(staffId) }, { id: String(staffId) }] } });
-    where = { ...where, staffId: staff ? staff.id : '__none__' };
+    const staff = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] } });
+    where = { ...where, staffId: staff ? staff.id : -1 }; // Use -1 to find no records if staff not found
   }
   if (date) where = { ...where, date: new Date(String(date)) };
   const rows = await prisma.workRecord.findMany({ where, orderBy: { date: 'desc' } });
@@ -18,46 +19,50 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/:id', async (req, res) => {
-  const row = await prisma.workRecord.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const row = await prisma.workRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.json(withIdAsCode(row));
 });
 
 router.post('/', async (req, res) => {
-  const b = req.body || {};
+  const schoolId = req.user.schoolId;
+  const body = req.body || {};
   try {
-    const staff = await prisma.staff.findFirst({ where: { OR: [{ code: b.staffId }, { id: b.staffId }] } });
+    const staff = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: body.staffId }, { id: parseInt(body.staffId) || 0 }] } });
     if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
     const created = await prisma.workRecord.create({
       data: {
-        code: b.id || genCode('WR'),
+        code: body.id || genCode('WR'),
         staffId: staff.id,
-        staffName: b.staffName,
-        date: b.date ? new Date(b.date) : new Date(),
-        subject: b.subject,
-        class: b.class,
-        topic: b.topic,
-        objectives: b.objectives,
-        activities: b.activities,
-        evaluation: b.evaluation,
-        remarks: b.remarks ?? null,
+        staffName: body.staffName,
+        date: body.date ? new Date(body.date) : new Date(),
+        subject: body.subject,
+        class: body.class,
+        topic: body.topic,
+        objectives: body.objectives,
+        activities: body.activities,
+        evaluation: body.evaluation,
+        remarks: body.remarks ?? null,
+        schoolId,
       },
     });
     res.status(201).json(withIdAsCode(created));
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
 router.put('/:id', async (req, res) => {
-  const found = await prisma.workRecord.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const found = await prisma.workRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   try {
     const updated = await prisma.workRecord.update({
       where: { id: found.id },
       data: {
         ...req.body,
-        date: req.body?.date ? new Date(req.body.date) : undefined,
+        date: req.body.date ? new Date(req.body.date) : undefined,
       },
     });
     res.json(withIdAsCode(updated));
@@ -67,7 +72,8 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  const found = await prisma.workRecord.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const found = await prisma.workRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   await prisma.workRecord.delete({ where: { id: found.id } });
   res.json(withIdAsCode(found));

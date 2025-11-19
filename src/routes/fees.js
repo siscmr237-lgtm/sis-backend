@@ -6,45 +6,49 @@ const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 router.get('/', async (req, res) => {
+  const schoolId = req.user.schoolId;
   const { studentId } = req.query;
-  let where = {};
+  let where = { schoolId };
   if (studentId) {
-    const student = await prisma.student.findFirst({ where: { OR: [{ code: String(studentId) }, { id: String(studentId) }] } });
-    where = student ? { studentId: student.id } : { studentId: '__none__' };
+    const student = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] } });
+    where = { ...where, studentId: student ? student.id : -1 }; // Use -1 to find no records if student not found
   }
   const rows = await prisma.fee.findMany({ where, orderBy: { code: 'asc' } });
   res.json(mapWithIdAsCode(rows));
 });
 
 router.get('/:id', async (req, res) => {
-  const row = await prisma.fee.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const row = await prisma.fee.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.json(withIdAsCode(row));
 });
 
 router.post('/', async (req, res) => {
-  const b = req.body || {};
+  const schoolId = req.user.schoolId;
+  const body = req.body || {};
   try {
-    const student = await prisma.student.findFirst({ where: { OR: [{ code: b.studentId }, { id: b.studentId }] } });
+    const student = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: body.studentId }, { id: parseInt(body.studentId) || 0 }] } });
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
     const created = await prisma.fee.create({
       data: {
-        code: b.id || genCode('FEE'),
+        code: body.id || genCode('FEE'),
         studentId: student.id,
-        studentName: b.studentName,
-        class: b.class,
-        term: b.term,
-        academicYear: b.academicYear,
-        tuitionFee: Number(b.tuitionFee ?? 0),
-        registrationFee: Number(b.registrationFee ?? 0),
-        uniformFee: Number(b.uniformFee ?? 0),
-        booksFee: Number(b.booksFee ?? 0),
-        otherFees: Number(b.otherFees ?? 0),
-        totalAmount: Number(b.totalAmount ?? 0),
-        amountPaid: Number(b.amountPaid ?? 0),
-        balance: Number(b.balance ?? 0),
-        paymentDate: b.paymentDate ? new Date(b.paymentDate) : new Date(),
-        paymentMethod: b.paymentMethod,
+        studentName: body.studentName,
+        class: body.class,
+        term: body.term,
+        academicYear: body.academicYear,
+        tuitionFee: Number(body.tuitionFee ?? 0),
+        registrationFee: Number(body.registrationFee ?? 0),
+        uniformFee: Number(body.uniformFee ?? 0),
+        booksFee: Number(body.booksFee ?? 0),
+        otherFees: Number(body.otherFees ?? 0),
+        totalAmount: Number(body.totalAmount ?? 0),
+        amountPaid: Number(body.amountPaid ?? 0),
+        balance: Number(body.balance ?? 0),
+        paymentDate: body.paymentDate ? new Date(body.paymentDate) : new Date(),
+        paymentMethod: body.paymentMethod,
+        schoolId,
       },
     });
     res.status(201).json(withIdAsCode(created));
@@ -54,7 +58,8 @@ router.post('/', async (req, res) => {
 });
 
 router.put('/:id', async (req, res) => {
-  const found = await prisma.fee.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const found = await prisma.fee.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   try {
     const updated = await prisma.fee.update({
@@ -79,7 +84,8 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  const found = await prisma.fee.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const found = await prisma.fee.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   await prisma.fee.delete({ where: { id: found.id } });
   res.json(withIdAsCode(found));
