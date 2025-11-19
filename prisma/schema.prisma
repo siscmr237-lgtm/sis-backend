@@ -10,8 +10,10 @@ datasource db {
 }
 
 model Student {
-  id             String   @id @default(cuid())
+  id             Int      @id @default(autoincrement())
   code           String   @unique @db.VarChar(16) // e.g., STU001
+  school         School   @relation(fields: [schoolId], references: [id])
+  schoolId       Int
   firstName      String
   lastName       String
   dateOfBirth    DateTime
@@ -25,72 +27,82 @@ model Student {
 }
 
 model Staff {
-  id       String  @id @default(cuid())
-  code     String  @unique @db.VarChar(16) // e.g., STF001
-  firstName String
-  lastName  String
-  role      String
-  phone     String
-  email     String @unique
-  hireDate  DateTime
-  salary    Int
+  id          Int          @id @default(autoincrement())
+  code        String       @unique @db.VarChar(16) // e.g., STF001
+  school      School       @relation(fields: [schoolId], references: [id])
+  schoolId    Int
+  firstName   String
+  lastName    String
+  role        String
+  phone       String
+  email       String       @unique
+  hireDate    DateTime
+  salary      Int
   workRecords WorkRecord[]
 }
 
 model Fee {
-  id            String  @id @default(cuid())
-  code          String  @unique @db.VarChar(16) // e.g., FEE001
-  student       Student @relation(fields: [studentId], references: [id])
-  studentId     String
-  studentName   String
-  class         String
-  term          String
-  academicYear  String
-  tuitionFee    Int
+  id              Int      @id @default(autoincrement())
+  code            String   @unique @db.VarChar(16) // e.g., FEE001
+  student         Student  @relation(fields: [studentId], references: [id])
+  school          School   @relation(fields: [schoolId], references: [id])
+  schoolId        Int
+  studentId       Int
+  studentName     String
+  class           String
+  term            String
+  academicYear    String
+  tuitionFee      Int
   registrationFee Int
-  uniformFee    Int
-  booksFee      Int
-  otherFees     Int
-  totalAmount   Int
-  amountPaid    Int
-  balance       Int
-  paymentDate   DateTime
-  paymentMethod String
+  uniformFee      Int
+  booksFee        Int
+  otherFees       Int
+  totalAmount     Int
+  amountPaid      Int
+  balance         Int
+  paymentDate     DateTime
+  paymentMethod   String
 }
 
 model Expense {
-  id           String @id @default(cuid())
-  code         String @unique @db.VarChar(16) // e.g., EXP001
-  date         DateTime
-  category     String
-  description  String
-  amount       Int
-  payee        String
+  id            Int      @id @default(autoincrement())
+  code          String   @unique @db.VarChar(16) // e.g., EXP001
+  school        School   @relation(fields: [schoolId], references: [id])
+  schoolId      Int
+  date          DateTime
+  category      String
+  description   String
+  amount        Int
+  payee         String
   paymentMethod String
-  invoiceNumber String @unique
+  invoiceNumber String   @unique
 }
 
 model AttendanceRecord {
-  id        String @id @default(cuid())
-  code      String @unique @db.VarChar(16) // e.g., ATT001
-  date      DateTime
-  type      String
-  personId  String
+  id         Int      @id @default(autoincrement())
+  code       String   @unique @db.VarChar(16) // e.g., ATT001
+  school     School   @relation(fields: [schoolId], references: [id])
+  schoolId   Int
+  date       DateTime
+  type       String
+  personId   String
   personName String
-  status    String
-  remarks   String?
+  status     String
+  remarks    String?
 }
 
 model WorkRecord {
-  id        String @id @default(cuid())
-  code      String @unique @db.VarChar(16) // e.g., WR001
-  staff     Staff  @relation(fields: [staffId], references: [id])
-  staffId   String
-  staffName String
-  date      DateTime
-  subject   String
-  class     String
-  topic     String
+  id         Int      @id @default(autoincrement())
+  code       String   @unique @db.VarChar(16) // e.g., WR001
+  staff      Staff    @relation(fields: [staffId], references: [id])
+  school     School   @relation(fields: [schoolId], references: [id])
+  schoolId   Int
+  staffId    Int
+  staffName  String
+  date       DateTime
+  subject    String
+  class      String
+  topic      String
   objectives String
   activities String
   evaluation String
@@ -98,54 +110,74 @@ model WorkRecord {
 }
 
 model ReportCard {
-  id           String @id @default(cuid())
-  code         String @unique @db.VarChar(16) // e.g., RC001
-  studentId    String
-  studentName  String
-  class        String
-  term         String
-  academicYear String
-  subjects     Json
-  averageScore Int
-  position     Int
-  totalStudents Int
-  attendance   Int
+  id                 Int    @id @default(autoincrement())
+  code               String @unique @db.VarChar(16) // e.g., RC001
+  school             School @relation(fields: [schoolId], references: [id])
+  schoolId           Int
+  studentId          String
+  studentName        String
+  class              String
+  term               String
+  academicYear       String
+  subjects           Json
+  averageScore       Int
+  position           Int
+  totalStudents      Int
+  attendance         Int
   headTeacherComment String
 }
 
 model TimetableEntry {
-  id      String @id @default(cuid())
-  code    String @unique @db.VarChar(16) // e.g., TT001
-  day     String
-  time    String
-  class   String
-  subject String
-  teacher String
+  id       Int    @id @default(autoincrement())
+  code     String @unique @db.VarChar(16) // e.g., TT001
+  school   School @relation(fields: [schoolId], references: [id])
+  schoolId Int
+  day      String
+  time     String
+  class    String
+  subject  String
+  teacher  String
 }
 
-model SchoolSettings {
-  id             Int    @id @default(1)
-  name           String
-  logo           String
-  academicYear   String
-  currentTerm    String
+model School {
+  id               Int                @id @default(autoincrement())
+  name             String
+  logo             String
+  academicYear     String
+  currentTerm      String
   subjectsPerClass Json
+  adminUser        AdminUser          @relation(fields: [adminUserId], references: [id])
+  adminUserId      Int
+  Student          Student[]
+  Staff            Staff[]
+  Fee              Fee[]
+  Expense          Expense[]
+  AttendanceRecord AttendanceRecord[]
+  WorkRecord       WorkRecord[]
+  ReportCard       ReportCard[]
+  TimetableEntry   TimetableEntry[]
+  FeeCategory      FeeCategory[]
 }
 
 model FeeCategory {
-  id        Int     @id @default(autoincrement())
-  name      String  @unique
-  limit     Int     @default(0)
+  id        Int      @id @default(autoincrement())
+  name      String
+  limit     Int      @default(0)
+  school    School   @relation(fields: [schoolId], references: [id])
+  schoolId  Int
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@unique([name, schoolId])
 }
 
 model AdminUser {
-  id           String   @id @default(cuid())
+  id           Int      @id @default(autoincrement())
   phoneNumber  String   @unique
   passwordHash String
   name         String
   role         String   @default("admin")
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+  School       School[]
 }

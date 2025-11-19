@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const { authMiddleware } = require('./auth');
 
 const studentsRouter = require('./routes/students');
 const staffRouter = require('./routes/staff');
@@ -12,6 +13,7 @@ const timetableRouter = require('./routes/timetable');
 const settingsRouter = require('./routes/settings');
 const authRouter = require('./routes/auth');
 const feeCategoriesRouter = require('./routes/feeCategories');
+const dashboardRouter = require('./routes/dashboard');
 
 const app = express();
 
@@ -32,6 +34,12 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
+// Public routes
+app.use('/auth', authRouter);
+
+// All routes below this line are protected
+app.use(authMiddleware);
+
 app.use('/students', studentsRouter);
 app.use('/staff', staffRouter);
 app.use('/fees', feesRouter);
@@ -42,6 +50,6 @@ app.use('/report-cards', reportCardsRouter);
 app.use('/timetable', timetableRouter);
 app.use('/settings', settingsRouter);
 app.use('/fee-categories', feeCategoriesRouter);
-app.use('/auth', authRouter);
+app.use('/dashboard', dashboardRouter);
 
 module.exports = app;

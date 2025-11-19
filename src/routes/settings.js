@@ -4,20 +4,24 @@ const { prisma } = require('../db/prisma');
 const router = express.Router();
 
 router.get('/', async (_req, res) => {
-  const row = await prisma.schoolSettings.findUnique({ where: { id: 1 } });
-  res.json(row);
+  const schoolId = _req.user.schoolId;
+  const school = await prisma.school.findUnique({ where: { id: schoolId } });
+  if (!school) {
+    return res.status(404).json({ error: 'School settings not found.' });
+  }
+  res.json(school);
 });
 
 router.put('/', async (req, res) => {
+  const schoolId = req.user.schoolId;
   try {
-    const updated = await prisma.schoolSettings.upsert({
-      where: { id: 1 },
-      update: { ...req.body },
-      create: { id: 1, name: '', logo: '', academicYear: '', currentTerm: '', subjectsPerClass: [] },
+    const updated = await prisma.school.update({
+      where: { id: schoolId },
+      data: req.body,
     });
     res.json(updated);
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 

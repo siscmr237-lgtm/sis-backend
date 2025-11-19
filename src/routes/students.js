@@ -7,8 +7,10 @@ const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 router.get('/', async (req, res) => {
+  const schoolId = req.user.schoolId;
   const { q, class: cls } = req.query;
   const where = {
+    schoolId,
     AND: [
       q
         ? {
@@ -27,12 +29,15 @@ router.get('/', async (req, res) => {
 });
 
 router.get('/:id', async (req, res) => {
-  const s = await prisma.student.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const s = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!s) return res.status(404).json({ error: 'Not found' });
   res.json(withIdAsCode(s));
 });
 
 router.post('/', async (req, res) => {
+  console.log(req.user);
+  const schoolId = req.user.schoolId;
   const body = req.body || {};
   try {
     const created = await prisma.student.create({
@@ -47,6 +52,7 @@ router.post('/', async (req, res) => {
         parentPhone: body.parentPhone,
         address: body.address,
         enrollmentDate: body.enrollmentDate ? new Date(body.enrollmentDate) : new Date(),
+        schoolId,
       },
     });
     res.status(201).json(withIdAsCode(created));
@@ -56,8 +62,9 @@ router.post('/', async (req, res) => {
 });
 
 router.put('/:id', async (req, res) => {
-  const where = { OR: [{ code: req.params.id }, { id: req.params.id }] };
-  const found = await prisma.student.findFirst({ where });
+  const schoolId = req.user.schoolId;
+  const where = { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] };
+  const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   try {
     const updated = await prisma.student.update({
@@ -75,7 +82,8 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
-  const found = await prisma.student.findFirst({ where: { OR: [{ code: req.params.id }, { id: req.params.id }] } });
+  const schoolId = req.user.schoolId;
+  const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   await prisma.student.delete({ where: { id: found.id } });
   res.json(withIdAsCode(found));
