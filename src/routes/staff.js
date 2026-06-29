@@ -47,6 +47,7 @@ router.post('/', async (req, res) => {
         email: body.email,
         hireDate: body.hireDate ? new Date(body.hireDate) : new Date(),
         salary: Number(body.salary ?? 0),
+        isTeacher: body.isTeacher ?? false,
         schoolId,
       },
     });

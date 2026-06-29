@@ -14,6 +14,7 @@ const settingsRouter = require('./routes/settings');
 const authRouter = require('./routes/auth');
 const feeCategoriesRouter = require('./routes/feeCategories');
 const dashboardRouter = require('./routes/dashboard');
+const classesRouter = require('./routes/classes');
 
 const app = express();
 
@@ -51,5 +52,6 @@ app.use('/timetable', timetableRouter);
 app.use('/settings', settingsRouter);
 app.use('/fee-categories', feeCategoriesRouter);
 app.use('/dashboard', dashboardRouter);
+app.use('/classes', classesRouter);
 
 module.exports = app;
