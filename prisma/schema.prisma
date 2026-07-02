@@ -157,11 +157,12 @@ model Class {
 }
 
 model Subject {
-  id            Int            @id @default(autoincrement())
-  name          String
-  school        School         @relation(fields: [schoolId], references: [id])
-  schoolId      Int
-  classSubjects ClassSubject[]
+  id              Int                   @id @default(autoincrement())
+  name            String
+  school          School                @relation(fields: [schoolId], references: [id])
+  schoolId        Int
+  classSubjects   ClassSubject[]
+  subjectTeachers ClassSubjectTeacher[]
 
   @@unique([name, schoolId])
 }
@@ -177,14 +178,15 @@ model ClassSubject {
 }
 
 model ClassSubjectTeacher {
-  id      Int    @id @default(autoincrement())
-  class   Class  @relation(fields: [classId], references: [id], onDelete: Cascade)
-  classId Int
-  staff   Staff  @relation(fields: [staffId], references: [id])
-  staffId Int
-  subject String
+  id        Int     @id @default(autoincrement())
+  class     Class   @relation(fields: [classId], references: [id], onDelete: Cascade)
+  classId   Int
+  staff     Staff   @relation(fields: [staffId], references: [id])
+  staffId   Int
+  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  subjectId Int
 
-  @@unique([classId, staffId, subject])
+  @@unique([classId, staffId, subjectId])
 }
 
 model School {

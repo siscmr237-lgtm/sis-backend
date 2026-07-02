@@ -1,6 +1,5 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
-const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -23,14 +22,14 @@ router.get('/', async (req, res) => {
     ],
   };
   const rows = await prisma.staff.findMany({ where, orderBy: { code: 'asc' } });
-  res.json(mapWithIdAsCode(rows));
+  res.json(rows);
 });
 
 router.get('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const s = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json(withIdAsCode(s));
+  res.json(s);
 });
 
 router.post('/', async (req, res) => {
@@ -39,7 +38,7 @@ router.post('/', async (req, res) => {
   try {
     const created = await prisma.staff.create({
       data: {
-        code: body.id || genCode('STF'),
+        code: body.code || genCode('STF'),
         firstName: body.firstName,
         lastName: body.lastName,
         role: body.role,
@@ -51,7 +50,7 @@ router.post('/', async (req, res) => {
         schoolId,
       },
     });
-    res.status(201).json(withIdAsCode(created));
+    res.status(201).json(created);
   } catch (e) {
     // P2002 is the Prisma code for unique constraint violation
     if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
@@ -70,7 +69,7 @@ router.put('/:id', async (req, res) => {
       where: { id: found.id },
       data: req.body,
     });
-    res.json(withIdAsCode(updated));
+    res.json(updated);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -81,7 +80,7 @@ router.delete('/:id', async (req, res) => {
   const found = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
   await prisma.staff.delete({ where: { id: found.id } });
-  res.json(withIdAsCode(found));
+  res.json(found);
 });
 
 module.exports = router;

@@ -9,6 +9,7 @@ const classInclude = {
   subjectTeachers: {
     include: {
       staff: { select: { id: true, code: true, firstName: true, lastName: true } },
+      subject: { select: { id: true, name: true } },
     },
   },
 };
@@ -122,7 +123,10 @@ router.get('/:id/subject-teachers', async (req, res) => {
   if (!cls) return res.status(404).json({ error: 'Class not found' });
   const assignments = await prisma.classSubjectTeacher.findMany({
     where: { classId: cls.id },
-    include: { staff: { select: { id: true, code: true, firstName: true, lastName: true } } },
+    include: {
+      staff: { select: { id: true, code: true, firstName: true, lastName: true } },
+      subject: { select: { id: true, name: true } },
+    },
   });
   res.json(assignments);
 });
@@ -135,18 +139,35 @@ router.post('/:id/subject-teachers', async (req, res) => {
   });
   if (!cls) return res.status(404).json({ error: 'Class not found' });
 
-  const { staffId, subject } = req.body || {};
+  const { staffId, subjectId } = req.body || {};
   if (!staffId) return res.status(400).json({ error: 'staffId is required' });
-  if (!subject) return res.status(400).json({ error: 'subject is required' });
+  if (!subjectId) return res.status(400).json({ error: 'subjectId is required' });
+
+  const asNumStaff = Number(staffId);
+  let resolvedStaffId;
+  if (Number.isFinite(asNumStaff) && Number.isInteger(asNumStaff)) {
+    resolvedStaffId = asNumStaff;
+  } else {
+    const staffMember = await prisma.staff.findFirst({ where: { schoolId, code: String(staffId) } });
+    if (!staffMember) return res.status(400).json({ error: 'staffId references a staff member that does not exist.' });
+    resolvedStaffId = staffMember.id;
+  }
+
+  const classSubject = await prisma.classSubject.findFirst({
+    where: { classId: cls.id, subjectId: Number(subjectId) },
+  });
+  if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
 
   try {
     const created = await prisma.classSubjectTeacher.create({
-      data: { classId: cls.id, staffId: Number(staffId), subject },
-      include: { staff: { select: { id: true, code: true, firstName: true, lastName: true } } },
+      data: { classId: cls.id, staffId: resolvedStaffId, subjectId: Number(subjectId) },
+      include: {
+        staff: { select: { id: true, code: true, firstName: true, lastName: true } },
+        subject: { select: { id: true, name: true } },
+      },
     });
     res.status(201).json(created);
   } catch (e) {
-    // P2002 fires only when this exact teacher+subject combo already exists in this class
     if (e.code === 'P2002') return res.status(409).json({ error: 'This teacher is already assigned to this subject in this class.' });
     if (e.code === 'P2003') return res.status(400).json({ error: 'staffId references a staff member that does not exist.' });
     res.status(500).json({ error: e.message });
@@ -166,16 +187,34 @@ router.put('/:id/subject-teachers/:assignmentId', async (req, res) => {
   });
   if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
 
-  const { staffId, subject } = req.body || {};
+  const { staffId, subjectId } = req.body || {};
   const data = {};
-  if (staffId !== undefined) data.staffId = Number(staffId);
-  if (subject !== undefined) data.subject = subject;
+  if (staffId !== undefined) {
+    const asNumStaff = Number(staffId);
+    if (Number.isFinite(asNumStaff) && Number.isInteger(asNumStaff)) {
+      data.staffId = asNumStaff;
+    } else {
+      const staffMember = await prisma.staff.findFirst({ where: { schoolId, code: String(staffId) } });
+      if (!staffMember) return res.status(400).json({ error: 'staffId references a staff member that does not exist.' });
+      data.staffId = staffMember.id;
+    }
+  }
+  if (subjectId !== undefined) {
+    const classSubject = await prisma.classSubject.findFirst({
+      where: { classId: cls.id, subjectId: Number(subjectId) },
+    });
+    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+    data.subjectId = Number(subjectId);
+  }
 
   try {
     const updated = await prisma.classSubjectTeacher.update({
       where: { id: assignment.id },
       data,
-      include: { staff: { select: { id: true, code: true, firstName: true, lastName: true } } },
+      include: {
+        staff: { select: { id: true, code: true, firstName: true, lastName: true } },
+        subject: { select: { id: true, name: true } },
+      },
     });
     res.json(updated);
   } catch (e) {
