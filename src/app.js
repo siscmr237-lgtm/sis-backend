@@ -16,6 +16,7 @@ const feeCategoriesRouter = require('./routes/feeCategories');
 const dashboardRouter = require('./routes/dashboard');
 const classesRouter = require('./routes/classes');
 const subjectsRouter = require('./routes/subjects');
+const uploadRouter = require('./routes/upload');
 
 const app = express();
 
@@ -55,5 +56,6 @@ app.use('/fee-categories', feeCategoriesRouter);
 app.use('/dashboard', dashboardRouter);
 app.use('/classes', classesRouter);
 app.use('/subjects', subjectsRouter);
+app.use('/upload', uploadRouter);
 
 module.exports = app;
