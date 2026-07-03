@@ -17,6 +17,8 @@ const dashboardRouter = require('./routes/dashboard');
 const classesRouter = require('./routes/classes');
 const subjectsRouter = require('./routes/subjects');
 const uploadRouter = require('./routes/upload');
+const ledgerRouter = require('./routes/ledger');
+const chargeCategoriesRouter = require('./routes/chargeCategories');
 
 const app = express();
 
@@ -57,5 +59,7 @@ app.use('/dashboard', dashboardRouter);
 app.use('/classes', classesRouter);
 app.use('/subjects', subjectsRouter);
 app.use('/upload', uploadRouter);
+app.use('/ledger', ledgerRouter);
+app.use('/charge-categories', chargeCategoriesRouter);
 
 module.exports = app;
