@@ -10,7 +10,7 @@ router.get('/', async (req, res) => {
     const [
       totalStudents,
       totalStaff,
-      feesSummary,
+      ledgerSummary,
       expensesSummary,
       recentExpenses,
     ] = await prisma.$transaction([
@@ -20,10 +20,11 @@ router.get('/', async (req, res) => {
       // 2. Get total staff
       prisma.staff.count({ where: { schoolId } }),
 
-      // 3. Get fees summary (collected and outstanding)
-      prisma.fee.aggregate({
+      // 3. Get ledger summary (charges and payments)
+      prisma.ledgerEntry.groupBy({
+        by: ['type'],
         where: { schoolId },
-        _sum: { amountPaid: true, balance: true },
+        _sum: { amount: true },
       }),
 
       // 4. Get expenses summary
@@ -36,19 +37,24 @@ router.get('/', async (req, res) => {
       prisma.expense.findMany({ where: { schoolId }, orderBy: { date: 'desc' }, take: 3 }),
     ]);
 
-    const totalIncome = feesSummary._sum.amountPaid || 0;
+    let totalCharged = 0;
+    let totalPaid = 0;
+    for (const row of ledgerSummary) {
+      if (row.type === 'CHARGE') totalCharged = row._sum.amount ?? 0;
+      if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
+    }
     const totalExpenses = expensesSummary._sum.amount || 0;
 
     res.json({
       totalStudents,
       totalStaff,
-      feesCollected: totalIncome,
-      outstandingFees: feesSummary._sum.balance || 0,
+      feesCollected: totalPaid,
+      outstandingFees: Math.max(0, totalCharged - totalPaid),
       recentExpenses,
       financialSummary: {
-        totalIncome,
+        totalIncome: totalPaid,
         totalExpenses,
-        netBalance: totalIncome - totalExpenses,
+        netBalance: totalPaid - totalExpenses,
       },
     });
   } catch (e) {
