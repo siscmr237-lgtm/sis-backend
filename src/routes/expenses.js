@@ -84,4 +84,73 @@ router.delete('/:id', async (req, res) => {
   res.json(withIdAsCode(found));
 });
 
+router.post('/damage', async (req, res) => {
+  const schoolId = req.user.schoolId;
+  const { responsibleType, studentId, staffName, description, amount, entryDate, paymentMethod } = req.body || {};
+
+  if (!['student', 'staff', 'general'].includes(responsibleType)) {
+    return res.status(422).json({ error: 'responsibleType must be "student", "staff", or "general"' });
+  }
+  if (!description || !amount || Number(amount) <= 0) {
+    return res.status(422).json({ error: 'description and a positive amount are required' });
+  }
+
+  if (responsibleType === 'student') {
+    if (!studentId) return res.status(422).json({ error: 'studentId is required for student damage' });
+
+    const student = await prisma.student.findFirst({
+      where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
+    });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const category = await prisma.chargeCategory.findFirst({ where: { schoolId, name: 'Damage' } });
+    if (!category) {
+      return res.status(422).json({
+        error: 'No "Damage" charge category found for this school. Run the seed script to add built-in categories.',
+      });
+    }
+
+    try {
+      const entry = await prisma.ledgerEntry.create({
+        data: {
+          code: genCode('CHG'),
+          type: 'CHARGE',
+          schoolId,
+          studentId: student.id,
+          categoryId: category.id,
+          description,
+          amount: Number(amount),
+          entryDate: entryDate ? new Date(entryDate) : new Date(),
+          ...(paymentMethod ? { paymentMethod } : {}),
+        },
+        include: { category: true, student: true },
+      });
+      return res.status(201).json({ type: 'ledger_charge', record: entry });
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+
+  // responsibleType === 'staff' | 'general' → Expense record
+  const payee = responsibleType === 'staff' ? (staffName || 'Staff') : 'General';
+  try {
+    const expense = await prisma.expense.create({
+      data: {
+        code: genCode('DMG'),
+        date: entryDate ? new Date(entryDate) : new Date(),
+        category: 'Damage',
+        description,
+        amount: Number(amount),
+        payee,
+        paymentMethod: paymentMethod || '',
+        invoiceNumber: genCode('DINV'),
+        schoolId,
+      },
+    });
+    return res.status(201).json({ type: 'expense', record: withIdAsCode(expense) });
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+});
+
 module.exports = router;
