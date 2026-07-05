@@ -23,7 +23,6 @@ model Student {
   parentPhone    String
   address        String
   enrollmentDate DateTime
-  fees           Fee[]
   ledgerEntries  LedgerEntry[]
 }
 
@@ -43,29 +42,6 @@ model Staff {
   workRecords           WorkRecord[]
   classesAsClassTeacher Class[]                @relation("ClassTeacher")
   subjectAssignments    ClassSubjectTeacher[]
-}
-
-model Fee {
-  id              Int      @id @default(autoincrement())
-  code            String   @unique @db.VarChar(16) // e.g., FEE001
-  student         Student  @relation(fields: [studentId], references: [id])
-  school          School   @relation(fields: [schoolId], references: [id])
-  schoolId        Int
-  studentId       Int
-  studentName     String
-  class           String
-  term            String
-  academicYear    String
-  tuitionFee      Int
-  registrationFee Int
-  uniformFee      Int
-  booksFee        Int
-  otherFees       Int
-  totalAmount     Int
-  amountPaid      Int
-  balance         Int
-  paymentDate     DateTime
-  paymentMethod   String
 }
 
 model Expense {
@@ -201,29 +177,15 @@ model School {
   adminUserId      Int
   Student          Student[]
   Staff            Staff[]
-  Fee              Fee[]
   Expense          Expense[]
   AttendanceRecord AttendanceRecord[]
   WorkRecord       WorkRecord[]
   ReportCard       ReportCard[]
   TimetableEntry   TimetableEntry[]
-  FeeCategory      FeeCategory[]
   Class            Class[]
   Subject          Subject[]
   chargeCategories ChargeCategory[]
   ledgerEntries    LedgerEntry[]
-}
-
-model FeeCategory {
-  id        Int      @id @default(autoincrement())
-  name      String
-  limit     Int      @default(0)
-  school    School   @relation(fields: [schoolId], references: [id])
-  schoolId  Int
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([name, schoolId])
 }
 
 model ChargeCategory {
