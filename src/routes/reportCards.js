@@ -15,7 +15,11 @@ router.get('/', async (req, res) => {
   }
   if (term) where = { ...where, term: String(term) };
   if (academicYear) where = { ...where, academicYear: String(academicYear) };
-  const rows = await prisma.reportCard.findMany({ where, orderBy: { code: 'asc' } });
+  const rows = await prisma.reportCard.findMany({
+    where,
+    orderBy: { code: 'asc' },
+    select: { id: true, code: true, studentId: true, studentName: true, class: true, term: true, academicYear: true, averageScore: true, position: true, totalStudents: true, attendance: true, headTeacherComment: true, schoolId: true },
+  });
   res.json(mapWithIdAsCode(rows));
 });
 

@@ -5,6 +5,46 @@ const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
+// GET /ledger/summary — one-shot balance summary for all students in the school
+router.get('/summary', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const rows = await prisma.ledgerEntry.groupBy({
+      by: ['studentId', 'type'],
+      where: { schoolId },
+      _sum: { amount: true },
+    });
+
+    if (!rows.length) return res.json([]);
+
+    const ids = [...new Set(rows.map(r => r.studentId))];
+    const students = await prisma.student.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, code: true },
+    });
+    const codeById = Object.fromEntries(students.map(s => [s.id, s.code]));
+
+    const map = {};
+    for (const row of rows) {
+      const code = codeById[row.studentId] ?? String(row.studentId);
+      if (!map[code]) map[code] = { totalCharged: 0, totalPaid: 0 };
+      if (row.type === 'CHARGE') map[code].totalCharged = row._sum.amount ?? 0;
+      if (row.type === 'PAYMENT') map[code].totalPaid = row._sum.amount ?? 0;
+    }
+
+    res.json(
+      Object.entries(map).map(([studentId, t]) => ({
+        studentId,
+        totalCharged: t.totalCharged,
+        totalPaid: t.totalPaid,
+        balance: t.totalCharged - t.totalPaid,
+      }))
+    );
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /ledger/charge
 router.post('/charge', async (req, res) => {
   try {
@@ -16,14 +56,15 @@ router.post('/charge', async (req, res) => {
     if (!description) return res.status(400).json({ error: 'description required' });
     if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
 
-    const student = await prisma.student.findFirst({
-      where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
-    });
+    const [student, category] = await Promise.all([
+      prisma.student.findFirst({
+        where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
+      }),
+      prisma.chargeCategory.findFirst({
+        where: { id: parseInt(categoryId) || 0, schoolId },
+      }),
+    ]);
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
-
-    const category = await prisma.chargeCategory.findFirst({
-      where: { id: parseInt(categoryId) || 0, schoolId },
-    });
     if (!category) return res.status(400).json({ error: 'Invalid categoryId' });
 
     if (category.limit > 0) {

@@ -14,7 +14,11 @@ router.get('/', async (req, res) => {
     where = { ...where, staffId: staff ? staff.id : -1 }; // Use -1 to find no records if staff not found
   }
   if (date) where = { ...where, date: new Date(String(date)) };
-  const rows = await prisma.workRecord.findMany({ where, orderBy: { date: 'desc' } });
+  const rows = await prisma.workRecord.findMany({
+    where,
+    orderBy: { date: 'desc' },
+    select: { id: true, code: true, staffId: true, staffName: true, date: true, subject: true, class: true, topic: true, schoolId: true },
+  });
   res.json(mapWithIdAsCode(rows));
 });
 

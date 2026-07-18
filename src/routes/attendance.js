@@ -20,6 +20,39 @@ router.get('/', async (req, res) => {
   res.json(mapWithIdAsCode(rows));
 });
 
+router.post('/bulk', async (req, res) => {
+  const schoolId = req.user.schoolId;
+  const { records } = req.body || {};
+  if (!Array.isArray(records) || !records.length) {
+    return res.status(400).json({ error: 'records array required' });
+  }
+  try {
+    const ops = records.map(r =>
+      r.existingCode
+        ? prisma.attendanceRecord.update({
+            where: { code: r.existingCode },
+            data: { status: r.status },
+          })
+        : prisma.attendanceRecord.create({
+            data: {
+              code: genCode('ATT'),
+              date: new Date(r.date),
+              type: r.type,
+              personId: r.personId,
+              personName: r.personName,
+              status: r.status,
+              remarks: r.remarks ?? null,
+              schoolId,
+            },
+          })
+    );
+    const results = await prisma.$transaction(ops);
+    res.json(mapWithIdAsCode(results));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 router.post('/', async (req, res) => {
   const schoolId = req.user.schoolId;
   const body = req.body || {};
