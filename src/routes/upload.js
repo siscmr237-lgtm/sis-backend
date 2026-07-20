@@ -75,6 +75,7 @@ router.post(
     });
   },
   async (req, res) => {
+    if (!supabase) return res.status(503).json({ error: 'File storage is not configured on this server.' });
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded.' });
     }
@@ -126,6 +127,7 @@ router.post(
 // Query params: path (required), expiresIn (seconds, optional, default 3600, max 86400)
 // Returns: { url }
 router.get('/signed-url', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'File storage is not configured on this server.' });
   const storagePath = req.query.path;
   const schoolId    = req.user.schoolId;
 
@@ -156,6 +158,7 @@ router.get('/signed-url', async (req, res) => {
 // Query params: path (required)
 // Returns: { dataUrl }
 router.get('/image-data', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'File storage is not configured on this server.' });
   const storagePath = req.query.path;
   const schoolId    = req.user.schoolId;
 
