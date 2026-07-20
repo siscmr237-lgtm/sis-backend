@@ -53,15 +53,15 @@ router.post('/signup', async (req, res) => {
           role: 'user',
         },
       });
-      const school = await
-      prisma.school.create({
+      const school = await prisma.school.create({
         data: {
           name: schoolName,
           adminUserId: user.id,
           logo: 'https://img.freepik.com/premium-vector/school-building-illustration_638438-385.jpg',
-    academicYear: '2025/2026',
-    currentTerm: 'Term 1',
-subjectsPerClass: [],
+          academicYear: '2025/2026',
+          currentTerm: 'Term 1',
+          subjectsPerClass: [],
+          onboardingCompleted: false,
         },
       });
     const newUser = await prisma.adminUser.findUnique({ where: { phoneNumber }, include: { School: true } });

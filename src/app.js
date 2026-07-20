@@ -17,6 +17,7 @@ const subjectsRouter = require('./routes/subjects');
 const uploadRouter = require('./routes/upload');
 const ledgerRouter = require('./routes/ledger');
 const chargeCategoriesRouter = require('./routes/chargeCategories');
+const onboardingRouter = require('./routes/onboarding');
 
 const app = express();
 
@@ -57,5 +58,6 @@ app.use('/subjects', subjectsRouter);
 app.use('/upload', uploadRouter);
 app.use('/ledger', ledgerRouter);
 app.use('/charge-categories', chargeCategoriesRouter);
+app.use('/onboarding', onboardingRouter);
 
 module.exports = app;

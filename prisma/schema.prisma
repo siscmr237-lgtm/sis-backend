@@ -187,27 +187,36 @@ model ClassSubjectTeacher {
   @@unique([classId, staffId, subjectId])
 }
 
+enum SchoolType {
+  DAYCARE_NURSERY
+  DAYCARE_NURSERY_PRIMARY
+}
+
 model School {
-  id               Int                @id @default(autoincrement())
-  name             String
-  logo             String
-  academicYear     String
-  currentTerm      String
-  motto            String?
-  subjectsPerClass Json
-  adminUser        AdminUser          @relation(fields: [adminUserId], references: [id])
-  adminUserId      Int
-  Student          Student[]
-  Staff            Staff[]
-  Expense          Expense[]
-  AttendanceRecord AttendanceRecord[]
-  WorkRecord       WorkRecord[]
-  ReportCard       ReportCard[]
-  TimetableEntry   TimetableEntry[]
-  Class            Class[]
-  Subject          Subject[]
-  chargeCategories ChargeCategory[]
-  ledgerEntries    LedgerEntry[]
+  id                   Int                @id @default(autoincrement())
+  name                 String
+  logo                 String
+  academicYear         String
+  currentTerm          String
+  motto                String?
+  address              String?
+  schoolType           SchoolType?
+  uniformColors        Json               @default("[]")
+  onboardingCompleted  Boolean            @default(true)
+  subjectsPerClass     Json
+  adminUser            AdminUser          @relation(fields: [adminUserId], references: [id])
+  adminUserId          Int
+  Student              Student[]
+  Staff                Staff[]
+  Expense              Expense[]
+  AttendanceRecord     AttendanceRecord[]
+  WorkRecord           WorkRecord[]
+  ReportCard           ReportCard[]
+  TimetableEntry       TimetableEntry[]
+  Class                Class[]
+  Subject              Subject[]
+  chargeCategories     ChargeCategory[]
+  ledgerEntries        LedgerEntry[]
 }
 
 model ChargeCategory {
