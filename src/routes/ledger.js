@@ -11,7 +11,7 @@ router.get('/summary', async (req, res) => {
     const schoolId = req.user.schoolId;
     const rows = await prisma.ledgerEntry.groupBy({
       by: ['studentId', 'type'],
-      where: { schoolId },
+      where: { schoolId, studentId: { not: null } },
       _sum: { amount: true },
     });
 
@@ -174,6 +174,131 @@ router.get('/student/:studentId', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ledger/staff/:staffId
+router.get('/staff/:staffId', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { staffId } = req.params;
+
+    const staff = await prisma.staff.findFirst({
+      where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] },
+    });
+    if (!staff) return res.status(404).json({ error: 'Staff not found' });
+
+    const STAFF_CATS = ['Salary', 'Staff Expense', 'Damage', 'Bonus', 'Transportation Allowance'];
+    await prisma.chargeCategory.createMany({
+      data: STAFF_CATS.map(name => ({ name, isBuiltIn: true, forStaff: true, schoolId })),
+      skipDuplicates: true,
+    });
+
+    const [entries, agg] = await Promise.all([
+      prisma.ledgerEntry.findMany({
+        where: { staffId: staff.id, schoolId },
+        include: { category: true },
+        orderBy: { entryDate: 'desc' },
+      }),
+      prisma.ledgerEntry.groupBy({
+        by: ['type'],
+        where: { staffId: staff.id, schoolId },
+        _sum: { amount: true },
+      }),
+    ]);
+
+    let totalCharged = 0;
+    let totalPaid = 0;
+    for (const row of agg) {
+      if (row.type === 'CHARGE') totalCharged = row._sum.amount ?? 0;
+      if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
+    }
+
+    res.json({
+      entries: mapWithIdAsCode(entries),
+      totalCharged,
+      totalPaid,
+      balance: totalCharged - totalPaid,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /ledger/staff-charge
+router.post('/staff-charge', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { staffId, categoryId, description, amount, entryDate, paymentMethod } = req.body || {};
+
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
+    if (!description) return res.status(400).json({ error: 'description required' });
+    if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
+
+    const [staff, category] = await Promise.all([
+      prisma.staff.findFirst({
+        where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] },
+      }),
+      prisma.chargeCategory.findFirst({
+        where: { id: parseInt(categoryId) || 0, schoolId },
+      }),
+    ]);
+    if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
+    if (!category) return res.status(400).json({ error: 'Invalid categoryId' });
+
+    const entry = await prisma.ledgerEntry.create({
+      data: {
+        code: genCode('SCH'),
+        type: 'CHARGE',
+        schoolId,
+        staffId: staff.id,
+        categoryId: category.id,
+        description,
+        amount: amt,
+        entryDate: new Date(entryDate),
+        paymentMethod: paymentMethod || null,
+      },
+      include: { category: true },
+    });
+    res.status(201).json(withIdAsCode(entry));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// POST /ledger/staff-payment
+router.post('/staff-payment', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { staffId, description, amount, entryDate, paymentMethod } = req.body || {};
+
+    const amt = Number(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
+    if (!description) return res.status(400).json({ error: 'description required' });
+    if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
+
+    const staff = await prisma.staff.findFirst({
+      where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] },
+    });
+    if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
+
+    const entry = await prisma.ledgerEntry.create({
+      data: {
+        code: genCode('SPM'),
+        type: 'PAYMENT',
+        schoolId,
+        staffId: staff.id,
+        categoryId: null,
+        description,
+        amount: amt,
+        entryDate: new Date(entryDate),
+        paymentMethod: paymentMethod || null,
+      },
+    });
+    res.status(201).json(withIdAsCode(entry));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 

@@ -3,11 +3,12 @@ const { prisma } = require('../db/prisma');
 
 const router = express.Router();
 
-// GET /charge-categories
+// GET /charge-categories?forStaff=true|false
 router.get('/', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const items = await prisma.chargeCategory.findMany({ where: { schoolId }, orderBy: { name: 'asc' } });
+    const forStaff = req.query.forStaff === 'true';
+    const items = await prisma.chargeCategory.findMany({ where: { schoolId, forStaff }, orderBy: { name: 'asc' } });
     res.json(items);
   } catch (e) {
     res.status(500).json({ error: e.message });
