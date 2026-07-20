@@ -45,6 +45,7 @@ model Staff {
   workRecords           WorkRecord[]
   classesAsClassTeacher Class[]                @relation("ClassTeacher")
   subjectAssignments    ClassSubjectTeacher[]
+  ledgerEntries         LedgerEntry[]
 
   @@index([schoolId])
 }
@@ -214,6 +215,7 @@ model ChargeCategory {
   name      String
   limit     Int           @default(0)
   isBuiltIn Boolean       @default(false)
+  forStaff  Boolean       @default(false)
   school    School        @relation(fields: [schoolId], references: [id])
   schoolId  Int
   entries   LedgerEntry[]
@@ -234,8 +236,10 @@ model LedgerEntry {
   type          LedgerEntryType
   school        School          @relation(fields: [schoolId], references: [id])
   schoolId      Int
-  student       Student         @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  studentId     Int
+  student       Student?        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId     Int?
+  staff         Staff?          @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId       Int?
   category      ChargeCategory? @relation(fields: [categoryId], references: [id])
   categoryId    Int?
   description   String
@@ -246,6 +250,7 @@ model LedgerEntry {
   updatedAt     DateTime        @updatedAt
 
   @@index([studentId, schoolId])
+  @@index([staffId, schoolId])
   @@index([schoolId])
 }
 
