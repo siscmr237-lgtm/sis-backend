@@ -8,20 +8,22 @@ async function authMiddleware(req, res, next) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
 
   if (!token) {
-    return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    return res.status(401).json({ code: 'SESSION_INVALID', error: 'Your session is no longer valid.' });
   }
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     const user = await prisma.adminUser.findUnique({ where: { id: payload.sub }, include: { School: true } });
-    if (!user || !user.School) return res.status(401).json({ error: 'Unauthorized: Invalid user or school not found' });
+    if (!user) return res.status(401).json({ code: 'SESSION_INVALID', error: 'Your session is no longer valid.' });
+    if (user.isActive === false) return res.status(401).json({ code: 'SESSION_INVALID', error: 'Your session is no longer valid.' });
+    if (!user.School.length) return res.status(401).json({ code: 'SESSION_INVALID', error: 'Your session is no longer valid.' });
     req.user = {
       ...user,
       schoolId: user.School[0].id,
     };
     next();
   } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    return res.status(401).json({ code: 'SESSION_INVALID', error: 'Your session is no longer valid.' });
   }
 }
 

@@ -22,11 +22,29 @@ model Student {
   parentName     String
   parentPhone    String
   address        String
-  enrollmentDate DateTime
-  ledgerEntries  LedgerEntry[]
+  enrollmentDate     DateTime
+  allergies          String?
+  medicalConditions  String?
+  currentMedications String?
+  medicalNotes       String?
+  ledgerEntries      LedgerEntry[]
+  pickupContacts     PickupContact[]
 
   @@index([schoolId])
   @@index([schoolId, class])
+}
+
+model PickupContact {
+  id           Int      @id @default(autoincrement())
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId    Int
+  name         String
+  phone        String
+  relationship String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([studentId])
 }
 
 model Staff {
@@ -266,10 +284,41 @@ model LedgerEntry {
 model AdminUser {
   id           Int      @id @default(autoincrement())
   phoneNumber  String   @unique
+  email        String?  @unique
   passwordHash String
   name         String
   role         String   @default("admin")
+  isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
   School       School[]
+}
+
+enum OtpPurpose {
+  SIGNUP_VERIFICATION
+  PASSWORD_RESET
+}
+
+model OtpCode {
+  id                Int        @id @default(autoincrement())
+  purpose           OtpPurpose
+  identifier        String
+  codeHash          String
+  expiresAt         DateTime
+  attemptsRemaining Int        @default(5)
+  consumed          Boolean    @default(false)
+  createdAt         DateTime   @default(now())
+
+  @@index([identifier, purpose])
+}
+
+model PendingSignup {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  phoneNumber  String
+  name         String
+  schoolName   String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
 }

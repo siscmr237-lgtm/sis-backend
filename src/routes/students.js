@@ -52,6 +52,10 @@ router.post('/', async (req, res) => {
         parentPhone: body.parentPhone,
         address: body.address,
         enrollmentDate: body.enrollmentDate ? new Date(body.enrollmentDate) : new Date(),
+        allergies: body.allergies || null,
+        medicalConditions: body.medicalConditions || null,
+        currentMedications: body.currentMedications || null,
+        medicalNotes: body.medicalNotes || null,
         schoolId,
       },
     });

@@ -11,6 +11,7 @@ const reportCardsRouter = require('./routes/reportCards');
 const timetableRouter = require('./routes/timetable');
 const settingsRouter = require('./routes/settings');
 const authRouter = require('./routes/auth');
+const passwordResetRouter = require('./routes/passwordReset');
 const dashboardRouter = require('./routes/dashboard');
 const classesRouter = require('./routes/classes');
 const subjectsRouter = require('./routes/subjects');
@@ -18,6 +19,7 @@ const uploadRouter = require('./routes/upload');
 const ledgerRouter = require('./routes/ledger');
 const chargeCategoriesRouter = require('./routes/chargeCategories');
 const onboardingRouter = require('./routes/onboarding');
+const pickupContactsRouter = require('./routes/pickupContacts');
 
 const app = express();
 
@@ -40,11 +42,13 @@ app.get('/health', (_req, res) => {
 
 // Public routes
 app.use('/auth', authRouter);
+app.use('/password-reset', passwordResetRouter);
 
 // All routes below this line are protected
 app.use(authMiddleware);
 
 app.use('/students', studentsRouter);
+app.use('/students/:studentId/pickup-contacts', pickupContactsRouter);
 app.use('/staff', staffRouter);
 app.use('/expenses', expensesRouter);
 app.use('/attendance', attendanceRouter);
