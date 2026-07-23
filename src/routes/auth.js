@@ -2,6 +2,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const { authMiddleware } = require('../auth');
 const { validatePassword } = require('../utils/validatePassword');
 const { sendSignupOtp } = require('../utils/mailer');
 
@@ -20,6 +21,42 @@ function signToken(user) {
 
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// Shared by /otp/send-code and /pending-email (which auto-sends after an edit).
+// Throws { code: 'RESEND_TOO_SOON', waitSeconds } if the 60s cooldown hasn't elapsed.
+async function issueSignupOtp(user) {
+  const recent = await prisma.otpCode.findFirst({
+    where: { identifier: user.email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (recent) {
+    const secondsAgo = (Date.now() - new Date(recent.createdAt).getTime()) / 1000;
+    if (secondsAgo < 60) {
+      const err = new Error('RESEND_TOO_SOON');
+      err.code = 'RESEND_TOO_SOON';
+      err.waitSeconds = Math.ceil(60 - secondsAgo);
+      throw err;
+    }
+  }
+
+  await prisma.otpCode.updateMany({
+    where: { identifier: user.email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
+    data: { consumed: true },
+  });
+
+  const code = generateOtp();
+  const codeHash = await bcrypt.hash(code, 10);
+  await prisma.otpCode.create({
+    data: {
+      purpose: 'SIGNUP_VERIFICATION',
+      identifier: user.email,
+      codeHash,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    },
+  });
+
+  await sendSignupOtp({ to: user.email, name: user.name, code });
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +89,10 @@ router.post('/login', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // POST /auth/signup  { name, schoolName, phoneNumber, email, password }
-// Stores pending data + emails a 6-digit OTP. Does NOT create the account yet.
+// Creates the real AdminUser + School immediately (emailVerified: false).
+// Resubmitting with the same still-unverified phone/email updates that account
+// instead of creating a duplicate. No OTP is sent here — the OTP page (reached
+// via the returned session) handles confirming/editing the email and sending.
 // ---------------------------------------------------------------------------
 router.post('/signup', async (req, res) => {
   try {
@@ -66,72 +106,145 @@ router.post('/signup', async (req, res) => {
       return res.status(400).json({ code: 'WEAK_PASSWORD', error: pwCheck.message });
     }
 
-    // Reject if phone or email already in use by a real account
     const [existingPhone, existingEmail] = await Promise.all([
-      prisma.adminUser.findUnique({ where: { phoneNumber } }),
-      prisma.adminUser.findUnique({ where: { email } }),
+      prisma.adminUser.findUnique({ where: { phoneNumber }, include: { School: true } }),
+      prisma.adminUser.findUnique({ where: { email }, include: { School: true } }),
     ]);
-    if (existingPhone) {
+
+    if (existingPhone && existingPhone.emailVerified) {
       return res.status(409).json({ code: 'PHONE_TAKEN', error: 'An account with this phone number already exists.' });
     }
-    if (existingEmail) {
+    if (existingEmail && existingEmail.emailVerified) {
+      return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'An account with this email already exists.' });
+    }
+    // Phone matches one unverified account and email matches a different one — can't
+    // merge them, and updating either to match the other would collide at the DB level.
+    if (existingPhone && existingEmail && existingPhone.id !== existingEmail.id) {
       return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'An account with this email already exists.' });
     }
 
     const passwordHash = await bcrypt.hash(String(password), 10);
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+    const resumeTarget = existingPhone || existingEmail;
 
-    // Upsert the pending record so re-submitting the form refreshes it
-    await prisma.pendingSignup.upsert({
-      where: { email },
-      update: { name, schoolName, phoneNumber, passwordHash, expiresAt },
-      create: { email, name, schoolName, phoneNumber, passwordHash, expiresAt },
-    });
+    let user;
+    if (resumeTarget) {
+      await prisma.adminUser.update({
+        where: { id: resumeTarget.id },
+        data: { name, phoneNumber, email, passwordHash },
+      });
+      const school = resumeTarget.School[0];
+      if (school) {
+        await prisma.school.update({ where: { id: school.id }, data: { name: schoolName } });
+      }
+      user = await prisma.adminUser.findUnique({ where: { id: resumeTarget.id }, include: { School: true } });
+    } else {
+      const created = await prisma.adminUser.create({
+        data: { phoneNumber, email, passwordHash, name, role: 'admin', emailVerified: false },
+      });
+      await prisma.school.create({
+        data: {
+          name: schoolName,
+          adminUserId: created.id,
+          logo: 'https://img.freepik.com/premium-vector/school-building-illustration_638438-385.jpg',
+          academicYear: '2025/2026',
+          currentTerm: 'Term 1',
+          subjectsPerClass: [],
+          onboardingCompleted: false,
+        },
+      });
+      user = await prisma.adminUser.findUnique({ where: { id: created.id }, include: { School: true } });
+    }
 
-    // Invalidate any previous OTPs for this email
-    await prisma.otpCode.updateMany({
-      where: { identifier: email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
-      data: { consumed: true },
-    });
-
-    const code = generateOtp();
-    const codeHash = await bcrypt.hash(code, 10);
-    await prisma.otpCode.create({
-      data: {
-        purpose: 'SIGNUP_VERIFICATION',
-        identifier: email,
-        codeHash,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
-    });
-
-    await sendSignupOtp({ to: email, name, code });
-
-    return res.status(202).json({ email });
+    return res.status(201).json({ token: signToken(user), user });
   } catch (e) {
+    if (e.code === 'P2002') {
+      return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'An account with this email or phone number already exists.' });
+    }
     console.error('signup error', e);
     res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
   }
 });
 
 // ---------------------------------------------------------------------------
-// POST /auth/signup/verify  { email, code }
-// Verifies the OTP, creates the real account, logs the user in.
+// POST /auth/otp/send-code  (authenticated; own account only, while unverified)
+// Used for the initial send, manual resend, and the auto-send after an email edit.
 // ---------------------------------------------------------------------------
-router.post('/signup/verify', async (req, res) => {
+router.post('/otp/send-code', authMiddleware, async (req, res) => {
+  if (req.user.emailVerified) {
+    return res.status(400).json({ code: 'ALREADY_VERIFIED', error: 'Your email is already verified.' });
+  }
   try {
-    const { email, code } = req.body || {};
-    if (!email || !code) {
-      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Email and code are required.' });
+    await issueSignupOtp(req.user);
+    return res.json({ message: 'A verification code has been sent.' });
+  } catch (e) {
+    if (e.code === 'RESEND_TOO_SOON') {
+      return res.status(429).json({
+        code: 'RESEND_TOO_SOON',
+        error: `Please wait ${e.waitSeconds} second${e.waitSeconds === 1 ? '' : 's'} before requesting a new code.`,
+        waitSeconds: e.waitSeconds,
+      });
+    }
+    console.error('otp/send-code error', e);
+    return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /auth/pending-email  { email }  (authenticated; own account only, while unverified)
+// Updates the account's email, then immediately sends a code to the new address.
+// ---------------------------------------------------------------------------
+router.patch('/pending-email', authMiddleware, async (req, res) => {
+  if (req.user.emailVerified) {
+    return res.status(400).json({ code: 'ALREADY_VERIFIED', error: 'Your email is already verified.' });
+  }
+  const { email } = req.body || {};
+  if (!email) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Email is required.' });
+  }
+
+  try {
+    if (email !== req.user.email) {
+      const other = await prisma.adminUser.findUnique({ where: { email } });
+      if (other && other.id !== req.user.id) {
+        return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'This email is already associated with another account.' });
+      }
+      await prisma.adminUser.update({ where: { id: req.user.id }, data: { email } });
     }
 
-    const pending = await prisma.pendingSignup.findUnique({ where: { email } });
-    if (!pending || pending.expiresAt < new Date()) {
-      return res.status(400).json({ code: 'SESSION_EXPIRED', error: 'This signup session has expired. Please start over.' });
+    const updated = await prisma.adminUser.findUnique({ where: { id: req.user.id } });
+    await issueSignupOtp(updated);
+    return res.json({ email: updated.email, message: 'Email updated and a new code has been sent.' });
+  } catch (e) {
+    if (e.code === 'RESEND_TOO_SOON') {
+      return res.status(429).json({
+        code: 'RESEND_TOO_SOON',
+        error: `Please wait ${e.waitSeconds} second${e.waitSeconds === 1 ? '' : 's'} before requesting a new code.`,
+        waitSeconds: e.waitSeconds,
+      });
     }
+    if (e.code === 'P2002') {
+      return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'This email is already associated with another account.' });
+    }
+    console.error('pending-email error', e);
+    return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
 
+// ---------------------------------------------------------------------------
+// POST /auth/otp/verify-signup  { code }  (authenticated; own account only, while unverified)
+// ---------------------------------------------------------------------------
+router.post('/otp/verify-signup', authMiddleware, async (req, res) => {
+  if (req.user.emailVerified) {
+    return res.status(400).json({ code: 'ALREADY_VERIFIED', error: 'Your email is already verified.' });
+  }
+  const { code } = req.body || {};
+  if (!code) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Code is required.' });
+  }
+
+  try {
     const otp = await prisma.otpCode.findFirst({
-      where: { identifier: email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
+      where: { identifier: req.user.email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -158,95 +271,14 @@ router.post('/signup/verify', async (req, res) => {
       });
     }
 
-    // Code correct — consume it and create the real account
     await prisma.otpCode.update({ where: { id: otp.id }, data: { consumed: true } });
+    await prisma.adminUser.update({ where: { id: req.user.id }, data: { emailVerified: true } });
 
-    const user = await prisma.adminUser.create({
-      data: {
-        phoneNumber: pending.phoneNumber,
-        email: pending.email,
-        passwordHash: pending.passwordHash,
-        name: pending.name,
-        role: 'admin',
-      },
-    });
-    const school = await prisma.school.create({
-      data: {
-        name: pending.schoolName,
-        adminUserId: user.id,
-        logo: 'https://img.freepik.com/premium-vector/school-building-illustration_638438-385.jpg',
-        academicYear: '2025/2026',
-        currentTerm: 'Term 1',
-        subjectsPerClass: [],
-        onboardingCompleted: false,
-      },
-    });
-    await prisma.pendingSignup.delete({ where: { email } });
-
-    const fullUser = await prisma.adminUser.findUnique({ where: { id: user.id }, include: { School: true } });
-    return res.status(201).json({ token: signToken(user), user: fullUser });
+    const user = await prisma.adminUser.findUnique({ where: { id: req.user.id }, include: { School: true } });
+    return res.json({ user });
   } catch (e) {
-    console.error('signup/verify error', e);
-    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// POST /auth/signup/resend  { email }
-// Re-sends a fresh code. Rate-limited to once per 60 seconds.
-// ---------------------------------------------------------------------------
-router.post('/signup/resend', async (req, res) => {
-  try {
-    const { email } = req.body || {};
-    if (!email) {
-      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Email is required.' });
-    }
-
-    const pending = await prisma.pendingSignup.findUnique({ where: { email } });
-    if (!pending || pending.expiresAt < new Date()) {
-      return res.status(400).json({ code: 'SESSION_EXPIRED', error: 'This signup session has expired. Please start over.' });
-    }
-
-    // Rate limit: reject if a code was issued within the last 60 seconds
-    const recent = await prisma.otpCode.findFirst({
-      where: { identifier: email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
-      orderBy: { createdAt: 'desc' },
-    });
-    if (recent) {
-      const secondsAgo = (Date.now() - new Date(recent.createdAt).getTime()) / 1000;
-      if (secondsAgo < 60) {
-        const waitSeconds = Math.ceil(60 - secondsAgo);
-        return res.status(429).json({
-          code: 'RESEND_TOO_SOON',
-          error: `Please wait ${waitSeconds} second${waitSeconds === 1 ? '' : 's'} before requesting a new code.`,
-          waitSeconds,
-        });
-      }
-    }
-
-    // Invalidate old codes and issue a fresh one
-    await prisma.otpCode.updateMany({
-      where: { identifier: email, purpose: 'SIGNUP_VERIFICATION', consumed: false },
-      data: { consumed: true },
-    });
-
-    const code = generateOtp();
-    const codeHash = await bcrypt.hash(code, 10);
-    await prisma.otpCode.create({
-      data: {
-        purpose: 'SIGNUP_VERIFICATION',
-        identifier: email,
-        codeHash,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
-    });
-
-    await sendSignupOtp({ to: email, name: pending.name, code });
-
-    return res.json({ message: 'A new code has been sent.' });
-  } catch (e) {
-    console.error('signup/resend error', e);
-    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+    console.error('otp/verify-signup error', e);
+    return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
   }
 });
 

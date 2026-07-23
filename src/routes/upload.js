@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const sharp = require('sharp');
 const { supabase, BUCKET } = require('../utils/storage');
 
 const router = express.Router();
@@ -15,6 +16,38 @@ const ALLOWED_MIMES = {
 const IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const IMAGE_SIZE_LIMIT = 5 * 1024 * 1024;  // 5 MB for images
 const PDF_SIZE_LIMIT   = 10 * 1024 * 1024; // 10 MB for PDFs (also the multer hard cap)
+
+// Safety net for oversized logo uploads (the client already resizes before sending,
+// this only kicks in for a direct API call that bypasses that). Re-encodes instead
+// of rejecting: PNG/WebP sources are re-encoded as WebP (keeps transparency, unlike
+// JPEG which would flatten it onto a solid background); everything else as JPEG.
+const LOGO_TARGET_BYTES = 4 * 1024 * 1024; // real margin under IMAGE_SIZE_LIMIT
+const LOGO_QUALITIES = [90, 80, 70, 60, 50, 40, 30];
+const LOGO_DIMENSION_TIERS = [1600, 800]; // 1600px first; only falls back to 800px if still oversized
+
+async function resizeLogoToFit(buffer, mimetype) {
+  const preserveTransparency = mimetype === 'image/png' || mimetype === 'image/webp';
+  const outputFormat = preserveTransparency ? 'webp' : 'jpeg';
+
+  let result = buffer;
+  tiers:
+  for (const maxDim of LOGO_DIMENSION_TIERS) {
+    for (const quality of LOGO_QUALITIES) {
+      let pipeline = sharp(buffer)
+        .rotate() // auto-orient from EXIF (phone photos), then strip the tag
+        .resize({ width: maxDim, height: maxDim, fit: 'inside', withoutEnlargement: true });
+      pipeline = outputFormat === 'webp' ? pipeline.webp({ quality }) : pipeline.jpeg({ quality });
+      result = await pipeline.toBuffer();
+      if (result.length <= LOGO_TARGET_BYTES) break tiers;
+    }
+  }
+
+  return {
+    buffer: result,
+    mimetype: outputFormat === 'webp' ? 'image/webp' : 'image/jpeg',
+    ext: outputFormat === 'webp' ? 'webp' : 'jpg',
+  };
+}
 
 // Maps the client-supplied `type` value to its storage folder segment
 const TYPE_TO_FOLDER = {
@@ -81,7 +114,8 @@ router.post(
     }
 
     const { type, entityId } = req.body;
-    const { mimetype, buffer, size } = req.file;
+    const { mimetype, size } = req.file;
+    let { buffer } = req.file;
 
     // Validate type
     if (!TYPE_TO_FOLDER[type]) {
@@ -91,16 +125,26 @@ router.post(
     }
 
     // Validate MIME type against whitelist
-    const ext = ALLOWED_MIMES[mimetype];
+    let ext = ALLOWED_MIMES[mimetype];
     if (!ext) {
       return res.status(400).json({
         error: 'File type not allowed. Accepted formats: JPEG, PNG, WebP, PDF.',
       });
     }
 
-    // Enforce the tighter image size limit
+    let uploadMime = mimetype;
+
     if (IMAGE_MIMES.has(mimetype) && size > IMAGE_SIZE_LIMIT) {
-      return res.status(400).json({ error: 'Image files must be 5 MB or smaller.' });
+      if (type === 'logo') {
+        // The client already resizes before sending — this only runs for a direct
+        // API call that bypasses that. Re-encode instead of rejecting.
+        const resized = await resizeLogoToFit(buffer, mimetype);
+        buffer = resized.buffer;
+        uploadMime = resized.mimetype;
+        ext = resized.ext;
+      } else {
+        return res.status(400).json({ error: 'Image files must be 5 MB or smaller.' });
+      }
     }
 
     // entityId required for every type except logo
@@ -113,7 +157,7 @@ router.post(
 
     const { error } = await supabase.storage
       .from(BUCKET)
-      .upload(storagePath, buffer, { contentType: mimetype, upsert: true });
+      .upload(storagePath, buffer, { contentType: uploadMime, upsert: true });
 
     if (error) {
       return res.status(500).json({ error: `Storage upload failed: ${error.message}` });
