@@ -41,6 +41,7 @@ router.post('/', async (req, res) => {
         code: body.code || genCode('STF'),
         firstName: body.firstName,
         lastName: body.lastName,
+        idNumber: body.idNumber,
         role: body.role,
         phone: body.phone,
         email: body.email,
@@ -64,14 +65,28 @@ router.put('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  const body = req.body || {};
   try {
     const updated = await prisma.staff.update({
       where: { id: found.id },
-      data: req.body,
+      data: {
+        firstName: body.firstName,
+        lastName: body.lastName,
+        idNumber: body.idNumber,
+        role: body.role,
+        phone: body.phone,
+        email: body.email,
+        hireDate: body.hireDate ? new Date(body.hireDate) : undefined,
+        salary: body.salary !== undefined ? Number(body.salary) || 0 : undefined,
+        isTeacher: body.isTeacher,
+      },
     });
     res.json(updated);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
+      return res.status(409).json({ error: 'A staff member with this email already exists.' });
+    }
+    res.status(400).json({ error: e.message });
   }
 });
 

@@ -54,6 +54,7 @@ model Staff {
   schoolId              Int
   firstName             String
   lastName              String
+  idNumber              String
   role                  String
   phone                 String
   email                 String                 @unique
