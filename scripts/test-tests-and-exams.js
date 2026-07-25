@@ -158,6 +158,33 @@ async function main() {
   const mathRowAfterReject = compiledAfterReject.json.subjects.find((s) => s.subjectId === math.id);
   expect(mathRowAfterReject.marksObtained === 18, 'rejected batch left the earlier valid mark (18) untouched — no partial write');
 
+  const dupeStudentInBatch = await req('POST', `/test-exams/${class5Ca1.json.id}/marks/bulk`, {
+    subjectId: math.id,
+    marks: [
+      { studentId: bob.id, marksObtained: 10 },
+      { studentId: bob.id, marksObtained: 12 },
+    ],
+  }, token);
+  expect(dupeStudentInBatch.status === 400, 'a batch listing the same studentId twice is rejected outright');
+
+  const decimalMark = await req('POST', `/test-exams/${class5Ca1.json.id}/marks/bulk`, {
+    subjectId: math.id,
+    marks: [{ studentId: bob.id, marksObtained: 15.5 }],
+  }, token);
+  expect(decimalMark.status === 400, 'a non-integer marksObtained (15.5) is rejected');
+
+  const negativeMark = await req('POST', `/test-exams/${class5Ca1.json.id}/marks/bulk`, {
+    subjectId: math.id,
+    marks: [{ studentId: bob.id, marksObtained: -5 }],
+  }, token);
+  expect(negativeMark.status === 400, 'a negative marksObtained is rejected');
+
+  const oversizedTotal = await req('PUT', `/test-exams/${class5Ca1.json.id}/subject-totals/${math.id}`, { totalMarks: 9999999999 }, token);
+  expect(oversizedTotal.status === 400, 'a totalMarks value beyond a 32-bit integer is rejected cleanly (not a raw DB error)');
+
+  const oversizedId = await req('GET', '/test-exams/99999999999999999999', null, token);
+  expect(oversizedId.status === 404, 'an oversized numeric id in the URL resolves to a clean 404, not a 500');
+
   await req('POST', `/test-exams/${class5Ca1.json.id}/marks/bulk`, {
     subjectId: french.id,
     marks: [
@@ -193,7 +220,14 @@ async function main() {
   expect(aliceMath.marksObtained === 98 && aliceMath.totalMarks === 120, `Alice's Math sums to 98/120 across CA1+Exam (got ${aliceMath.marksObtained}/${aliceMath.totalMarks})`);
   expect(aliceFrench.marksObtained === 25 && aliceFrench.totalMarks === 30, `Alice's French sums to 25/30 (got ${aliceFrench.marksObtained}/${aliceFrench.totalMarks})`);
 
-  console.log('\n[9] Verifying class-ranking orders students and handles a tie...');
+  console.log('\n[9] Verifying compiled-scores keeps historical marks after a class reassignment...');
+  await req('PUT', `/students/${carol.id}`, { class: 'Class 6' }, token);
+  const compiledCarolAfterMove = await req('GET', `/test-exams/compiled-scores?studentId=${carol.id}&term=${encodeURIComponent(TERM1)}&academicYear=${encodeURIComponent(YEAR)}`, null, token);
+  const carolMathAfterMove = compiledCarolAfterMove.json.subjects.find((s) => s.subjectId === math.id);
+  expect(carolMathAfterMove && carolMathAfterMove.marksObtained === 85, `Carol's Class 5 marks (85) remain visible in compiled-scores after being moved to Class 6 (got ${carolMathAfterMove?.marksObtained})`);
+  await req('PUT', `/students/${carol.id}`, { class: 'Class 5' }, token);
+
+  console.log('\n[10] Verifying class-ranking orders students and handles a tie...');
   const ranking = await req('GET', `/test-exams/class-ranking?classId=${class5.id}&term=${encodeURIComponent(TERM1)}&academicYear=${encodeURIComponent(YEAR)}`, null, token);
   const byCode = Object.fromEntries(ranking.json.rankings.map((r) => [r.studentId, r]));
   expect(byCode[alice.id].totalObtained === 123, `Alice's overall total is 123 (18+80+25) (got ${byCode[alice.id].totalObtained})`);
@@ -203,7 +237,7 @@ async function main() {
   expect(byCode[bob.id].rank === 2 && byCode[carol.id].rank === 2, 'Bob and Carol share rank 2 (tie-handling)');
   expect(byCode[alice.id].totalPossible === 150, `total possible is 150 for every student (20+100+30) (got ${byCode[alice.id].totalPossible})`);
 
-  console.log('\n[10] Cleaning up test data...');
+  console.log('\n[11] Cleaning up test data...');
   await cleanup();
   console.log('\n✅ All Tests and Exams checks passed.\n');
 }

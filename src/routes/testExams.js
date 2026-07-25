@@ -5,28 +5,38 @@ const { resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const router = express.Router();
 
 const VALID_TYPES = ['TEST', 'EXAM'];
+const MAX_INT32 = 2147483647;
+
+// parseInt on an oversized numeric string (e.g. a 20-digit id) returns a
+// finite-but-out-of-range number that Prisma's Int columns then reject with
+// a raw validation error. Clamping to a valid Int32 (or 0, which never
+// matches a real row) keeps that as an ordinary not-found instead of a 500.
+function toId(value) {
+  const n = parseInt(value, 10);
+  return Number.isInteger(n) && n > 0 && n <= MAX_INT32 ? n : 0;
+}
 
 async function resolveClass(schoolId, classId) {
   if (classId == null) return null;
   return prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: String(classId) }, { id: parseInt(classId) || 0 }] },
+    where: { schoolId, OR: [{ code: String(classId) }, { id: toId(classId) }] },
   });
 }
 
 async function resolveSubject(schoolId, subjectId) {
   if (subjectId == null) return null;
-  return prisma.subject.findFirst({ where: { schoolId, id: parseInt(subjectId) || 0 } });
+  return prisma.subject.findFirst({ where: { schoolId, id: toId(subjectId) } });
 }
 
 async function resolveStudent(schoolId, studentId) {
   if (studentId == null) return null;
   return prisma.student.findFirst({
-    where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
+    where: { schoolId, OR: [{ code: String(studentId) }, { id: toId(studentId) }] },
   });
 }
 
 async function resolveTestExam(schoolId, id) {
-  return prisma.testExam.findFirst({ where: { schoolId, id: parseInt(id) || 0 } });
+  return prisma.testExam.findFirst({ where: { schoolId, id: toId(id) } });
 }
 
 // Resolves the academicYear/term to compute against: explicit query params win,
@@ -56,14 +66,24 @@ router.get('/compiled-scores', async (req, res) => {
 
     const { academicYear, term } = resolvePeriod(req);
 
-    const cls = await prisma.class.findFirst({ where: { schoolId, name: student.class } });
-    if (!cls) return res.json({ studentId: student.code, academicYear, term, subjects: [] });
-
-    const testExams = await prisma.testExam.findMany({
-      where: { schoolId, classId: cls.id, academicYear, term },
-      select: { id: true },
-    });
-    const testExamIds = testExams.map((t) => t.id);
+    // Test/exams to consider: the student's current class's test/exams (so a
+    // subject with a configured total but no marks yet still shows as
+    // pending), unioned with any test/exam the student already has a mark in
+    // for this term. The union matters if the student was later moved to a
+    // different class — without it, marks entered under their old class
+    // would silently vanish from this view even though nothing was deleted.
+    const currentClass = await prisma.class.findFirst({ where: { schoolId, name: student.class } });
+    const [currentClassTestExams, markedTestExams] = await Promise.all([
+      currentClass
+        ? prisma.testExam.findMany({ where: { schoolId, classId: currentClass.id, academicYear, term }, select: { id: true } })
+        : Promise.resolve([]),
+      prisma.studentMark.findMany({
+        where: { studentId: student.id, testExam: { schoolId, academicYear, term } },
+        select: { testExamId: true },
+        distinct: ['testExamId'],
+      }),
+    ]);
+    const testExamIds = [...new Set([...currentClassTestExams.map((t) => t.id), ...markedTestExams.map((m) => m.testExamId)])];
     if (!testExamIds.length) return res.json({ studentId: student.code, academicYear, term, subjects: [] });
 
     const [totals, obtained] = await Promise.all([
@@ -220,6 +240,14 @@ router.post('/', async (req, res) => {
     const cls = await resolveClass(schoolId, classId);
     if (!cls) return res.status(400).json({ error: 'Invalid classId' });
 
+    let orderValue;
+    if (order !== undefined) {
+      orderValue = Number(order);
+      if (!Number.isInteger(orderValue) || orderValue < 0 || orderValue > MAX_INT32) {
+        return res.status(400).json({ error: 'order must be a non-negative integer' });
+      }
+    }
+
     const created = await prisma.testExam.create({
       data: {
         schoolId,
@@ -228,7 +256,7 @@ router.post('/', async (req, res) => {
         term: String(term),
         name: String(name),
         type,
-        ...(order !== undefined && { order: Number(order) || 0 }),
+        ...(orderValue !== undefined && { order: orderValue }),
       },
     });
     res.status(201).json(created);
@@ -260,7 +288,13 @@ router.put('/:id', async (req, res) => {
       if (!VALID_TYPES.includes(type)) return res.status(400).json({ error: `type must be one of: ${VALID_TYPES.join(', ')}` });
       data.type = type;
     }
-    if (order !== undefined) data.order = Number(order) || 0;
+    if (order !== undefined) {
+      const orderValue = Number(order);
+      if (!Number.isInteger(orderValue) || orderValue < 0 || orderValue > MAX_INT32) {
+        return res.status(400).json({ error: 'order must be a non-negative integer' });
+      }
+      data.order = orderValue;
+    }
 
     const updated = await prisma.testExam.update({ where: { id: found.id }, data });
     res.json(updated);
@@ -316,7 +350,7 @@ router.put('/:id/subject-totals/:subjectId', async (req, res) => {
     if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
 
     const totalMarks = Number(req.body?.totalMarks);
-    if (!Number.isInteger(totalMarks) || totalMarks <= 0) {
+    if (!Number.isInteger(totalMarks) || totalMarks <= 0 || totalMarks > MAX_INT32) {
       return res.status(400).json({ error: 'totalMarks must be a positive integer' });
     }
 
@@ -358,7 +392,17 @@ router.post('/:id/marks/bulk', async (req, res) => {
 
     if (!Array.isArray(marks) || !marks.length) return res.status(400).json({ error: 'marks must be a non-empty array' });
 
-    const cls = await prisma.class.findFirst({ where: { id: testExam.classId } });
+    const seenStudentIds = new Set();
+    for (const entry of marks) {
+      const key = String(entry?.studentId);
+      if (seenStudentIds.has(key)) {
+        return res.status(400).json({ error: `Duplicate studentId in the same request: ${key}` });
+      }
+      seenStudentIds.add(key);
+    }
+
+    const cls = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId } });
+    if (!cls) return res.status(400).json({ error: "This test/exam's class no longer exists." });
 
     const errors = [];
     const resolvedRows = [];
@@ -373,8 +417,8 @@ router.post('/:id/marks/bulk', async (req, res) => {
         continue;
       }
       const marksObtained = Number(entry?.marksObtained);
-      if (!Number.isFinite(marksObtained) || marksObtained < 0) {
-        errors.push({ studentId: entry.studentId, error: 'marksObtained must be a non-negative number' });
+      if (!Number.isInteger(marksObtained) || marksObtained < 0) {
+        errors.push({ studentId: entry.studentId, error: 'marksObtained must be a non-negative integer' });
         continue;
       }
       if (marksObtained > subjectTotal.totalMarks) {
@@ -386,6 +430,27 @@ router.post('/:id/marks/bulk', async (req, res) => {
 
     if (errors.length) {
       return res.status(400).json({ error: 'Some marks were invalid; nothing was saved.', details: errors });
+    }
+
+    // Re-check the total immediately before committing — narrows the window
+    // in which a concurrent change to (or deletion of) the total, or of the
+    // test/exam itself, could let a mark validated against a stale value
+    // through, or surface as a raw FK-constraint error instead of a clean one.
+    const freshTotal = await prisma.testExamSubjectTotal.findUnique({
+      where: { testExamId_subjectId: { testExamId: testExam.id, subjectId: subject.id } },
+    });
+    if (!freshTotal) {
+      return res.status(400).json({ error: 'This test/exam or its subject total no longer exists; please retry.' });
+    }
+    const nowOverLimit = resolvedRows.filter((r) => r.marksObtained > freshTotal.totalMarks);
+    if (nowOverLimit.length) {
+      return res.status(400).json({
+        error: 'The configured total changed while marks were being entered; please retry.',
+        details: nowOverLimit.map((r) => ({
+          studentId: r.studentCode,
+          error: `marksObtained (${r.marksObtained}) exceeds the configured total (${freshTotal.totalMarks})`,
+        })),
+      });
     }
 
     await prisma.$transaction(
@@ -401,7 +466,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
     res.json({
       testExamId: testExam.id,
       subjectId: subject.id,
-      totalMarks: subjectTotal.totalMarks,
+      totalMarks: freshTotal.totalMarks,
       count: resolvedRows.length,
       studentIds: resolvedRows.map((r) => r.studentCode),
     });
