@@ -187,6 +187,81 @@ router.get('/class-ranking', async (req, res) => {
   }
 });
 
+// GET /test-exams/student-breakdown?studentId=&term=&academicYear=
+// Per-subject detail for one student across a term: each individual
+// test/exam's marksObtained/totalMarks, plus the compiled subject total —
+// everything a report card needs, computed fresh on every call.
+router.get('/student-breakdown', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { studentId } = req.query;
+    if (!studentId) return res.status(400).json({ error: 'studentId is required' });
+
+    const student = await resolveStudent(schoolId, studentId);
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const { academicYear, term } = resolvePeriod(req);
+
+    // Same union approach as compiled-scores: the student's current class's
+    // test/exams, unioned with any test/exam they already have a mark in for
+    // this term, so a later class reassignment never hides historical marks.
+    const currentClass = await prisma.class.findFirst({ where: { schoolId, name: student.class } });
+    const [currentClassTestExams, markedTestExamRows] = await Promise.all([
+      currentClass
+        ? prisma.testExam.findMany({ where: { schoolId, classId: currentClass.id, academicYear, term } })
+        : [],
+      prisma.studentMark.findMany({
+        where: { studentId: student.id, testExam: { schoolId, academicYear, term } },
+        select: { testExamId: true },
+        distinct: ['testExamId'],
+      }),
+    ]);
+    const currentIds = new Set(currentClassTestExams.map((t) => t.id));
+    const markedIds = new Set(markedTestExamRows.map((m) => m.testExamId));
+    const allIds = [...new Set([...currentIds, ...markedIds])];
+    if (!allIds.length) return res.json({ studentId: student.code, academicYear, term, subjects: [] });
+
+    const missingIds = allIds.filter((id) => !currentIds.has(id));
+    const extraTestExams = missingIds.length ? await prisma.testExam.findMany({ where: { id: { in: missingIds } } }) : [];
+    const testExamById = Object.fromEntries([...currentClassTestExams, ...extraTestExams].map((t) => [t.id, t]));
+
+    const [totals, marks] = await Promise.all([
+      prisma.testExamSubjectTotal.findMany({ where: { testExamId: { in: allIds } }, include: { subject: true } }),
+      prisma.studentMark.findMany({ where: { testExamId: { in: allIds }, studentId: student.id } }),
+    ]);
+    const markByKey = Object.fromEntries(marks.map((m) => [`${m.testExamId}:${m.subjectId}`, m.marksObtained]));
+
+    const bySubject = new Map();
+    for (const t of totals) {
+      const testExam = testExamById[t.testExamId];
+      if (!testExam) continue;
+      if (!bySubject.has(t.subjectId)) {
+        bySubject.set(t.subjectId, { subjectId: t.subjectId, subjectName: t.subject.name, marksObtained: 0, totalMarks: 0, testExams: [] });
+      }
+      const entry = bySubject.get(t.subjectId);
+      const obtained = markByKey[`${t.testExamId}:${t.subjectId}`] ?? 0;
+      entry.marksObtained += obtained;
+      entry.totalMarks += t.totalMarks;
+      entry.testExams.push({
+        testExamId: testExam.id,
+        name: testExam.name,
+        type: testExam.type,
+        order: testExam.order,
+        marksObtained: markByKey[`${t.testExamId}:${t.subjectId}`] ?? null,
+        totalMarks: t.totalMarks,
+      });
+    }
+
+    const subjects = [...bySubject.values()]
+      .map((s) => ({ ...s, testExams: s.testExams.sort((a, b) => a.order - b.order) }))
+      .sort((a, b) => a.subjectName.localeCompare(b.subjectName));
+
+    res.json({ studentId: student.code, academicYear, term, subjects });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /test-exams?classId=&term=&academicYear=
 router.get('/', async (req, res) => {
   try {
@@ -330,6 +405,51 @@ router.get('/:id/subject-totals', async (req, res) => {
       orderBy: { subject: { name: 'asc' } },
     });
     res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /test-exams/:id/marks?subjectId=
+// The full class roster for this test/exam's class, each student's existing
+// mark for the given subject if any (null otherwise) — everything the bulk
+// marks-entry screen needs to prefill in one call.
+router.get('/:id/marks', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const testExam = await resolveTestExam(schoolId, req.params.id);
+    if (!testExam) return res.status(404).json({ error: 'Test/exam not found' });
+
+    const subject = await resolveSubject(schoolId, req.query.subjectId);
+    if (!subject) return res.status(400).json({ error: 'Invalid subjectId' });
+
+    const classSubject = await prisma.classSubject.findFirst({ where: { classId: testExam.classId, subjectId: subject.id } });
+    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+
+    const cls = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId } });
+    if (!cls) return res.status(400).json({ error: "This test/exam's class no longer exists." });
+
+    const [subjectTotal, students, marks] = await Promise.all([
+      prisma.testExamSubjectTotal.findUnique({
+        where: { testExamId_subjectId: { testExamId: testExam.id, subjectId: subject.id } },
+      }),
+      prisma.student.findMany({ where: { schoolId, class: cls.name }, orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }] }),
+      prisma.studentMark.findMany({ where: { testExamId: testExam.id, subjectId: subject.id } }),
+    ]);
+    const markByStudent = Object.fromEntries(marks.map((m) => [m.studentId, m.marksObtained]));
+
+    res.json({
+      testExamId: testExam.id,
+      subjectId: subject.id,
+      subjectName: subject.name,
+      totalMarks: subjectTotal?.totalMarks ?? null,
+      roster: students.map((s) => ({
+        studentId: s.code,
+        firstName: s.firstName,
+        lastName: s.lastName,
+        marksObtained: markByStudent[s.id] ?? null,
+      })),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

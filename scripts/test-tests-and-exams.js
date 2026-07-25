@@ -227,6 +227,23 @@ async function main() {
   expect(carolMathAfterMove && carolMathAfterMove.marksObtained === 85, `Carol's Class 5 marks (85) remain visible in compiled-scores after being moved to Class 6 (got ${carolMathAfterMove?.marksObtained})`);
   await req('PUT', `/students/${carol.id}`, { class: 'Class 5' }, token);
 
+  console.log('\n[9b] Verifying the new roster/marks-prefill and student-breakdown endpoints...');
+  const rosterMarks = await req('GET', `/test-exams/${class5Ca1.json.id}/marks?subjectId=${math.id}`, null, token);
+  const aliceRosterRow = rosterMarks.json.roster.find((r) => r.studentId === alice.id);
+  const bobRosterRow = rosterMarks.json.roster.find((r) => r.studentId === bob.id);
+  expect(rosterMarks.json.totalMarks === 20, `roster/marks endpoint reports the configured total (20) for CA1 Math (got ${rosterMarks.json.totalMarks})`);
+  expect(aliceRosterRow?.marksObtained === 18, `roster/marks prefills Alice's existing CA1 Math mark (18) (got ${aliceRosterRow?.marksObtained})`);
+  expect(bobRosterRow?.marksObtained === 15, `roster/marks prefills Bob's existing CA1 Math mark (15) (got ${bobRosterRow?.marksObtained})`);
+
+  const breakdown = await req('GET', `/test-exams/student-breakdown?studentId=${alice.id}&term=${encodeURIComponent(TERM1)}&academicYear=${encodeURIComponent(YEAR)}`, null, token);
+  const breakdownMath = breakdown.json.subjects.find((s) => s.subjectId === math.id);
+  expect(breakdownMath && breakdownMath.marksObtained === 98 && breakdownMath.totalMarks === 120, `student-breakdown compiles Alice's Math to 98/120 (got ${breakdownMath?.marksObtained}/${breakdownMath?.totalMarks})`);
+  expect(breakdownMath?.testExams?.length === 2, `student-breakdown lists both of Alice's Math test/exams individually (got ${breakdownMath?.testExams?.length})`);
+  const ca1Row = breakdownMath?.testExams?.find((t) => t.name === 'CA1');
+  const examRow = breakdownMath?.testExams?.find((t) => t.name === 'End of Term Exam');
+  expect(ca1Row?.marksObtained === 18 && ca1Row?.totalMarks === 20, `student-breakdown shows CA1 Math as 18/20 individually (got ${ca1Row?.marksObtained}/${ca1Row?.totalMarks})`);
+  expect(examRow?.marksObtained === 80 && examRow?.totalMarks === 100, `student-breakdown shows End of Term Exam Math as 80/100 individually (got ${examRow?.marksObtained}/${examRow?.totalMarks})`);
+
   console.log('\n[10] Verifying class-ranking orders students and handles a tie...');
   const ranking = await req('GET', `/test-exams/class-ranking?classId=${class5.id}&term=${encodeURIComponent(TERM1)}&academicYear=${encodeURIComponent(YEAR)}`, null, token);
   const byCode = Object.fromEntries(ranking.json.rankings.map((r) => [r.studentId, r]));
