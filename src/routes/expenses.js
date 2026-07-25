@@ -1,6 +1,7 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
 const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
+const { resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -111,6 +112,11 @@ router.post('/damage', async (req, res) => {
     }
 
     try {
+      const school = await prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { academicYear: true, currentTerm: true },
+      });
+      const { academicYear, term } = resolveEffectiveSchoolTerm(school);
       const entry = await prisma.ledgerEntry.create({
         data: {
           code: genCode('CHG'),
@@ -122,6 +128,8 @@ router.post('/damage', async (req, res) => {
           amount: Number(amount),
           entryDate: entryDate ? new Date(entryDate) : new Date(),
           ...(paymentMethod ? { paymentMethod } : {}),
+          academicYear,
+          term,
         },
         include: { category: true, student: true },
       });

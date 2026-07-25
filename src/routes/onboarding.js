@@ -5,6 +5,7 @@ const { CLASS_CATALOG } = require('../utils/classCatalog');
 const router = express.Router();
 
 const VALID_SCHOOL_TYPES = ['DAYCARE_NURSERY', 'DAYCARE_NURSERY_PRIMARY'];
+const VALID_UNIFORM_GARMENTS = ['shirt', 'trouser', 'gown'];
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 // GET /onboarding/class-catalog?schoolType=DAYCARE_NURSERY_PRIMARY
@@ -22,6 +23,8 @@ router.get('/class-catalog', (req, res) => {
 
 // POST /onboarding
 // Body: { schoolType, classNames, motto?, address?, logo?, uniformColors? }
+// uniformColors, if present, is { shirt?, trouser?, gown? } with each value a color
+// label string or null — one independent color choice per garment.
 // Saves fields to the school, auto-creates class records, sets onboardingCompleted = true.
 router.post('/', async (req, res) => {
   const schoolId = req.user.schoolId;
@@ -33,6 +36,15 @@ router.post('/', async (req, res) => {
   }
   if (!Array.isArray(classNames) || classNames.length === 0) {
     return res.status(400).json({ error: 'classNames must be a non-empty array' });
+  }
+  if (uniformColors !== undefined) {
+    if (typeof uniformColors !== 'object' || uniformColors === null || Array.isArray(uniformColors)) {
+      return res.status(400).json({ error: 'uniformColors must be an object with shirt, trouser, gown keys' });
+    }
+    const invalidKeys = Object.keys(uniformColors).filter(k => !VALID_UNIFORM_GARMENTS.includes(k));
+    if (invalidKeys.length) {
+      return res.status(400).json({ error: `Invalid uniformColors keys: ${invalidKeys.join(', ')}` });
+    }
   }
 
   const validNamesForType = CLASS_CATALOG

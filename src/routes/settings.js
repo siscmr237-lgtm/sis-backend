@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const { prisma } = require('../db/prisma');
 const { validatePassword } = require('../utils/validatePassword');
+const { resolveSchoolTerm } = require('../utils/academicTerm');
 
 const router = express.Router();
 
@@ -14,12 +15,41 @@ router.get('/', async (_req, res) => {
   res.json(school);
 });
 
+// PUT / — updates school settings. Raw academicYear/currentTerm are always
+// stored/returned as given (or unchanged) — resolving what to *display* is
+// the frontend's job (via the shared academicTerm resolver), computed live
+// on every render rather than baked into a response that could get cached.
+// If the request touches academicYear or currentTerm without explicitly
+// setting autoTermEnabled, that's a manual edit: auto-detect gets switched
+// off so the edit sticks instead of being silently overwritten on the next
+// read. An explicit autoTermEnabled in the body (the Settings page toggle)
+// always wins.
 router.put('/', async (req, res) => {
   const schoolId = req.user.schoolId;
   try {
+    const current = await prisma.school.findUnique({ where: { id: schoolId } });
+    if (!current) {
+      return res.status(404).json({ error: 'School settings not found.' });
+    }
+
+    const data = { ...req.body };
+    const togglesAuto = Object.prototype.hasOwnProperty.call(data, 'autoTermEnabled');
+    if (!togglesAuto) {
+      // Compare against what the school is CURRENTLY reporting (live-computed
+      // when auto is on), not the raw stored row — otherwise re-submitting an
+      // untouched, auto-resolved form value would look like a manual edit
+      // just because it differs from a stale placeholder in the database.
+      const currentDisplay = resolveSchoolTerm(current);
+      const editsAcademicYear = Object.prototype.hasOwnProperty.call(data, 'academicYear') && data.academicYear !== currentDisplay.academicYear;
+      const editsCurrentTerm = Object.prototype.hasOwnProperty.call(data, 'currentTerm') && data.currentTerm !== currentDisplay.term;
+      if (current.autoTermEnabled && (editsAcademicYear || editsCurrentTerm)) {
+        data.autoTermEnabled = false;
+      }
+    }
+
     const updated = await prisma.school.update({
       where: { id: schoolId },
-      data: req.body,
+      data,
     });
     res.json(updated);
   } catch (e) {

@@ -1,45 +1,214 @@
 const express = require('express');
+const { Prisma } = require('@prisma/client');
 const { prisma } = require('../db/prisma');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
+const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
-// GET /ledger/summary — one-shot balance summary for all students in the school
-router.get('/summary', async (req, res) => {
+// The school's currently-active academic year/term, stamped onto every ledger
+// entry at creation time (mirrors how ReportCard captures these per-record —
+// there's no historical Term/AcademicYear model, so "as of creation" is the
+// only point-in-time record we have). Goes through the shared resolver so
+// auto-computed schools and manually-set schools are both handled correctly.
+async function getSchoolPeriod(schoolId) {
+  const school = await prisma.school.findUnique({
+    where: { id: schoolId },
+    select: { academicYear: true, currentTerm: true },
+  });
+  return resolveEffectiveSchoolTerm(school);
+}
+
+// GET /ledger/current-period — the academic year/term this school currently
+// reports as active (live-computed if autoTermEnabled, else the manually set
+// values) — used to default the Finance page's Academic Year/Term filters to
+// "current" instead of "All".
+router.get('/current-period', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const rows = await prisma.ledgerEntry.groupBy({
-      by: ['studentId', 'type'],
-      where: { schoolId, studentId: { not: null } },
-      _sum: { amount: true },
+    const school = await prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { academicYear: true, currentTerm: true },
     });
+    res.json(resolveSchoolTerm(school));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    if (!rows.length) return res.json([]);
+// GET /ledger/academic-years — distinct academic years seen in this school's
+// ledger, newest first, for populating the Finance page's filter dropdown.
+router.get('/academic-years', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const rows = await prisma.ledgerEntry.findMany({
+      where: { schoolId },
+      distinct: ['academicYear'],
+      select: { academicYear: true },
+      orderBy: { academicYear: 'desc' },
+    });
+    res.json(rows.map(r => r.academicYear));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    const ids = [...new Set(rows.map(r => r.studentId))];
+// GET /ledger/student-summary — paginated, filterable per-student balance
+// rollup for the school-wide Finance page's "Student Transactions" table.
+// Search/class filter which students appear; date range/academic year/term
+// filter which of their ledger entries count toward the charged/paid totals.
+router.get('/student-summary', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const { q, class: cls, dateFrom, dateTo, academicYear, term } = req.query;
+
+    const studentWhere = {
+      schoolId,
+      AND: [
+        q
+          ? {
+              OR: [
+                { firstName: { contains: String(q), mode: 'insensitive' } },
+                { lastName: { contains: String(q), mode: 'insensitive' } },
+                { code: { contains: String(q), mode: 'insensitive' } },
+                { class: { contains: String(q), mode: 'insensitive' } },
+              ],
+            }
+          : {},
+        cls && cls !== 'all' ? { class: String(cls) } : {},
+      ],
+    };
+
+    const total = await prisma.student.count({ where: studentWhere });
     const students = await prisma.student.findMany({
-      where: { id: { in: ids } },
-      select: { id: true, code: true },
+      where: studentWhere,
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+      skip: (page - 1) * pageSize,
+      take: pageSize,
     });
-    const codeById = Object.fromEntries(students.map(s => [s.id, s.code]));
 
-    const map = {};
-    for (const row of rows) {
-      const code = codeById[row.studentId] ?? String(row.studentId);
-      if (!map[code]) map[code] = { totalCharged: 0, totalPaid: 0 };
-      if (row.type === 'CHARGE') map[code].totalCharged = row._sum.amount ?? 0;
-      if (row.type === 'PAYMENT') map[code].totalPaid = row._sum.amount ?? 0;
+    const byStudent = {};
+    if (students.length) {
+      const entryWhere = {
+        schoolId,
+        studentId: { in: students.map(s => s.id) },
+        ...(dateFrom || dateTo
+          ? {
+              entryDate: {
+                ...(dateFrom ? { gte: new Date(String(dateFrom)) } : {}),
+                ...(dateTo ? { lte: new Date(String(dateTo)) } : {}),
+              },
+            }
+          : {}),
+        ...(academicYear && academicYear !== 'all' ? { academicYear: String(academicYear) } : {}),
+        ...(term && term !== 'all' ? { term: String(term) } : {}),
+      };
+
+      const sums = await prisma.ledgerEntry.groupBy({
+        by: ['studentId', 'type'],
+        where: entryWhere,
+        _sum: { amount: true },
+      });
+
+      for (const row of sums) {
+        if (!byStudent[row.studentId]) byStudent[row.studentId] = { totalCharged: 0, totalPaid: 0 };
+        if (row.type === 'CHARGE') byStudent[row.studentId].totalCharged = row._sum.amount ?? 0;
+        if (row.type === 'PAYMENT') byStudent[row.studentId].totalPaid = row._sum.amount ?? 0;
+      }
     }
 
-    res.json(
-      Object.entries(map).map(([studentId, t]) => ({
-        studentId,
+    const rows = students.map(s => {
+      const t = byStudent[s.id] ?? { totalCharged: 0, totalPaid: 0 };
+      return {
+        student: withIdAsCode(s),
         totalCharged: t.totalCharged,
         totalPaid: t.totalPaid,
         balance: t.totalCharged - t.totalPaid,
-      }))
-    );
+      };
+    });
+
+    res.json({ rows, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ledger/transactions — paginated, bucketed transaction-level list for
+// the school-wide Finance page's "School Transactions" table. Merges
+// LedgerEntry rows (student + staff) with the standalone Expense table into
+// one normalized, sorted list via a raw SQL UNION so pagination and the
+// bucket filter both apply against the full combined dataset, not just
+// whichever page happens to be loaded in the browser.
+//   bucket 'fees'    — any LedgerEntry tied to a student (charge or payment)
+//   bucket 'payroll' — staff LedgerEntry rows charged under the "Salary" category
+//   bucket 'others'  — every other staff LedgerEntry (Bonus, Transportation
+//                       Allowance, Staff Expense, Damage, uncategorized staff
+//                       payments) plus every standalone Expense row (Utilities,
+//                       Supplies, Maintenance, general/staff Damage, etc.)
+router.get('/transactions', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const bucket = ['fees', 'payroll', 'others'].includes(req.query.bucket) ? req.query.bucket : 'fees';
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const offset = (page - 1) * pageSize;
+
+    const combined = Prisma.sql`
+      WITH combined AS (
+        SELECT
+          'ledger-' || le.code AS id,
+          CASE
+            WHEN le."studentId" IS NOT NULL THEN 'fees'
+            WHEN cc.name = 'Salary' THEN 'payroll'
+            ELSE 'others'
+          END AS bucket,
+          le.type::text AS type,
+          cc.name AS category,
+          le.description AS description,
+          COALESCE(st."firstName" || ' ' || st."lastName", sf."firstName" || ' ' || sf."lastName") AS "partyName",
+          le.amount AS amount,
+          le."entryDate" AS "entryDate",
+          le."paymentMethod" AS "paymentMethod"
+        FROM "LedgerEntry" le
+        LEFT JOIN "ChargeCategory" cc ON cc.id = le."categoryId"
+        LEFT JOIN "Student" st ON st.id = le."studentId"
+        LEFT JOIN "Staff" sf ON sf.id = le."staffId"
+        WHERE le."schoolId" = ${schoolId}
+
+        UNION ALL
+
+        SELECT
+          'expense-' || ex.code AS id,
+          'others' AS bucket,
+          'EXPENSE' AS type,
+          ex.category AS category,
+          ex.description AS description,
+          ex.payee AS "partyName",
+          ex.amount AS amount,
+          ex.date AS "entryDate",
+          ex."paymentMethod" AS "paymentMethod"
+        FROM "Expense" ex
+        WHERE ex."schoolId" = ${schoolId}
+      )
+    `;
+
+    const [rows, countRows] = await Promise.all([
+      prisma.$queryRaw`${combined}
+        SELECT * FROM combined
+        WHERE bucket = ${bucket}
+        ORDER BY "entryDate" DESC, id DESC
+        LIMIT ${pageSize} OFFSET ${offset}
+      `,
+      prisma.$queryRaw`${combined}
+        SELECT COUNT(*)::int AS count FROM combined WHERE bucket = ${bucket}
+      `,
+    ]);
+
+    const total = countRows[0]?.count ?? 0;
+    res.json({ transactions: rows, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -80,6 +249,7 @@ router.post('/charge', async (req, res) => {
       }
     }
 
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
       data: {
         code: genCode('CHG'),
@@ -91,6 +261,8 @@ router.post('/charge', async (req, res) => {
         amount: amt,
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
+        academicYear,
+        term,
       },
       include: { category: true },
     });
@@ -116,6 +288,7 @@ router.post('/payment', async (req, res) => {
     });
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
 
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
       data: {
         code: genCode('PMT'),
@@ -127,6 +300,8 @@ router.post('/payment', async (req, res) => {
         amount: amt,
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
+        academicYear,
+        term,
       },
     });
     res.status(201).json(withIdAsCode(entry));
@@ -247,6 +422,7 @@ router.post('/staff-charge', async (req, res) => {
     if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
     if (!category) return res.status(400).json({ error: 'Invalid categoryId' });
 
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
       data: {
         code: genCode('SCH'),
@@ -258,6 +434,8 @@ router.post('/staff-charge', async (req, res) => {
         amount: amt,
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
+        academicYear,
+        term,
       },
       include: { category: true },
     });
@@ -283,6 +461,7 @@ router.post('/staff-payment', async (req, res) => {
     });
     if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
 
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
       data: {
         code: genCode('SPM'),
@@ -294,6 +473,8 @@ router.post('/staff-payment', async (req, res) => {
         amount: amt,
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
+        academicYear,
+        term,
       },
     });
     res.status(201).json(withIdAsCode(entry));

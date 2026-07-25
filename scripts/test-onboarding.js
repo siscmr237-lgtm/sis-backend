@@ -79,7 +79,7 @@ async function main() {
     classNames: ['Pre-Nursery', 'Nursery 1', 'Nursery 2', 'Class 1', 'Class 2'],
     motto: 'Excellence in Education',
     address: '123 Test Street, Buea',
-    uniformColors: ['#ffffff', '#003366'],
+    uniformColors: { shirt: 'White', trouser: 'Navy', gown: null },
   }, token);
 
   console.log(`  ✓ School updated: onboardingCompleted=${result.school.onboardingCompleted}, schoolType=${result.school.schoolType}`);

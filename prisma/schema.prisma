@@ -217,10 +217,11 @@ model School {
   logo                 String
   academicYear         String
   currentTerm          String
+  autoTermEnabled      Boolean            @default(true)
   motto                String?
   address              String?
   schoolType           SchoolType?
-  uniformColors        Json               @default("[]")
+  uniformColors        Json               @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
   onboardingCompleted  Boolean            @default(true)
   subjectsPerClass     Json
   adminUser            AdminUser          @relation(fields: [adminUserId], references: [id])
@@ -274,12 +275,15 @@ model LedgerEntry {
   amount        Int
   entryDate     DateTime
   paymentMethod String?
+  academicYear  String
+  term          String
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
 
   @@index([studentId, schoolId])
   @@index([staffId, schoolId])
   @@index([schoolId])
+  @@index([schoolId, academicYear, term])
 }
 
 model AdminUser {
