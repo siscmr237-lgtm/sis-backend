@@ -20,6 +20,8 @@ const ledgerRouter = require('./routes/ledger');
 const chargeCategoriesRouter = require('./routes/chargeCategories');
 const onboardingRouter = require('./routes/onboarding');
 const pickupContactsRouter = require('./routes/pickupContacts');
+const testExamsRouter = require('./routes/testExams');
+const parentsRouter = require('./routes/parents');
 
 const app = express();
 
@@ -49,6 +51,7 @@ app.use(authMiddleware);
 
 app.use('/students', studentsRouter);
 app.use('/students/:studentId/pickup-contacts', pickupContactsRouter);
+app.use('/parents', parentsRouter);
 app.use('/staff', staffRouter);
 app.use('/expenses', expensesRouter);
 app.use('/attendance', attendanceRouter);
@@ -63,5 +66,6 @@ app.use('/upload', uploadRouter);
 app.use('/ledger', ledgerRouter);
 app.use('/charge-categories', chargeCategoriesRouter);
 app.use('/onboarding', onboardingRouter);
+app.use('/test-exams', testExamsRouter);
 
 module.exports = app;

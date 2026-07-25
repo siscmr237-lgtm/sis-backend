@@ -5,23 +5,24 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 model Student {
-  id             Int      @id @default(autoincrement())
-  code           String   @unique @db.VarChar(16) // e.g., STU001
-  school         School   @relation(fields: [schoolId], references: [id])
-  schoolId       Int
-  firstName      String
-  lastName       String
-  dateOfBirth    DateTime
-  gender         String
-  class          String
-  parentName     String
-  parentPhone    String
-  address        String
+  id                 Int             @id @default(autoincrement())
+  code               String          @unique @db.VarChar(16) // e.g., STU001
+  school             School          @relation(fields: [schoolId], references: [id])
+  schoolId           Int
+  firstName          String
+  lastName           String
+  dateOfBirth        DateTime
+  gender             String
+  class              String
+  parent             Parent          @relation(fields: [parentId], references: [id])
+  parentId           Int
+  address            String
   enrollmentDate     DateTime
   allergies          String?
   medicalConditions  String?
@@ -29,9 +30,27 @@ model Student {
   medicalNotes       String?
   ledgerEntries      LedgerEntry[]
   pickupContacts     PickupContact[]
+  marks              StudentMark[]
 
   @@index([schoolId])
   @@index([schoolId, class])
+  @@index([parentId])
+}
+
+// A parent/guardian contact, shared across however many of their children are
+// enrolled — editing this record (e.g. a corrected phone number) is visible
+// to every linked Student. Deliberately dedupes only on an exact (schoolId,
+// name, phone) match, never fuzzy — near-identical entries stay separate.
+model Parent {
+  id       Int       @id @default(autoincrement())
+  school   School    @relation(fields: [schoolId], references: [id])
+  schoolId Int
+  name     String
+  phone    String
+  students Student[]
+
+  @@unique([schoolId, name, phone])
+  @@index([schoolId])
 }
 
 model PickupContact {
@@ -48,21 +67,21 @@ model PickupContact {
 }
 
 model Staff {
-  id                    Int                    @id @default(autoincrement())
-  code                  String                 @unique @db.VarChar(16) // e.g., STF001
-  school                School                 @relation(fields: [schoolId], references: [id])
+  id                    Int                   @id @default(autoincrement())
+  code                  String                @unique @db.VarChar(16) // e.g., STF001
+  school                School                @relation(fields: [schoolId], references: [id])
   schoolId              Int
   firstName             String
   lastName              String
   idNumber              String
   role                  String
   phone                 String
-  email                 String                 @unique
+  email                 String                @unique
   hireDate              DateTime
   salary                Int
-  isTeacher             Boolean                @default(false)
+  isTeacher             Boolean               @default(false)
   workRecords           WorkRecord[]
-  classesAsClassTeacher Class[]                @relation("ClassTeacher")
+  classesAsClassTeacher Class[]               @relation("ClassTeacher")
   subjectAssignments    ClassSubjectTeacher[]
   ledgerEntries         LedgerEntry[]
 
@@ -160,26 +179,29 @@ model TimetableEntry {
 }
 
 model Class {
-  id              Int                    @id @default(autoincrement())
-  code            String                 @unique @db.VarChar(16)
+  id              Int                   @id @default(autoincrement())
+  code            String                @unique @db.VarChar(16)
   name            String
-  school          School                 @relation(fields: [schoolId], references: [id])
+  school          School                @relation(fields: [schoolId], references: [id])
   schoolId        Int
-  classTeacher    Staff?                 @relation("ClassTeacher", fields: [classTeacherId], references: [id])
+  classTeacher    Staff?                @relation("ClassTeacher", fields: [classTeacherId], references: [id])
   classTeacherId  Int?
   subjectTeachers ClassSubjectTeacher[]
   classSubjects   ClassSubject[]
+  testExams       TestExam[]
 
   @@unique([name, schoolId])
 }
 
 model Subject {
-  id              Int                   @id @default(autoincrement())
+  id              Int                    @id @default(autoincrement())
   name            String
-  school          School                @relation(fields: [schoolId], references: [id])
+  school          School                 @relation(fields: [schoolId], references: [id])
   schoolId        Int
   classSubjects   ClassSubject[]
   subjectTeachers ClassSubjectTeacher[]
+  subjectTotals   TestExamSubjectTotal[]
+  marks           StudentMark[]
 
   @@unique([name, schoolId])
 }
@@ -206,37 +228,105 @@ model ClassSubjectTeacher {
   @@unique([classId, staffId, subjectId])
 }
 
+enum TestExamType {
+  TEST
+  EXAM
+}
+
+// A single test/exam instance (e.g. "CA1", "End of Term Exam"), always scoped
+// to exactly one class — never shared or reused across classes, even when two
+// classes teach the same subject under the same name.
+model TestExam {
+  id            Int                    @id @default(autoincrement())
+  school        School                 @relation(fields: [schoolId], references: [id])
+  schoolId      Int
+  class         Class                  @relation(fields: [classId], references: [id], onDelete: Cascade)
+  classId       Int
+  academicYear  String
+  term          String
+  name          String
+  type          TestExamType
+  order         Int                    @default(0)
+  subjectTotals TestExamSubjectTotal[]
+  studentMarks  StudentMark[]
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+
+  @@unique([classId, academicYear, term, name])
+  @@index([schoolId])
+  @@index([classId, academicYear, term])
+}
+
+// The school-configured total marks for one subject on one test/exam. Set
+// manually per subject per test/exam, so totals can differ both across
+// tests/exams and across subjects within the same test/exam.
+model TestExamSubjectTotal {
+  id         Int      @id @default(autoincrement())
+  testExam   TestExam @relation(fields: [testExamId], references: [id], onDelete: Cascade)
+  testExamId Int
+  subject    Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  subjectId  Int
+  totalMarks Int
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([testExamId, subjectId])
+}
+
+// A student's score for one subject on one test/exam. Can only be created
+// once the matching TestExamSubjectTotal exists; marksObtained is enforced
+// (at the application layer) to never exceed that configured total.
+model StudentMark {
+  id            Int      @id @default(autoincrement())
+  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId     Int
+  subject       Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  subjectId     Int
+  testExam      TestExam @relation(fields: [testExamId], references: [id], onDelete: Cascade)
+  testExamId    Int
+  marksObtained Int
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([studentId, subjectId, testExamId])
+  @@index([testExamId])
+  @@index([subjectId])
+  @@index([studentId])
+}
+
 enum SchoolType {
   DAYCARE_NURSERY
   DAYCARE_NURSERY_PRIMARY
 }
 
 model School {
-  id                   Int                @id @default(autoincrement())
-  name                 String
-  logo                 String
-  academicYear         String
-  currentTerm          String
-  autoTermEnabled      Boolean            @default(true)
-  motto                String?
-  address              String?
-  schoolType           SchoolType?
-  uniformColors        Json               @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
-  onboardingCompleted  Boolean            @default(true)
-  subjectsPerClass     Json
-  adminUser            AdminUser          @relation(fields: [adminUserId], references: [id])
-  adminUserId          Int
-  Student              Student[]
-  Staff                Staff[]
-  Expense              Expense[]
-  AttendanceRecord     AttendanceRecord[]
-  WorkRecord           WorkRecord[]
-  ReportCard           ReportCard[]
-  TimetableEntry       TimetableEntry[]
-  Class                Class[]
-  Subject              Subject[]
-  chargeCategories     ChargeCategory[]
-  ledgerEntries        LedgerEntry[]
+  id                  Int                @id @default(autoincrement())
+  name                String
+  logo                String
+  academicYear        String
+  currentTerm         String
+  autoTermEnabled     Boolean            @default(true)
+  motto               String?
+  address             String?
+  schoolType          SchoolType?
+  uniformColors       Json               @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
+  onboardingCompleted Boolean            @default(true)
+  subjectsPerClass    Json
+  adminUser           AdminUser          @relation(fields: [adminUserId], references: [id])
+  adminUserId         Int
+  Student             Student[]
+  Parent              Parent[]
+  Staff               Staff[]
+  Expense             Expense[]
+  AttendanceRecord    AttendanceRecord[]
+  WorkRecord          WorkRecord[]
+  ReportCard          ReportCard[]
+  TimetableEntry      TimetableEntry[]
+  Class               Class[]
+  Subject             Subject[]
+  chargeCategories    ChargeCategory[]
+  ledgerEntries       LedgerEntry[]
+  TestExam            TestExam[]
 }
 
 model ChargeCategory {

@@ -47,10 +47,18 @@ router.post('/', async (req, res) => {
     }
   }
 
+  // A submitted name is valid if it matches a catalog entry exactly, or is a
+  // catalog entry plus a single section-letter suffix (e.g. "Class 1A" for
+  // section A of "Class 1", from the onboarding "how many sections?" input).
   const validNamesForType = CLASS_CATALOG
     .filter(c => c.schoolTypes.includes(schoolType))
     .map(c => c.name);
-  const invalid = classNames.filter(n => !validNamesForType.includes(n));
+  const isValidClassName = (n) => {
+    if (validNamesForType.includes(n)) return true;
+    const lastChar = n.slice(-1);
+    return /^[A-Z]$/.test(lastChar) && validNamesForType.includes(n.slice(0, -1));
+  };
+  const invalid = classNames.filter(n => !isValidClassName(n));
   if (invalid.length) {
     return res.status(400).json({
       error: `Invalid class names for school type ${schoolType}: ${invalid.join(', ')}`,
