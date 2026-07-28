@@ -95,12 +95,31 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// DELETE /students/:id — removes the student and every record that
+// references them, so no other page (Finance, Report Cards, Attendance,
+// Tests & Exams) is left holding a dangling reference. PgBouncer transaction
+// mode doesn't support interactive transactions, so these run sequentially in
+// dependency order (children first) rather than wrapped in $transaction — the
+// same approach scripts/delete-all-schools.js uses for the same reason.
+// The shared Parent record is intentionally left alone: it may still be
+// linked to the student's siblings.
 router.delete('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
-  await prisma.student.delete({ where: { id: found.id } });
-  res.json(withIdAsCode(found));
+
+  try {
+    await prisma.studentMark.deleteMany({ where: { studentId: found.id } });
+    await prisma.ledgerEntry.deleteMany({ where: { studentId: found.id } });
+    await prisma.pickupContact.deleteMany({ where: { studentId: found.id } });
+    await prisma.attendanceRecord.deleteMany({ where: { schoolId, type: 'student', personId: found.code } });
+    await prisma.reportCard.deleteMany({ where: { schoolId, studentId: found.code } });
+
+    await prisma.student.delete({ where: { id: found.id } });
+    res.json(withIdAsCode(found));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 module.exports = router;

@@ -1,24 +1,13 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { authMiddleware } = require('../auth');
 const { validatePassword } = require('../utils/validatePassword');
 const { sendSignupOtp } = require('../utils/mailer');
 const { computeSchoolAbbreviation } = require('../utils/schoolAbbreviation');
+const { signSessionToken: signToken } = require('../utils/sessionToken');
 
 const router = express.Router();
-
-const JWT_SECRET = process.env.JWT_SECRET;
-const TOKEN_TTL = '7d';
-
-function signToken(user) {
-  return jwt.sign(
-    { sub: user.id, role: user.role, phoneNumber: user.phoneNumber },
-    JWT_SECRET,
-    { expiresIn: TOKEN_TTL }
-  );
-}
 
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));

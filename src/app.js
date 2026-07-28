@@ -35,6 +35,10 @@ app.use(cors({
   ],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
+  // Without this, the browser silently drops X-Refreshed-Token from the
+  // response — CORS only exposes a small safelisted set of headers to JS
+  // by default, and the rolling session depends on the client reading it.
+  exposedHeaders: ["X-Refreshed-Token"],
   credentials: true,
 }));
 
