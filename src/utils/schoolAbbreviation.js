@@ -6,10 +6,13 @@
  * live preview shown when the Settings page's auto-generate toggle is on.
  *
  * Splits the name on whitespace, drops a fixed set of stop words
- * (case-insensitive), then takes the uppercased first letter of each
- * remaining word.
+ * (case-insensitive), takes the uppercased first letter of each remaining
+ * word, then truncates to MAX_ABBREVIATION_LENGTH. The cap exists because
+ * very long names (some real schools run 20+ words) otherwise produce an
+ * abbreviation long enough to overflow the Dashboard header on mobile.
  */
 const STOP_WORDS = new Set(['of', 'and', 'with', 'the', '&']);
+const MAX_ABBREVIATION_LENGTH = 6;
 
 function computeSchoolAbbreviation(name) {
   return String(name || '')
@@ -17,7 +20,8 @@ function computeSchoolAbbreviation(name) {
     .split(/\s+/)
     .filter((word) => word && !STOP_WORDS.has(word.toLowerCase()))
     .map((word) => word[0].toUpperCase())
-    .join('');
+    .join('')
+    .slice(0, MAX_ABBREVIATION_LENGTH);
 }
 
-module.exports = { computeSchoolAbbreviation };
+module.exports = { computeSchoolAbbreviation, MAX_ABBREVIATION_LENGTH };
