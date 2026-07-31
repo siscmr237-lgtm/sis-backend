@@ -38,9 +38,43 @@ app.use(cors({
   // Without this, the browser silently drops X-Refreshed-Token from the
   // response — CORS only exposes a small safelisted set of headers to JS
   // by default, and the rolling session depends on the client reading it.
-  exposedHeaders: ["X-Refreshed-Token"],
+  //
+  // The Age/X-Vercel-* entries are TEMPORARY, added alongside the client-side
+  // auth diagnostic (SIS/src/lib/authDiagnostic.ts): they are what lets the
+  // client tell "the app returned 401" apart from "a cache handed us a stale
+  // 401", and neither is readable from JS unless exposed here. Remove them
+  // together with that diagnostic.
+  exposedHeaders: [
+    "X-Refreshed-Token",
+    "Age",
+    "X-Vercel-Cache",
+    "X-Vercel-Id",
+    "ETag",
+    "Date",
+  ],
   credentials: true,
 }));
+
+// Nothing this API returns may ever be stored by a shared cache. Every response
+// is either a credential (the login token), data scoped to one school, or an
+// authentication decision — and the cache key an intermediary would use does
+// NOT include Authorization, so a proxy that caches one of these can serve one
+// user's data, or a stale 401, to somebody else's authenticated request.
+//
+// This has to be set explicitly because a Vercel function that returns no
+// Cache-Control of its own gets `public, max-age=0, must-revalidate` filled in
+// for it — `public` being exactly the wrong default here. Registered before
+// every route and before authMiddleware so it also lands on the 401s that
+// middleware returns early, which are the most damaging responses to cache.
+app.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0, must-revalidate');
+  res.setHeader('Pragma', 'no-cache'); // HTTP/1.0 intermediaries
+  res.setHeader('Expires', '0');
+  // Belt-and-braces for anything that ignores no-store but honours Vary: make
+  // the token part of the cache key so entries can't cross accounts.
+  res.vary('Authorization');
+  next();
+});
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
