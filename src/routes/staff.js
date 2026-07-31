@@ -53,9 +53,12 @@ router.post('/', async (req, res) => {
     });
     res.status(201).json(created);
   } catch (e) {
-    // P2002 is the Prisma code for unique constraint violation
+    // P2002 is the Prisma code for unique constraint violation. The email
+    // constraint is (schoolId, email), so this can only ever fire on a clash
+    // inside the caller's own school — hence "in this school": it must not
+    // read as though it could be reporting another school's data.
     if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
-      return res.status(409).json({ error: 'A staff member with this email already exists.' });
+      return res.status(409).json({ error: 'A staff member with this email already exists in this school.' });
     }
     res.status(500).json({ error: e.message });
   }
@@ -84,7 +87,7 @@ router.put('/:id', async (req, res) => {
     res.json(updated);
   } catch (e) {
     if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
-      return res.status(409).json({ error: 'A staff member with this email already exists.' });
+      return res.status(409).json({ error: 'A staff member with this email already exists in this school.' });
     }
     res.status(400).json({ error: e.message });
   }

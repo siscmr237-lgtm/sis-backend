@@ -76,7 +76,11 @@ model Staff {
   idNumber              String
   role                  String
   phone                 String
-  email                 String                @unique
+  // Scoped per school by the @@unique below, NOT globally: schools are separate
+  // tenants, so one school having a staff member on an address must never stop
+  // another school entering the same person — nor reveal, via a uniqueness
+  // error, that the address exists somewhere else in the system.
+  email                 String
   hireDate              DateTime
   salary                Int
   isTeacher             Boolean               @default(false)
@@ -85,6 +89,7 @@ model Staff {
   subjectAssignments    ClassSubjectTeacher[]
   ledgerEntries         LedgerEntry[]
 
+  @@unique([schoolId, email])
   @@index([schoolId])
 }
 
