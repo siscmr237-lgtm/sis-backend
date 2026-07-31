@@ -38,20 +38,7 @@ app.use(cors({
   // Without this, the browser silently drops X-Refreshed-Token from the
   // response — CORS only exposes a small safelisted set of headers to JS
   // by default, and the rolling session depends on the client reading it.
-  //
-  // The Age/X-Vercel-* entries are TEMPORARY, added alongside the client-side
-  // auth diagnostic (SIS/src/lib/authDiagnostic.ts): they are what lets the
-  // client tell "the app returned 401" apart from "a cache handed us a stale
-  // 401", and neither is readable from JS unless exposed here. Remove them
-  // together with that diagnostic.
-  exposedHeaders: [
-    "X-Refreshed-Token",
-    "Age",
-    "X-Vercel-Cache",
-    "X-Vercel-Id",
-    "ETag",
-    "Date",
-  ],
+  exposedHeaders: ["X-Refreshed-Token"],
   credentials: true,
 }));
 
