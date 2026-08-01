@@ -48,15 +48,19 @@ router.post('/', async (req, res) => {
   }
 
   // A submitted name is valid if it matches a catalog entry exactly, or is a
-  // catalog entry plus a single section-letter suffix (e.g. "Class 1A" for
-  // section A of "Class 1", from the onboarding "how many sections?" input).
+  // catalog entry plus a space and a single section letter (e.g. "Class 1 A"
+  // for section A of "Class 1", from the onboarding "how many sections?"
+  // input). The space is required: it is the canonical separator the frontend
+  // generates and the one existing rows were migrated to, so accepting the
+  // older unspaced "Class 1A" here would let a second format back in.
   const validNamesForType = CLASS_CATALOG
     .filter(c => c.schoolTypes.includes(schoolType))
     .map(c => c.name);
+  const SECTION_SUFFIX = /^(.+) ([A-Z])$/;
   const isValidClassName = (n) => {
     if (validNamesForType.includes(n)) return true;
-    const lastChar = n.slice(-1);
-    return /^[A-Z]$/.test(lastChar) && validNamesForType.includes(n.slice(0, -1));
+    const m = SECTION_SUFFIX.exec(n);
+    return Boolean(m) && validNamesForType.includes(m[1]);
   };
   const invalid = classNames.filter(n => !isValidClassName(n));
   if (invalid.length) {

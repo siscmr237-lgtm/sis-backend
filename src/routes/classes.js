@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { CLASS_CATALOG } = require('../utils/classCatalog');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -34,6 +35,75 @@ router.get('/:id', async (req, res) => {
   });
   if (!found) return res.status(404).json({ error: 'Not found' });
   res.json(found);
+});
+
+// POST /classes/standard
+//
+// Creates the full set of class levels this school's TYPE allows, in ONE
+// statement. It replaces a client-side loop of individual POSTs, which could
+// half-succeed — leaving a school with some levels created and some not, with
+// nothing recording which — and which also let the client decide the level
+// list. Both are decided here now: the catalog is filtered server-side, so a
+// Daycare–Nursery school cannot be given Class 1–6 whatever the caller sends.
+//
+// createMany is a single INSERT, so it either applies or it doesn't; there is
+// no partial state to report. skipDuplicates makes it idempotent, so pressing
+// the button twice, or running it on a school that already has some levels,
+// tops up the missing ones instead of erroring.
+router.post('/standard', async (req, res) => {
+  const schoolId = req.user.schoolId;
+  try {
+    const school = await prisma.school.findUnique({ where: { id: schoolId } });
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+    if (!school.schoolType) {
+      return res.status(400).json({
+        code: 'NO_SCHOOL_TYPE',
+        error: 'This school has no school type set, so its standard classes are unknown.',
+      });
+    }
+
+    const wanted = CLASS_CATALOG
+      .filter(c => c.schoolTypes.includes(school.schoolType))
+      .map(c => c.name);
+
+    const existing = (await prisma.class.findMany({
+      where: { schoolId },
+      select: { name: true },
+    })).map(c => c.name);
+
+    const alreadyExisted = wanted.filter(n => existing.includes(n));
+    const toCreate = wanted.filter(n => !existing.includes(n));
+
+    if (toCreate.length) {
+      await prisma.class.createMany({
+        data: toCreate.map(name => ({ code: genCode('CLS'), name, schoolId })),
+        skipDuplicates: true,
+      });
+    }
+
+    // Report from what the database actually holds afterwards rather than from
+    // what we intended, so the caller can never be told something was created
+    // that isn't there.
+    const after = (await prisma.class.findMany({
+      where: { schoolId },
+      select: { name: true },
+    })).map(c => c.name);
+    const created = toCreate.filter(n => after.includes(n));
+    const failed = toCreate.filter(n => !after.includes(n));
+
+    res.status(failed.length ? 500 : 201).json({
+      schoolType: school.schoolType,
+      created,
+      alreadyExisted,
+      failed,
+      ...(failed.length && {
+        code: 'PARTIAL_CREATE',
+        error: `Only ${created.length} of ${toCreate.length} classes were created.`,
+      }),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /classes
