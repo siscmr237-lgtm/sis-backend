@@ -28,6 +28,17 @@ model Student {
   medicalConditions  String?
   currentMedications String?
   medicalNotes       String?
+  /// True when this student has been DETACHED from their class level's fee
+  /// structure and billed from their own snapshot instead (scholarship, staff
+  /// child, partial waiver). While set, feeOverrides below is the student's fee
+  /// structure and the level sync skips them entirely, so a later class-level
+  /// change does not silently undo the arrangement.
+  ///
+  /// A flag rather than "has override rows", because an override can legitimately
+  /// be an EMPTY set — a student who owes nothing at all — which is a different
+  /// thing from not being overridden.
+  feesOverridden     Boolean         @default(false)
+  feeOverrides       StudentFeeOverride[]
   ledgerEntries      LedgerEntry[]
   pickupContacts     PickupContact[]
   marks              StudentMark[]
@@ -345,6 +356,7 @@ model School {
   Subject                   Subject[]
   chargeCategories          ChargeCategory[]
   classLevelFees            ClassLevelFee[]
+  studentFeeOverrides       StudentFeeOverride[]
   ledgerEntries             LedgerEntry[]
   TestExam                  TestExam[]
 }
@@ -397,6 +409,33 @@ model ClassLevelFee {
   @@index([schoolId, classLevel])
 }
 
+/// One fee in a single student's PERSONAL fee structure, used when they have been
+/// detached from their class level's (Student.feesOverridden).
+///
+/// A snapshot, not a diff against the level: the dialog pre-fills it from the
+/// level's current fees and the admin adjusts down, so from then on the student's
+/// bill is fully described here. Storing deltas instead would mean the meaning of
+/// a waiver silently changed whenever the class fee moved, which is exactly what
+/// detaching is meant to prevent.
+model StudentFeeOverride {
+  id        Int      @id @default(autoincrement())
+  school    School   @relation(fields: [schoolId], references: [id])
+  schoolId  Int
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId Int
+  name      String
+  amount    Int      @default(0)
+  /// Same meaning as on ClassLevelFee: NULL means this fee is not part of the
+  /// student's first installment.
+  firstInstallmentPercent Int?
+  charges   LedgerEntry[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([studentId, name])
+  @@index([schoolId])
+}
+
 enum LedgerEntryType {
   CHARGE
   PAYMENT
@@ -436,6 +475,12 @@ model LedgerEntry {
   /// fee while allowing any number of extra charges. It is created in raw SQL
   /// in the migration because Prisma cannot express a partial index.
   isFeeStructureCharge Boolean @default(false)
+  /// The override fee this charge bills, for a DETACHED student. Exactly one of
+  /// classLevelFeeId / studentFeeOverrideId is set on a fee-linked charge: the
+  /// first while a student follows their class, the second once they have their
+  /// own structure. Both null means a one-off charge, outside any fee structure.
+  studentFeeOverride   StudentFeeOverride? @relation(fields: [studentFeeOverrideId], references: [id], onDelete: Cascade)
+  studentFeeOverrideId Int?
   description   String
   amount        Int
   entryDate     DateTime
@@ -450,6 +495,7 @@ model LedgerEntry {
   @@index([schoolId])
   @@index([schoolId, academicYear, term])
   @@index([classLevelFeeId])
+  @@index([studentFeeOverrideId])
 }
 
 model AdminUser {

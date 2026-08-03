@@ -4,6 +4,7 @@ const { CLASS_CATALOG } = require('../utils/classCatalog');
 const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
 const { ensureLevelFeeDefaults } = require('../utils/feeCategories');
 const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
+const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -104,9 +105,10 @@ router.put('/levels/:level/fees', async (req, res) => {
 
     const existing = await prisma.classLevelFee.findMany({
       where: { schoolId, classLevel: level },
-      select: { id: true },
+      select: { id: true, name: true, amount: true, firstInstallmentPercent: true },
     });
     const existingIds = new Set(existing.map((f) => f.id));
+    const existingById = new Map(existing.map((f) => [f.id, f]));
 
     const seenNames = new Set();
     const parsed = [];
@@ -176,11 +178,87 @@ router.put('/levels/:level/fees', async (req, res) => {
       where: { schoolId, classLevel: level },
       orderBy: { name: 'asc' },
     });
-    res.json({ classLevel: level, fees: updated, removed: removedIds.length, rebill });
+
+    // Which amounts actually moved, and which students of this level are
+    // detached. The dialog uses these two together: a detached student did NOT
+    // receive this change, and the admin may want to pass specific categories on
+    // to some of them (see POST .../apply-to-overridden).
+    const changedFees = parsed
+      .filter((p) => {
+        if (p.id == null) return true; // a brand-new fee is a change for everyone
+        const before = existingById.get(p.id);
+        return before && before.amount !== p.amount;
+      })
+      .map((p) => {
+        const before = p.id != null ? existingById.get(p.id) : null;
+        return {
+          name: p.name,
+          from: before ? before.amount : null,
+          to: p.amount,
+        };
+      });
+
+    const allStudents = await prisma.student.findMany({
+      where: { schoolId, feesOverridden: true },
+      select: { id: true, code: true, firstName: true, lastName: true, class: true },
+    });
+    const detachedStudents = allStudents
+      .filter((s) => classLevelOf(s.class) === level)
+      .map((s) => ({ id: s.code, name: `${s.firstName} ${s.lastName}`, class: s.class }));
+
+    res.json({
+      classLevel: level,
+      fees: updated,
+      removed: removedIds.length,
+      rebill,
+      changedFees,
+      detachedStudents,
+    });
   } catch (e) {
     if (e.code === 'P2002') {
       return res.status(409).json({ error: 'Two fees on this level cannot share a name.' });
     }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /classes/levels/:level/fees/apply-to-overridden
+// Body: { feeName, studentIds: [code|id] }
+//
+// Passes ONE changed class fee on to specific DETACHED students. Only that named
+// fee is overwritten with the class's current value; every other fee in each
+// student's snapshot is left untouched and they REMAIN detached. The admin is
+// saying "this one change applies to them too", not "put them back on standard
+// fees" — that is what DELETE /students/:id/fee-override is for.
+router.post('/levels/:level/fees/apply-to-overridden', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const { feeName, studentIds } = req.body || {};
+    if (!feeName) return res.status(400).json({ error: 'feeName required' });
+    if (!Array.isArray(studentIds) || !studentIds.length) {
+      return res.status(400).json({ error: 'studentIds array required' });
+    }
+
+    // Accept codes or numeric ids, resolving to ids scoped to this school.
+    const resolved = await prisma.student.findMany({
+      where: {
+        schoolId,
+        OR: [
+          { code: { in: studentIds.map(String) } },
+          { id: { in: studentIds.map((s) => parseInt(s, 10)).filter(Number.isFinite) } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (!resolved.length) return res.status(400).json({ error: 'No matching students in this school.' });
+
+    const result = await applyLevelFeeToOverriddenStudents(
+      prisma, schoolId, level, String(feeName), resolved.map((s) => s.id),
+    );
+    if (result.error) return res.status(400).json({ error: result.error });
+    res.json(result);
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });

@@ -41,9 +41,15 @@ async function syncLevelFeeCharges(prisma, schoolId, classLevel) {
 
   const allStudents = await prisma.student.findMany({
     where: { schoolId },
-    select: { id: true, class: true },
+    select: { id: true, class: true, feesOverridden: true },
   });
-  const students = allStudents.filter((s) => classLevelOf(s.class) === classLevel);
+  // Detached students are deliberately excluded: their fees are their own
+  // snapshot, and a class-level change must not silently undo the arrangement.
+  // The admin can still opt specific ones in, one category at a time — see
+  // applyLevelFeeToOverriddenStudents in studentOverrideCharges.js.
+  const students = allStudents.filter(
+    (s) => classLevelOf(s.class) === classLevel && !s.feesOverridden,
+  );
 
   if (!students.length || !fees.length) {
     return { students: students.length, fees: fees.length, created: 0, updated: 0, unchanged: 0 };
@@ -129,9 +135,15 @@ async function syncLevelFeeCharges(prisma, schoolId, classLevel) {
 async function syncStudentFeeCharges(prisma, schoolId, studentId) {
   const student = await prisma.student.findFirst({
     where: { id: studentId, schoolId },
-    select: { id: true, class: true },
+    select: { id: true, class: true, feesOverridden: true },
   });
   if (!student) return null;
+  // A detached student's bill comes from their own snapshot; changing class does
+  // not re-attach them to a level's fees.
+  if (student.feesOverridden) {
+    const { syncStudentOverrideCharges } = require('./studentOverrideCharges');
+    return syncStudentOverrideCharges(prisma, schoolId, studentId);
+  }
   const level = classLevelOf(student.class);
 
   const feesOfLevel = await prisma.classLevelFee.findMany({

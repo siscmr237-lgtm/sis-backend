@@ -5,12 +5,38 @@ const { resolveParentId, withFlatParent } = require('../utils/parents');
 const { computeFeesStatusForStudents } = require('../utils/feesStatus');
 const { classLevelOf } = require('../utils/classLevels');
 const { syncStudentFeeCharges } = require('../utils/levelFeeCharges');
+const { getStudentFeeStructure } = require('../utils/studentFees');
+const {
+  setStudentFeeOverride,
+  removeStudentFeeOverride,
+} = require('../utils/studentOverrideCharges');
 
 const router = express.Router();
 
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
+// A transient database failure here used to take the whole process down: this
+// handler awaited Prisma with no try/catch, so a connection blip became an
+// unhandled rejection and Node exited. Reporting it as 503 keeps the server up
+// and tells the client it is worth retrying — the same distinction authMiddleware
+// already draws between "unavailable" and "your session is invalid".
+const isTransientDbError = (e) =>
+  e && (e.code === 'P1001' || e.code === 'P1002' || e.code === 'P1017' || e.code === 'P2024');
+
+function sendDbError(res, e, what) {
+  if (isTransientDbError(e)) {
+    console.error(`students: ${what} — database unavailable`, e.code);
+    return res.status(503).json({
+      code: 'SERVER_UNAVAILABLE',
+      error: 'Something went wrong on our end. Please try again.',
+    });
+  }
+  console.error(`students: ${what} failed`, e);
+  return res.status(500).json({ error: e.message });
+}
+
 router.get('/', async (req, res) => {
+  try {
   const schoolId = req.user.schoolId;
   const { q, class: cls } = req.query;
   const where = {
@@ -34,13 +60,14 @@ router.get('/', async (req, res) => {
   // pair per student.
   // Each student's first-installment rule comes from THEIR class level, so the
   // computation needs the class name, not just the id.
-  const status = await computeFeesStatusForStudents(prisma, schoolId, rows.map((r) => ({ id: r.id, class: r.class })));
+  const status = await computeFeesStatusForStudents(prisma, schoolId, rows.map((r) => ({ id: r.id, class: r.class, feesOverridden: r.feesOverridden })));
   res.json(
     mapWithIdAsCode(rows).map((row, i) => {
       const st = status.get(rows[i].id);
       return {
         ...withFlatParent(row),
         classLevel: classLevelOf(rows[i].class),
+        feesOverridden: Boolean(rows[i].feesOverridden),
         paymentStatus: st?.paymentStatus ?? null,
         firstInstallmentMet: st?.firstInstallmentMet ?? null,
         // The totals the status was derived from — the later Fees column needs
@@ -52,20 +79,25 @@ router.get('/', async (req, res) => {
       };
     }),
   );
+  } catch (e) {
+    sendDbError(res, e, 'list');
+  }
 });
 
 router.get('/:id', async (req, res) => {
+  try {
   const schoolId = req.user.schoolId;
   const s = await prisma.student.findFirst({
     where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
     include: { parent: true },
   });
   if (!s) return res.status(404).json({ error: 'Not found' });
-  const status = await computeFeesStatusForStudents(prisma, schoolId, [{ id: s.id, class: s.class }]);
+  const status = await computeFeesStatusForStudents(prisma, schoolId, [{ id: s.id, class: s.class, feesOverridden: s.feesOverridden }]);
   const st = status.get(s.id);
   res.json({
     ...withFlatParent(withIdAsCode(s)),
     classLevel: classLevelOf(s.class),
+    feesOverridden: Boolean(s.feesOverridden),
     paymentStatus: st?.paymentStatus ?? null,
     firstInstallmentMet: st?.firstInstallmentMet ?? null,
     // Detail view also gets the raw totals the status was derived from, so a
@@ -74,6 +106,9 @@ router.get('/:id', async (req, res) => {
     totalPaid: st?.totalPaid ?? 0,
     balance: st?.balance ?? 0,
   });
+  } catch (e) {
+    sendDbError(res, e, 'detail');
+  }
 });
 
 router.post('/', async (req, res) => {
@@ -139,6 +174,103 @@ router.put('/:id', async (req, res) => {
     res.json(withFlatParent(withIdAsCode(updated)));
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Per-student fee override — detaching one student from their class level's fee
+// structure (scholarship, staff child, partial waiver).
+// ---------------------------------------------------------------------------
+
+const findStudent = (schoolId, idOrCode) =>
+  prisma.student.findFirst({
+    where: { schoolId, OR: [{ code: String(idOrCode) }, { id: parseInt(idOrCode) || 0 }] },
+  });
+
+// GET /students/:id/fee-override
+// The student's current effective structure. When they are NOT overridden this
+// returns their class level's fees, which is exactly what the dialog pre-fills
+// with — the admin adjusts down from the standard rather than rebuilding it.
+router.get('/:id/fee-override', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const student = await findStudent(schoolId, req.params.id);
+    if (!student) return res.status(404).json({ error: 'Not found' });
+    const structure = await getStudentFeeStructure(prisma, schoolId, student);
+    res.json({
+      studentId: student.code,
+      classLevel: structure.classLevel,
+      overridden: structure.overridden,
+      fees: structure.fees.map((f) => ({
+        name: f.name,
+        amount: f.amount,
+        firstInstallmentPercent: f.firstInstallmentPercent,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /students/:id/fee-override
+// Body: { fees: [{ name, amount, firstInstallmentPercent }] }
+// Detaches the student (if not already) and replaces their snapshot with this
+// COMPLETE set — an omitted fee is removed for them. Then reconciles their
+// existing charges to the new amounts.
+router.put('/:id/fee-override', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const student = await findStudent(schoolId, req.params.id);
+    if (!student) return res.status(404).json({ error: 'Not found' });
+
+    const { fees } = req.body || {};
+    if (!Array.isArray(fees)) return res.status(400).json({ error: 'fees array required' });
+
+    const seen = new Set();
+    const parsed = [];
+    for (const raw of fees) {
+      const name = String(raw?.name ?? '').trim();
+      if (!name) return res.status(400).json({ error: 'every fee needs a name' });
+      if (seen.has(name.toLowerCase())) {
+        return res.status(400).json({ error: `Duplicate fee name "${name}".` });
+      }
+      seen.add(name.toLowerCase());
+      const amount = Number(raw?.amount ?? 0);
+      if (!Number.isFinite(amount) || amount < 0) {
+        return res.status(400).json({ error: `"${name}": amount must be 0 or more.` });
+      }
+      let percent = null;
+      const p = raw?.firstInstallmentPercent;
+      if (p !== null && p !== undefined && p !== '') {
+        percent = Number(p);
+        if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+          return res.status(400).json({ error: `"${name}": first installment % must be 0–100.` });
+        }
+        percent = Math.round(percent);
+      }
+      parsed.push({ name, amount: Math.round(amount), firstInstallmentPercent: percent });
+    }
+
+    const rebill = await setStudentFeeOverride(prisma, schoolId, student.id, parsed);
+    const structure = await getStudentFeeStructure(prisma, schoolId, { ...student, feesOverridden: true });
+    res.json({ studentId: student.code, overridden: true, fees: structure.fees, rebill });
+  } catch (e) {
+    if (e.code === 'P2002') return res.status(409).json({ error: 'Two fees cannot share a name.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /students/:id/fee-override — re-attach to the standard class fees,
+// discarding the custom setup.
+router.delete('/:id/fee-override', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const student = await findStudent(schoolId, req.params.id);
+    if (!student) return res.status(404).json({ error: 'Not found' });
+    const rebill = await removeStudentFeeOverride(prisma, schoolId, student.id);
+    res.json({ studentId: student.code, overridden: false, rebill });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

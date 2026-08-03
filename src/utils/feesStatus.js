@@ -1,4 +1,4 @@
-const { classLevelOf } = require('./classLevels');
+const { feeKeyOf, getFeeStructuresForStudents } = require('./studentFees');
 
 /**
  * Two derived fee values per student, computed live from ledger entries and
@@ -55,7 +55,7 @@ function computeStudentFeesStatus(entries, config = []) {
     if (e.type === 'CHARGE') {
       totalCharged += amount;
       charges.push({
-        feeId: e.classLevelFeeId ?? null,
+        feeId: feeKeyOf(e),
         amount,
         remaining: amount,
         entryDate: new Date(e.entryDate).getTime(),
@@ -81,7 +81,7 @@ function computeStudentFeesStatus(entries, config = []) {
   const base = { paymentStatus, totalCharged, totalPaid, balance: totalCharged - totalPaid };
 
   // --- (b) first installment ----------------------------------------------
-  const rule = (config || []).filter((c) => c && c.classLevelFeeId != null && c.percent != null);
+  const rule = (config || []).filter((c) => c && c.feeKey != null && c.percent != null);
   if (!rule.length) return { ...base, firstInstallmentMet: null };
 
   // Allocation runs over FEE-LINKED charges only. A one-off charge (a fine, a
@@ -108,15 +108,15 @@ function computeStudentFeesStatus(entries, config = []) {
     paidByFee.set(c.feeId, (paidByFee.get(c.feeId) ?? 0) + (c.amount - c.remaining));
   }
 
-  const firstInstallmentMet = rule.every(({ classLevelFeeId, percent }) => {
-    const charged = chargedByFee.get(classLevelFeeId) ?? 0;
+  const firstInstallmentMet = rule.every(({ feeKey, percent }) => {
+    const charged = chargedByFee.get(feeKey) ?? 0;
     // Nothing charged for a required fee means nothing to pay for it, so it
     // cannot hold the student back.
     if (charged <= 0) return true;
     // Rounded up, so a 50% requirement is not satisfied by being half a unit
     // short.
     const required = Math.ceil((charged * Number(percent)) / 100);
-    return (paidByFee.get(classLevelFeeId) ?? 0) >= required;
+    return (paidByFee.get(feeKey) ?? 0) >= required;
   });
 
   return { ...base, firstInstallmentMet };
@@ -125,29 +125,29 @@ function computeStudentFeesStatus(entries, config = []) {
 /**
  * Both values for many students at once — the student list needs this per row,
  * so it runs a fixed number of queries rather than a pair per student.
- * Each student's rule comes from THEIR class level.
+ *
+ * Each student's first-installment rule comes from THEIR OWN effective fee
+ * structure: their personal override snapshot if they have been detached,
+ * otherwise their class level's fees. A detached student is therefore measured
+ * entirely against their own arrangement, which is the point of detaching.
+ *
+ * `students` must carry { id, class, feesOverridden }.
  */
 async function computeFeesStatusForStudents(prisma, schoolId, students) {
   const ids = students.map((s) => s.id);
   const out = new Map();
   if (!ids.length) return out;
 
-  const [entries, fees] = await Promise.all([
+  const [entries, structures] = await Promise.all([
     prisma.ledgerEntry.findMany({
       where: { schoolId, studentId: { in: ids } },
-      select: { id: true, studentId: true, type: true, classLevelFeeId: true, amount: true, entryDate: true },
+      select: {
+        id: true, studentId: true, type: true, amount: true, entryDate: true,
+        classLevelFeeId: true, studentFeeOverrideId: true,
+      },
     }),
-    prisma.classLevelFee.findMany({
-      where: { schoolId, firstInstallmentPercent: { not: null } },
-      select: { id: true, classLevel: true, firstInstallmentPercent: true },
-    }),
+    getFeeStructuresForStudents(prisma, schoolId, students),
   ]);
-
-  const ruleByLevel = new Map();
-  for (const f of fees) {
-    if (!ruleByLevel.has(f.classLevel)) ruleByLevel.set(f.classLevel, []);
-    ruleByLevel.get(f.classLevel).push({ classLevelFeeId: f.id, percent: f.firstInstallmentPercent });
-  }
 
   const entriesByStudent = new Map(ids.map((id) => [id, []]));
   for (const e of entries) {
@@ -156,8 +156,12 @@ async function computeFeesStatusForStudents(prisma, schoolId, students) {
   }
 
   for (const s of students) {
-    const level = classLevelOf(s.class);
-    out.set(s.id, computeStudentFeesStatus(entriesByStudent.get(s.id) ?? [], ruleByLevel.get(level) ?? []));
+    const structure = structures.get(s.id);
+    const rule = (structure?.fees ?? [])
+      .filter((f) => f.firstInstallmentPercent != null)
+      .map((f) => ({ feeKey: f.key, percent: f.firstInstallmentPercent }));
+    const status = computeStudentFeesStatus(entriesByStudent.get(s.id) ?? [], rule);
+    out.set(s.id, { ...status, feesOverridden: Boolean(structure?.overridden) });
   }
   return out;
 }
