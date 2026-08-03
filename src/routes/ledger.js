@@ -1,6 +1,7 @@
 const express = require('express');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../db/prisma');
+const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 
@@ -215,38 +216,55 @@ router.get('/transactions', async (req, res) => {
 });
 
 // POST /ledger/charge
+//
+// Two distinct kinds of student charge, chosen by whether classLevelFeeId is
+// supplied. They are kept apart deliberately, because they mean different things
+// to the fee maths:
+//
+//   FEE-CATEGORY CHARGE  { classLevelFeeId }
+//     An extra charge in one of the student's OWN class level's fee categories.
+//     Carries classLevelFeeId, so it counts toward that category's
+//     first-installment requirement exactly like the structural billed charge.
+//     isFeeStructureCharge stays false, so the level sync will not overwrite it
+//     when the fee's amount next changes.
+//
+//   ONE-OFF CHARGE  { description, no classLevelFeeId }
+//     A fine, a trip, a replaced book — outside the fee structure. No
+//     classLevelFeeId and no ChargeCategory, so it can never appear in
+//     per-category first-installment maths. It still raises the student's total
+//     owed, so it does affect No Payment / Owing / Completed / Overpaid.
 router.post('/charge', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const { studentId, categoryId, description, amount, entryDate, paymentMethod } = req.body || {};
+    const { studentId, classLevelFeeId, description, amount, entryDate, paymentMethod } = req.body || {};
 
     const amt = Number(amount);
-    if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
-    if (!description) return res.status(400).json({ error: 'description required' });
+    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
     if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
 
-    const [student, category] = await Promise.all([
-      prisma.student.findFirst({
-        where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
-      }),
-      prisma.chargeCategory.findFirst({
-        where: { id: parseInt(categoryId) || 0, schoolId },
-      }),
-    ]);
+    const student = await prisma.student.findFirst({
+      where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
+    });
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
-    if (!category) return res.status(400).json({ error: 'Invalid categoryId' });
 
-    if (category.limit > 0) {
-      const agg = await prisma.ledgerEntry.aggregate({
-        where: { studentId: student.id, categoryId: category.id, type: 'CHARGE' },
-        _sum: { amount: true },
-      });
-      const cumulative = agg._sum.amount ?? 0;
-      if (cumulative + amt > category.limit) {
-        return res.status(422).json({
-          error: `This charge would exceed the ${category.name} limit of ${category.limit} for this student (charged so far: ${cumulative}, adding: ${amt})`,
+    let fee = null;
+    if (classLevelFeeId !== undefined && classLevelFeeId !== null && classLevelFeeId !== '') {
+      const feeId = parseInt(classLevelFeeId, 10);
+      if (!Number.isFinite(feeId)) return res.status(400).json({ error: 'Invalid classLevelFeeId' });
+      fee = await prisma.classLevelFee.findFirst({ where: { id: feeId, schoolId } });
+      if (!fee) return res.status(400).json({ error: 'Invalid classLevelFeeId' });
+      // The fee must belong to THIS student's level. Charging a student against
+      // another level's category would corrupt both levels' figures.
+      const level = classLevelOf(student.class);
+      if (fee.classLevel !== level) {
+        return res.status(400).json({
+          error: `${fee.name} belongs to ${fee.classLevel}, but this student is in ${level}.`,
         });
       }
+    } else if (!String(description || '').trim()) {
+      // Only the one-off path needs a description typed in; a fee-category
+      // charge can fall back to the category's own name.
+      return res.status(400).json({ error: 'description required for a one-off charge' });
     }
 
     const { academicYear, term } = await getSchoolPeriod(schoolId);
@@ -256,15 +274,18 @@ router.post('/charge', async (req, res) => {
         type: 'CHARGE',
         schoolId,
         studentId: student.id,
-        categoryId: category.id,
-        description,
-        amount: amt,
+        classLevelFeeId: fee ? fee.id : null,
+        // Never true here: only syncLevelFeeCharges creates structural rows.
+        isFeeStructureCharge: false,
+        categoryId: null,
+        description: String(description || '').trim() || fee.name,
+        amount: Math.round(amt),
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
         academicYear,
         term,
       },
-      include: { category: true },
+      include: { classLevelFee: true },
     });
     res.status(201).json(withIdAsCode(entry));
   } catch (e) {

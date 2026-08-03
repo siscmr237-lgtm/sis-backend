@@ -93,6 +93,11 @@ router.post('/', async (req, res) => {
       skipDuplicates: true,
     });
 
+    // Fee categories are NOT seeded here any more: they belong to a class
+    // LEVEL, and each level gets its defaults the first time its fee structure
+    // is opened (see ensureLevelFeeDefaults). Seeding every level up front
+    // would create rows for levels the school may never configure.
+
     const updated = await prisma.school.findUnique({ where: { id: schoolId } });
     const classes = await prisma.class.findMany({
       where: { schoolId },

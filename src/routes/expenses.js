@@ -6,6 +6,19 @@ const { resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
+// invoiceNumber is unique on (schoolId, invoiceNumber), so a P2002 on it can
+// only be a clash within the caller's own school. Previously unhandled, which
+// surfaced the raw Prisma error text to the client.
+function invoiceConflictMessage(e) {
+  if (e.code !== 'P2002') return null;
+  const target = e.meta?.target;
+  const fields = Array.isArray(target) ? target : [target].filter(Boolean);
+  if (fields.includes('invoiceNumber')) {
+    return 'An expense with this invoice number already exists in this school.';
+  }
+  return 'An expense with these details already exists in this school.';
+}
+
 router.get('/', async (req, res) => {
   const schoolId = req.user.schoolId;
   const { q, category } = req.query;
@@ -54,6 +67,8 @@ router.post('/', async (req, res) => {
     });
     res.status(201).json(withIdAsCode(created));
   } catch (e) {
+    const conflict = invoiceConflictMessage(e);
+    if (conflict) return res.status(409).json({ error: conflict });
     res.status(400).json({ error: e.message });
   }
 });
@@ -73,6 +88,8 @@ router.put('/:id', async (req, res) => {
     });
     res.json(withIdAsCode(updated));
   } catch (e) {
+    const conflict = invoiceConflictMessage(e);
+    if (conflict) return res.status(409).json({ error: conflict });
     res.status(400).json({ error: e.message });
   }
 });

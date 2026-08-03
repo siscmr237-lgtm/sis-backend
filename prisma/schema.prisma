@@ -89,7 +89,14 @@ model Staff {
   subjectAssignments    ClassSubjectTeacher[]
   ledgerEntries         LedgerEntry[]
 
+  // All three are scoped per school, never globally: the same person can
+  // legitimately be on staff at more than one school, so one school holding
+  // their email, phone or ID must not block another from entering them — nor
+  // reveal, through a uniqueness error, that the value exists elsewhere.
+  // Within a single school each stays unique.
   @@unique([schoolId, email])
+  @@unique([schoolId, phone])
+  @@unique([schoolId, idNumber])
   @@index([schoolId])
 }
 
@@ -104,8 +111,13 @@ model Expense {
   amount        Int
   payee         String
   paymentMethod String
-  invoiceNumber String   @unique
+  // Per school, not global. Invoice numbers are each school's own document
+  // series, so sequences like "INV-001" collide across tenants almost by
+  // definition — a global constraint both blocks legitimate entry and leaks
+  // that another school already used the number.
+  invoiceNumber String
 
+  @@unique([schoolId, invoiceNumber])
   @@index([schoolId, date])
 }
 
@@ -332,6 +344,7 @@ model School {
   Class                     Class[]
   Subject                   Subject[]
   chargeCategories          ChargeCategory[]
+  classLevelFees            ClassLevelFee[]
   ledgerEntries             LedgerEntry[]
   TestExam                  TestExam[]
 }
@@ -351,6 +364,39 @@ model ChargeCategory {
   @@unique([name, schoolId])
 }
 
+/// A fee belonging to a class LEVEL — "Class 1", "Nursery 1" — never to a
+/// section and never to the school. Every section of a level ("Class 1 A",
+/// "Class 1 B") shares one fee structure, which is why classLevel stores the
+/// level name rather than pointing at a Class row: a section is not the owner,
+/// and adding or removing sections must not disturb the fees.
+///
+/// classLevel is a plain string rather than an FK because the level is a
+/// concept above the Class table (several Class rows map to one level, and a
+/// level can be configured before any section of it exists). src/utils/
+/// classLevels.js is the only place that derives a level from a class name.
+model ClassLevelFee {
+  id         Int    @id @default(autoincrement())
+  school     School @relation(fields: [schoolId], references: [id])
+  schoolId   Int
+  classLevel String
+  name       String
+  /// What every student of this level is charged for this fee. 0 is a real,
+  /// valid value: the defaults are seeded with no amount so a school fills in
+  /// its own, and a guessed figure would look authoritative.
+  amount     Int    @default(0)
+  /// Share of `amount` that must be paid for this fee to count as part of the
+  /// first installment. NULL means the fee does not count toward it at all, so
+  /// the level's whole first-installment rule is "every fee where this is
+  /// non-null".
+  firstInstallmentPercent Int?
+  charges    LedgerEntry[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([schoolId, classLevel, name])
+  @@index([schoolId, classLevel])
+}
+
 enum LedgerEntryType {
   CHARGE
   PAYMENT
@@ -368,6 +414,28 @@ model LedgerEntry {
   staffId       Int?
   category      ChargeCategory? @relation(fields: [categoryId], references: [id])
   categoryId    Int?
+  /// Set on the one CHARGE row that bills a student for a class-level fee.
+  /// Exactly one such row exists per (student, fee) — see the compound unique
+  /// below — so when a level's amount changes that row is updated in place and
+  /// the student's total charged always equals the level's current fee
+  /// structure. That is what makes a fee change apply to EXISTING charges
+  /// rather than only future ones.
+  classLevelFee   ClassLevelFee? @relation(fields: [classLevelFeeId], references: [id], onDelete: Cascade)
+  classLevelFeeId Int?
+  /// True only on the row that bills the class level's fee STRUCTURE — the one
+  /// syncLevelFeeCharges owns and rewrites when the level's amount changes.
+  ///
+  /// An admin can also record an EXTRA charge against the same fee category
+  /// (say a second Tuition charge). Those carry classLevelFeeId too, so they
+  /// count toward that category's first-installment maths exactly like the
+  /// billed charge, but isFeeStructureCharge is false so the level sync leaves
+  /// them alone instead of overwriting them with the structural amount.
+  ///
+  /// A partial unique index — (studentId, classLevelFeeId) WHERE
+  /// isFeeStructureCharge — keeps exactly one structural row per student per
+  /// fee while allowing any number of extra charges. It is created in raw SQL
+  /// in the migration because Prisma cannot express a partial index.
+  isFeeStructureCharge Boolean @default(false)
   description   String
   amount        Int
   entryDate     DateTime
@@ -381,6 +449,7 @@ model LedgerEntry {
   @@index([staffId, schoolId])
   @@index([schoolId])
   @@index([schoolId, academicYear, term])
+  @@index([classLevelFeeId])
 }
 
 model AdminUser {

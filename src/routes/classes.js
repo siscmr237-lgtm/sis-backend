@@ -1,6 +1,9 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
 const { CLASS_CATALOG } = require('../utils/classCatalog');
+const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
+const { ensureLevelFeeDefaults } = require('../utils/feeCategories');
+const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -26,7 +29,162 @@ router.get('/', async (req, res) => {
   res.json(classes);
 });
 
-// GET /classes/:id
+// The /levels routes are declared BEFORE GET /:id: Express matches in order, so
+// a bare '/levels' would otherwise be captured as an :id.
+//
+// GET /classes/levels
+// The school's distinct class LEVELS — "Class 1", "Nursery 1" — never sections.
+// This is what the Fee Categories dialog lists, because a fee structure belongs
+// to a level and is shared by all of its sections.
+router.get('/levels', async (req, res) => {
+  try {
+    const levels = await listSchoolClassLevels(prisma, req.user.schoolId);
+    res.json({ levels });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /classes/levels/:level/fees
+// That level's fee structure, seeding the defaults the first time it is opened.
+router.get('/levels/:level/fees', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+
+    // One class query serves both the level check and the section list, and it
+    // runs alongside the fee read rather than before it. This endpoint backs a
+    // dialog, and every added round trip costs the better part of a second
+    // against a remote database — the first version issued five and took ~7s.
+    const [classes, existingFees] = await Promise.all([
+      prisma.class.findMany({ where: { schoolId }, select: { name: true } }),
+      prisma.classLevelFee.findMany({ where: { schoolId, classLevel: level }, orderBy: { name: 'asc' } }),
+    ]);
+
+    const sections = classes
+      .filter((c) => classLevelOf(c.name) === level)
+      .map((c) => c.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (!sections.length) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    // Only pays for the seeding round trip when the level genuinely has no fees.
+    const fees = existingFees.length ? existingFees : await ensureLevelFeeDefaults(schoolId, level);
+    res.json({ classLevel: level, sections, fees });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /classes/levels/:level/fees
+// Body: { fees: [{ id?, name, amount, firstInstallmentPercent }] }
+//
+// Replaces the level's whole fee structure in one request: a fee present without
+// an id is created, one with an id is updated, and any existing fee the caller
+// omits is DELETED (taking its charges with it via the FK cascade). Saving the
+// set as a unit is what makes deleting a category work — a patch-style endpoint
+// would leave omitted fees silently in force.
+//
+// Then re-bills: every student of the level has their charge for each fee set to
+// the new amount, so a change applies to EXISTING charges and not merely future
+// ones. Raising a fee puts a fully-paid student back into Owing; lowering one
+// below what they already paid computes as Overpaid.
+router.put('/levels/:level/fees', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const known = await listSchoolClassLevels(prisma, schoolId);
+    if (!known.includes(level)) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    const { fees } = req.body || {};
+    if (!Array.isArray(fees)) return res.status(400).json({ error: 'fees array required' });
+
+    const existing = await prisma.classLevelFee.findMany({
+      where: { schoolId, classLevel: level },
+      select: { id: true },
+    });
+    const existingIds = new Set(existing.map((f) => f.id));
+
+    const seenNames = new Set();
+    const parsed = [];
+    for (const raw of fees) {
+      const name = String(raw?.name ?? '').trim();
+      if (!name) return res.status(400).json({ error: 'every fee needs a name' });
+      const lower = name.toLowerCase();
+      if (seenNames.has(lower)) {
+        return res.status(400).json({ error: `Duplicate fee name "${name}" for this level.` });
+      }
+      seenNames.add(lower);
+
+      const amount = Number(raw?.amount ?? 0);
+      if (!Number.isFinite(amount) || amount < 0) {
+        return res.status(400).json({ error: `"${name}": amount must be 0 or more.` });
+      }
+
+      let percent = null;
+      const rawPct = raw?.firstInstallmentPercent;
+      if (rawPct !== null && rawPct !== undefined && rawPct !== '') {
+        percent = Number(rawPct);
+        if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+          return res.status(400).json({ error: `"${name}": first installment % must be between 0 and 100.` });
+        }
+        percent = Math.round(percent);
+      }
+
+      let id = null;
+      if (raw?.id != null) {
+        id = parseInt(raw.id, 10);
+        if (!existingIds.has(id)) {
+          return res.status(400).json({ error: `Fee ${raw.id} does not belong to this class level.` });
+        }
+      }
+      parsed.push({ id, name, amount: Math.round(amount), firstInstallmentPercent: percent });
+    }
+
+    const keptIds = new Set(parsed.filter((p) => p.id != null).map((p) => p.id));
+    const removedIds = [...existingIds].filter((id) => !keptIds.has(id));
+
+    // Removals first, so a fee can be deleted and another renamed to its name in
+    // the same save without tripping the (schoolId, classLevel, name) unique.
+    if (removedIds.length) {
+      await prisma.classLevelFee.deleteMany({ where: { id: { in: removedIds }, schoolId } });
+    }
+    for (const p of parsed) {
+      if (p.id != null) {
+        await prisma.classLevelFee.update({
+          where: { id: p.id },
+          data: { name: p.name, amount: p.amount, firstInstallmentPercent: p.firstInstallmentPercent },
+        });
+      } else {
+        await prisma.classLevelFee.create({
+          data: {
+            schoolId,
+            classLevel: level,
+            name: p.name,
+            amount: p.amount,
+            firstInstallmentPercent: p.firstInstallmentPercent,
+          },
+        });
+      }
+    }
+
+    const rebill = await syncLevelFeeCharges(prisma, schoolId, level);
+    const updated = await prisma.classLevelFee.findMany({
+      where: { schoolId, classLevel: level },
+      orderBy: { name: 'asc' },
+    });
+    res.json({ classLevel: level, fees: updated, removed: removedIds.length, rebill });
+  } catch (e) {
+    if (e.code === 'P2002') {
+      return res.status(409).json({ error: 'Two fees on this level cannot share a name.' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.class.findFirst({
@@ -36,6 +194,8 @@ router.get('/:id', async (req, res) => {
   if (!found) return res.status(404).json({ error: 'Not found' });
   res.json(found);
 });
+
+// GET /classes/:id — declared above the level routes' anchor; see the note there.
 
 // POST /classes/standard
 //

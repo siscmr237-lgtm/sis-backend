@@ -4,6 +4,28 @@ const { prisma } = require('../db/prisma');
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
+// Every uniqueness constraint on Staff is compound on (schoolId, field), so a
+// P2002 here can only ever be a clash inside the caller's own school. The
+// wording says so explicitly: it must never read as though it could be
+// reporting the existence of another school's record.
+const UNIQUE_FIELD_LABELS = {
+  email: 'email',
+  phone: 'phone number',
+  idNumber: 'ID number',
+};
+
+function uniqueConflictMessage(e) {
+  if (e.code !== 'P2002') return null;
+  const target = e.meta?.target;
+  const fields = Array.isArray(target) ? target : [target].filter(Boolean);
+  for (const [field, label] of Object.entries(UNIQUE_FIELD_LABELS)) {
+    if (fields.includes(field)) {
+      return `A staff member with this ${label} already exists in this school.`;
+    }
+  }
+  return 'A staff member with these details already exists in this school.';
+}
+
 router.get('/', async (req, res) => {
   const schoolId = req.user.schoolId;
   const { q } = req.query;
@@ -57,9 +79,8 @@ router.post('/', async (req, res) => {
     // constraint is (schoolId, email), so this can only ever fire on a clash
     // inside the caller's own school — hence "in this school": it must not
     // read as though it could be reporting another school's data.
-    if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
-      return res.status(409).json({ error: 'A staff member with this email already exists in this school.' });
-    }
+    const conflict = uniqueConflictMessage(e);
+    if (conflict) return res.status(409).json({ error: conflict });
     res.status(500).json({ error: e.message });
   }
 });
@@ -86,9 +107,8 @@ router.put('/:id', async (req, res) => {
     });
     res.json(updated);
   } catch (e) {
-    if (e.code === 'P2002' && e.meta?.target?.includes('email')) {
-      return res.status(409).json({ error: 'A staff member with this email already exists in this school.' });
-    }
+    const conflict = uniqueConflictMessage(e);
+    if (conflict) return res.status(409).json({ error: conflict });
     res.status(400).json({ error: e.message });
   }
 });

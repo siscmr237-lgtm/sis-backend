@@ -4,6 +4,11 @@ const { prisma } = require('../db/prisma');
 const router = express.Router();
 
 // GET /charge-categories?forStaff=true|false
+//
+// Staff-only in practice now. STUDENT fees are no longer ChargeCategory rows:
+// they belong to a class LEVEL (see ClassLevelFee and GET
+// /classes/levels/:level/fees), so nothing seeds student categories here any
+// more and forStaff=false returns whatever a school created by hand.
 router.get('/', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
@@ -11,22 +16,6 @@ router.get('/', async (req, res) => {
     const items = await prisma.chargeCategory.findMany({ where: { schoolId, forStaff }, orderBy: { name: 'asc' } });
     res.json(items);
   } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /charge-categories
-router.post('/', async (req, res) => {
-  try {
-    const schoolId = req.user.schoolId;
-    const { name, limit = 0 } = req.body || {};
-    if (!name) return res.status(400).json({ error: 'name required' });
-    const created = await prisma.chargeCategory.create({
-      data: { name, limit: Number(limit) || 0, isBuiltIn: false, schoolId },
-    });
-    res.status(201).json(created);
-  } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ error: 'A category with this name already exists for this school.' });
     res.status(500).json({ error: e.message });
   }
 });

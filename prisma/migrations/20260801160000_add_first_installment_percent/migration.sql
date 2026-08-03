@@ -1,0 +1,11 @@
+-- Per-school "first installment" requirement, stored on the category itself.
+--
+-- The config is the set of (category, percentage) pairs where this column is
+-- non-null. Keeping it here rather than as JSON on School means it is already
+-- scoped per school (ChargeCategory is), a deleted category takes its
+-- requirement with it instead of leaving a dangling reference, and renaming a
+-- category cannot break the link because the association is by row.
+--
+-- Nullable with no default, so this adds nothing to existing rows: every
+-- category starts outside the first-installment set until a school opts it in.
+ALTER TABLE "ChargeCategory" ADD COLUMN "firstInstallmentPercent" INTEGER;

@@ -2,6 +2,9 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 const { resolveParentId, withFlatParent } = require('../utils/parents');
+const { computeFeesStatusForStudents } = require('../utils/feesStatus');
+const { classLevelOf } = require('../utils/classLevels');
+const { syncStudentFeeCharges } = require('../utils/levelFeeCharges');
 
 const router = express.Router();
 
@@ -26,7 +29,29 @@ router.get('/', async (req, res) => {
     ],
   };
   const rows = await prisma.student.findMany({ where, include: { parent: true }, orderBy: { code: 'asc' } });
-  res.json(mapWithIdAsCode(rows).map(withFlatParent));
+  // Derived live from the ledger on every read, never stored — see
+  // src/utils/feesStatus.js. Two extra queries for the whole page, not one
+  // pair per student.
+  // Each student's first-installment rule comes from THEIR class level, so the
+  // computation needs the class name, not just the id.
+  const status = await computeFeesStatusForStudents(prisma, schoolId, rows.map((r) => ({ id: r.id, class: r.class })));
+  res.json(
+    mapWithIdAsCode(rows).map((row, i) => {
+      const st = status.get(rows[i].id);
+      return {
+        ...withFlatParent(row),
+        classLevel: classLevelOf(rows[i].class),
+        paymentStatus: st?.paymentStatus ?? null,
+        firstInstallmentMet: st?.firstInstallmentMet ?? null,
+        // The totals the status was derived from — the later Fees column needs
+        // them and they are already computed here, so returning them saves the
+        // list screen a second round trip per student.
+        totalCharged: st?.totalCharged ?? 0,
+        totalPaid: st?.totalPaid ?? 0,
+        balance: st?.balance ?? 0,
+      };
+    }),
+  );
 });
 
 router.get('/:id', async (req, res) => {
@@ -36,7 +61,19 @@ router.get('/:id', async (req, res) => {
     include: { parent: true },
   });
   if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json(withFlatParent(withIdAsCode(s)));
+  const status = await computeFeesStatusForStudents(prisma, schoolId, [{ id: s.id, class: s.class }]);
+  const st = status.get(s.id);
+  res.json({
+    ...withFlatParent(withIdAsCode(s)),
+    classLevel: classLevelOf(s.class),
+    paymentStatus: st?.paymentStatus ?? null,
+    firstInstallmentMet: st?.firstInstallmentMet ?? null,
+    // Detail view also gets the raw totals the status was derived from, so a
+    // profile screen does not have to re-fetch the ledger to show them.
+    totalCharged: st?.totalCharged ?? 0,
+    totalPaid: st?.totalPaid ?? 0,
+    balance: st?.balance ?? 0,
+  });
 });
 
 router.post('/', async (req, res) => {
@@ -63,6 +100,9 @@ router.post('/', async (req, res) => {
       },
       include: { parent: true },
     });
+    // Bill the new student their class level's fees straight away, so they are
+    // not silently uncharged until someone next edits the fee structure.
+    await syncStudentFeeCharges(prisma, schoolId, created.id);
     res.status(201).json(withFlatParent(withIdAsCode(created)));
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
@@ -89,6 +129,13 @@ router.put('/:id', async (req, res) => {
       },
       include: { parent: true },
     });
+    // Moving between levels changes which fees apply, so re-bill: charges from
+    // the level they left are dropped and the new level's are raised. A move
+    // within the same level (section A -> B) shares one fee structure and is
+    // therefore a no-op.
+    if (classLevelOf(updated.class) !== classLevelOf(found.class)) {
+      await syncStudentFeeCharges(prisma, schoolId, updated.id);
+    }
     res.json(withFlatParent(withIdAsCode(updated)));
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
