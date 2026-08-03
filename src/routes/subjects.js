@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { listSchoolClassLevels } = require('../utils/classLevels');
 
 const router = express.Router();
 
@@ -68,33 +69,29 @@ router.post('/seed-standard', async (req, res) => {
   const subjects = await prisma.subject.findMany({ where: { schoolId } });
   const subjectByName = Object.fromEntries(subjects.map((s) => [s.name, s.id]));
 
-  // 3. For each class name in the mapping, find the matching Class rows for this school.
-  const classNames = Object.keys(CLASS_SUBJECT_MAP);
-  const classes = await prisma.class.findMany({
-    where: { schoolId, name: { in: classNames } },
-  });
-  const classByName = Object.fromEntries(classes.map((c) => [c.name, c.id]));
+  // 3. CLASS_SUBJECT_MAP is keyed by class LEVEL ("Class 1"), and subjects now
+  //    belong to a level rather than to each section, so links are created per
+  //    level. Only levels this school actually has are seeded.
+  const levels = await listSchoolClassLevels(prisma, schoolId);
 
-  // 4. Build the full set of ClassSubject links to create.
+  // 4. Build the full set of ClassLevelSubject links to create.
   const links = [];
-  for (const [className, subjectNames] of Object.entries(CLASS_SUBJECT_MAP)) {
-    const classId = classByName[className];
-    if (classId == null) continue; // class doesn't exist in this school — skip
+  for (const [levelName, subjectNames] of Object.entries(CLASS_SUBJECT_MAP)) {
+    if (!levels.includes(levelName)) continue; // level not present in this school
     for (const subjectName of subjectNames) {
       const subjectId = subjectByName[subjectName];
       if (subjectId == null) continue;
-      links.push({ classId, subjectId });
+      links.push({ schoolId, classLevel: levelName, subjectId });
     }
   }
 
   // 5. Create links, skipping any that already exist.
-  const { count } = await prisma.classSubject.createMany({ data: links, skipDuplicates: true });
-
+  const { count } = await prisma.classLevelSubject.createMany({ data: links, skipDuplicates: true });
   res.json({
     subjectsInCatalog: ALL_SUBJECT_NAMES.length,
     classLinksCreated: count,
-    classesMatched: Object.keys(classByName).length,
-    classesInMapping: classNames.length,
+    levelsMatched: levels.filter((l) => CLASS_SUBJECT_MAP[l]).length,
+    levelsInMapping: Object.keys(CLASS_SUBJECT_MAP).length,
   });
 });
 

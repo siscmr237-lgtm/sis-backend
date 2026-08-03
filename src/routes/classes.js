@@ -461,10 +461,10 @@ router.post('/:id/subject-teachers', async (req, res) => {
     resolvedStaffId = staffMember.id;
   }
 
-  const classSubject = await prisma.classSubject.findFirst({
-    where: { classId: cls.id, subjectId: Number(subjectId) },
+  const levelSubject = await prisma.classLevelSubject.findFirst({
+    where: { schoolId, classLevel: classLevelOf(cls.name), subjectId: Number(subjectId) },
   });
-  if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+  if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
 
   try {
     const created = await prisma.classSubjectTeacher.create({
@@ -508,10 +508,10 @@ router.put('/:id/subject-teachers/:assignmentId', async (req, res) => {
     }
   }
   if (subjectId !== undefined) {
-    const classSubject = await prisma.classSubject.findFirst({
-      where: { classId: cls.id, subjectId: Number(subjectId) },
+    const levelSubject = await prisma.classLevelSubject.findFirst({
+      where: { schoolId, classLevel: classLevelOf(cls.name), subjectId: Number(subjectId) },
     });
-    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+    if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
     data.subjectId = Number(subjectId);
   }
 
@@ -550,115 +550,107 @@ router.delete('/:id/subject-teachers/:assignmentId', async (req, res) => {
 });
 
 // --- Class subject routes ---
+//
+// Subjects belong to a class LEVEL, shared by every section of it. There is one
+// list per level, so "Class 1 A" and "Class 1 B" can never drift apart and the
+// admin sets a level's subjects once rather than repeating it per section.
+//
+// (The three per-section routes that used to live here were duplicated verbatim
+// twice in this file; Express only ever reached the first copy, so the second was
+// dead. Both are replaced by the level-scoped routes below.)
 
 // GET /classes/:id/subjects
+//
+// Kept at this URL but resolved from the class's LEVEL, so existing callers —
+// Tests & Exams, marks entry, report cards — pick up level-scoped subjects
+// without changing. A student in any section sees their level's subjects.
 router.get('/:id/subjects', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-  const links = await prisma.classSubject.findMany({
-    where: { classId: cls.id },
-    include: { subject: true },
-    orderBy: { subject: { name: 'asc' } },
-  });
-  res.json(links.map((l) => l.subject));
+  try {
+    const schoolId = req.user.schoolId;
+    const cls = await prisma.class.findFirst({
+      where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
+    });
+    if (!cls) return res.status(404).json({ error: 'Class not found' });
+    const links = await prisma.classLevelSubject.findMany({
+      where: { schoolId, classLevel: classLevelOf(cls.name) },
+      include: { subject: true },
+      orderBy: { subject: { name: 'asc' } },
+    });
+    res.json(links.map((l) => l.subject));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// POST /classes/:id/subjects
-router.post('/:id/subjects', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-
-  const { subjectId } = req.body || {};
-  if (!subjectId) return res.status(400).json({ error: 'subjectId is required' });
-
-  const subject = await prisma.subject.findFirst({ where: { id: Number(subjectId), schoolId } });
-  if (!subject) return res.status(404).json({ error: 'Subject not found' });
-
+// GET /classes/levels/:level/subjects
+// The level's subject list, plus the sections it covers so the dialog can show
+// what a change affects.
+router.get('/levels/:level/subjects', async (req, res) => {
   try {
-    await prisma.classSubject.create({ data: { classId: cls.id, subjectId: subject.id } });
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const [classes, links] = await Promise.all([
+      prisma.class.findMany({ where: { schoolId }, select: { name: true } }),
+      prisma.classLevelSubject.findMany({
+        where: { schoolId, classLevel: level },
+        include: { subject: true },
+        orderBy: { subject: { name: 'asc' } },
+      }),
+    ]);
+    const sections = classes
+      .filter((c) => classLevelOf(c.name) === level)
+      .map((c) => c.name)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (!sections.length) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+    res.json({ classLevel: level, sections, subjects: links.map((l) => l.subject) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /classes/levels/:level/subjects  { subjectId }
+router.post('/levels/:level/subjects', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const known = await listSchoolClassLevels(prisma, schoolId);
+    if (!known.includes(level)) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+    const { subjectId } = req.body || {};
+    if (!subjectId) return res.status(400).json({ error: 'subjectId is required' });
+    const subject = await prisma.subject.findFirst({ where: { id: Number(subjectId), schoolId } });
+    if (!subject) return res.status(404).json({ error: 'Subject not found' });
+
+    await prisma.classLevelSubject.create({
+      data: { schoolId, classLevel: level, subjectId: subject.id },
+    });
     res.status(201).json(subject);
   } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ error: 'This subject is already assigned to this class.' });
+    if (e.code === 'P2002') {
+      return res.status(409).json({ error: 'This subject is already on this class level.' });
+    }
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE /classes/:id/subjects/:subjectId
-router.delete('/:id/subjects/:subjectId', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-
-  const link = await prisma.classSubject.findFirst({
-    where: { classId: cls.id, subjectId: parseInt(req.params.subjectId) || 0 },
-    include: { subject: true },
-  });
-  if (!link) return res.status(404).json({ error: 'Assignment not found' });
-
-  await prisma.classSubject.delete({ where: { id: link.id } });
-  res.json(link.subject);
-});
-
-// --- Class subject routes ---
-
-// GET /classes/:id/subjects
-router.get('/:id/subjects', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-  const assignments = await prisma.classSubject.findMany({
-    where: { classId: cls.id },
-    include: { subject: true },
-    orderBy: { subject: { name: 'asc' } },
-  });
-  res.json(assignments);
-});
-
-// POST /classes/:id/subjects
-router.post('/:id/subjects', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-  const { subjectId } = req.body || {};
-  if (!subjectId) return res.status(400).json({ error: 'subjectId is required' });
+// DELETE /classes/levels/:level/subjects/:subjectId
+router.delete('/levels/:level/subjects/:subjectId', async (req, res) => {
   try {
-    const created = await prisma.classSubject.create({
-      data: { classId: cls.id, subjectId: Number(subjectId) },
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const link = await prisma.classLevelSubject.findFirst({
+      where: { schoolId, classLevel: level, subjectId: parseInt(req.params.subjectId) || 0 },
       include: { subject: true },
     });
-    res.status(201).json(created);
+    if (!link) return res.status(404).json({ error: 'This subject is not on that class level.' });
+    await prisma.classLevelSubject.delete({ where: { id: link.id } });
+    res.json(link.subject);
   } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ error: 'Subject already assigned to this class.' });
-    if (e.code === 'P2003') return res.status(400).json({ error: 'subjectId references a subject that does not exist.' });
     res.status(500).json({ error: e.message });
   }
-});
-
-// DELETE /classes/:id/subjects/:subjectId
-router.delete('/:id/subjects/:subjectId', async (req, res) => {
-  const schoolId = req.user.schoolId;
-  const cls = await prisma.class.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
-  });
-  if (!cls) return res.status(404).json({ error: 'Class not found' });
-  const assignment = await prisma.classSubject.findFirst({
-    where: { classId: cls.id, subjectId: parseInt(req.params.subjectId) || 0 },
-  });
-  if (!assignment) return res.status(404).json({ error: 'Assignment not found' });
-  await prisma.classSubject.delete({ where: { id: assignment.id } });
-  res.json(assignment);
 });
 
 module.exports = router;

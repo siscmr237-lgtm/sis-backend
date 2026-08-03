@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { classLevelOf } = require('../utils/classLevels');
 const { resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 
 const router = express.Router();
@@ -423,8 +424,10 @@ router.get('/:id/marks', async (req, res) => {
     const subject = await resolveSubject(schoolId, req.query.subjectId);
     if (!subject) return res.status(400).json({ error: 'Invalid subjectId' });
 
-    const classSubject = await prisma.classSubject.findFirst({ where: { classId: testExam.classId, subjectId: subject.id } });
-    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+    const examClass = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId }, select: { name: true } });
+    // Subjects belong to the class LEVEL, shared by every section of it.
+    const levelSubject = examClass && await prisma.classLevelSubject.findFirst({ where: { schoolId, classLevel: classLevelOf(examClass.name), subjectId: subject.id } });
+    if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
 
     const cls = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId } });
     if (!cls) return res.status(400).json({ error: "This test/exam's class no longer exists." });
@@ -466,8 +469,10 @@ router.put('/:id/subject-totals/:subjectId', async (req, res) => {
     const subject = await resolveSubject(schoolId, req.params.subjectId);
     if (!subject) return res.status(404).json({ error: 'Subject not found' });
 
-    const classSubject = await prisma.classSubject.findFirst({ where: { classId: testExam.classId, subjectId: subject.id } });
-    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+    const examClass = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId }, select: { name: true } });
+    // Subjects belong to the class LEVEL, shared by every section of it.
+    const levelSubject = examClass && await prisma.classLevelSubject.findFirst({ where: { schoolId, classLevel: classLevelOf(examClass.name), subjectId: subject.id } });
+    if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
 
     const totalMarks = Number(req.body?.totalMarks);
     if (!Number.isInteger(totalMarks) || totalMarks <= 0 || totalMarks > MAX_INT32) {
@@ -500,8 +505,10 @@ router.post('/:id/marks/bulk', async (req, res) => {
     const subject = await resolveSubject(schoolId, subjectId);
     if (!subject) return res.status(400).json({ error: 'Invalid subjectId' });
 
-    const classSubject = await prisma.classSubject.findFirst({ where: { classId: testExam.classId, subjectId: subject.id } });
-    if (!classSubject) return res.status(400).json({ error: 'Subject is not assigned to this class.' });
+    const examClass = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId }, select: { name: true } });
+    // Subjects belong to the class LEVEL, shared by every section of it.
+    const levelSubject = examClass && await prisma.classLevelSubject.findFirst({ where: { schoolId, classLevel: classLevelOf(examClass.name), subjectId: subject.id } });
+    if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
 
     const subjectTotal = await prisma.testExamSubjectTotal.findUnique({
       where: { testExamId_subjectId: { testExamId: testExam.id, subjectId: subject.id } },

@@ -215,7 +215,6 @@ model Class {
   classTeacher    Staff?                @relation("ClassTeacher", fields: [classTeacherId], references: [id])
   classTeacherId  Int?
   subjectTeachers ClassSubjectTeacher[]
-  classSubjects   ClassSubject[]
   testExams       TestExam[]
 
   @@unique([name, schoolId])
@@ -226,7 +225,7 @@ model Subject {
   name            String
   school          School                 @relation(fields: [schoolId], references: [id])
   schoolId        Int
-  classSubjects   ClassSubject[]
+  classLevelSubjects ClassLevelSubject[]
   subjectTeachers ClassSubjectTeacher[]
   subjectTotals   TestExamSubjectTotal[]
   marks           StudentMark[]
@@ -234,14 +233,27 @@ model Subject {
   @@unique([name, schoolId])
 }
 
-model ClassSubject {
-  id        Int     @id @default(autoincrement())
-  class     Class   @relation(fields: [classId], references: [id], onDelete: Cascade)
-  classId   Int
-  subject   Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  subjectId Int
+/// Which subjects a class LEVEL teaches — "Class 1", "Nursery 1" — shared by
+/// every section of it. This replaced a per-Class (per-SECTION) link: sections of
+/// one level are the same grade taught twice, so giving them independent subject
+/// lists let them silently diverge, and the admin had to repeat every change per
+/// section.
+///
+/// Mirrors ClassLevelFee exactly, including storing the level as a string rather
+/// than pointing at a Class row: the level is a concept above the Class table
+/// (several sections map to one level, and a level can be configured before any
+/// section of it exists). src/utils/classLevels.js is the only place a level is
+/// derived from a class name.
+model ClassLevelSubject {
+  id         Int     @id @default(autoincrement())
+  school     School  @relation(fields: [schoolId], references: [id])
+  schoolId   Int
+  classLevel String
+  subject    Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  subjectId  Int
 
-  @@unique([classId, subjectId])
+  @@unique([schoolId, classLevel, subjectId])
+  @@index([schoolId, classLevel])
 }
 
 model ClassSubjectTeacher {
@@ -356,6 +368,7 @@ model School {
   Subject                   Subject[]
   chargeCategories          ChargeCategory[]
   classLevelFees            ClassLevelFee[]
+  classLevelSubjects        ClassLevelSubject[]
   studentFeeOverrides       StudentFeeOverride[]
   ledgerEntries             LedgerEntry[]
   TestExam                  TestExam[]
