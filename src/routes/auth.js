@@ -5,9 +5,32 @@ const { authMiddleware } = require('../auth');
 const { validatePassword } = require('../utils/validatePassword');
 const { sendSignupOtp } = require('../utils/mailer');
 const { computeSchoolAbbreviation } = require('../utils/schoolAbbreviation');
-const { signSessionToken: signToken } = require('../utils/sessionToken');
+const { signSessionToken: signToken, ACTOR_ADMIN, ACTOR_TEACHER } = require('../utils/sessionToken');
+const { verifyTeacherInviteToken } = require('../utils/teacherInviteToken');
 
 const router = express.Router();
+
+// A password hash has no business crossing the wire, even bcrypt'd — it is
+// offline-crackable material and the client has no use for it.
+function publicUser(row) {
+  if (!row) return row;
+  const { passwordHash, ...rest } = row;
+  return rest;
+}
+
+// Shapes a Staff row like the AdminUser payload the frontend already receives,
+// so a caller can read `user.name` / `user.schoolId` / `user.School[0]` without
+// caring which table the session came from. Mirrors loadTeacherActor in
+// src/auth.js — the two must stay in step.
+function publicTeacher(staff) {
+  const { school, ...staffRow } = staff;
+  return {
+    ...publicUser(staffRow),
+    name: `${staff.firstName} ${staff.lastName}`.trim(),
+    schoolId: staff.schoolId,
+    School: school ? [school] : [],
+  };
+}
 
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -50,29 +73,203 @@ async function issueSignupOtp(user) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /auth/login
+// POST /auth/login  { identifier, password }
+//
+// One form, two kinds of account. `identifier` is tried as an AdminUser phone
+// number first and then as a teacher's Staff email — admin first because that
+// is the pre-existing behaviour and the two namespaces do not overlap (a phone
+// number is not an email), so the order costs nothing but keeps admin login on
+// exactly the path it was already on.
+//
+// `phoneNumber` is still accepted as an alias. The deployed frontend posts that
+// field, and this endpoint is the one thing standing between it and a total
+// sign-in outage the moment this ships; drop the alias once the client sends
+// `identifier`.
 // ---------------------------------------------------------------------------
 router.post('/login', async (req, res) => {
   try {
-    const { phoneNumber, password } = req.body || {};
-    if (!phoneNumber || !password) {
-      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Phone number and password are required.' });
+    const body = req.body || {};
+    const identifier = body.identifier ?? body.phoneNumber;
+    const { password } = body;
+    if (!identifier || !password) {
+      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Phone number or email and password are required.' });
     }
 
-    const user = await prisma.adminUser.findUnique({ where: { phoneNumber }, include: { School: true } });
+    const admin = await prisma.adminUser.findUnique({
+      where: { phoneNumber: String(identifier) },
+      include: { School: true },
+    });
 
-    if (!user) return res.status(401).json({ code: 'PHONE_NOT_FOUND', error: 'No account linked to this number.' });
-    const ok = await bcrypt.compare(String(password), user.passwordHash);
-    if (!ok) return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
-    if (user.isActive === false) {
+    if (admin) {
+      const ok = await bcrypt.compare(String(password), admin.passwordHash);
+      if (!ok) return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
+      if (admin.isActive === false) {
+        return res.status(401).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
+      }
+      if (!admin.School.length) {
+        return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
+      }
+      return res.json({ token: signToken(admin, ACTOR_ADMIN), user: publicUser(admin), actorType: ACTOR_ADMIN });
+    }
+
+    // No admin — try a teacher. Only rows that can actually log in are
+    // considered: a staff member who is not a teacher, or who has never been
+    // invited (passwordHash still null), is not a candidate at all.
+    //
+    // Case-insensitive because a teacher typing their own address with
+    // different capitalisation is not a wrong password, and the DB's
+    // (schoolId, email) constraint is byte-exact so it does not settle this.
+    const teachers = await prisma.staff.findMany({
+      where: {
+        email: { equals: String(identifier), mode: 'insensitive' },
+        isTeacher: true,
+        passwordHash: { not: null },
+      },
+      include: { school: true },
+    });
+
+    if (!teachers.length) {
+      return res.status(401).json({ code: 'PHONE_NOT_FOUND', error: 'No account linked to this number.' });
+    }
+
+    // Staff.email is unique per SCHOOL, not globally, so two schools can each
+    // hold a login-capable row for the same address. POST /staff/:id/invite
+    // refuses to create that situation, but data predating this feature may
+    // already contain it — and there is no correct way to guess which school
+    // the person meant. Say so instead of signing them into an arbitrary one.
+    if (teachers.length > 1) {
+      return res.status(409).json({
+        code: 'EMAIL_NOT_UNIQUE',
+        error: 'This email is registered at more than one school. Please contact your school administrator.',
+      });
+    }
+
+    const teacher = teachers[0];
+    const teacherOk = await bcrypt.compare(String(password), teacher.passwordHash);
+    if (!teacherOk) {
+      return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid email or password.' });
+    }
+    if (teacher.isActive === false) {
       return res.status(401).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
     }
-    if (!user.School.length) {
-      return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
+
+    return res.json({
+      token: signToken(teacher, ACTOR_TEACHER),
+      user: publicTeacher(teacher),
+      actorType: ACTOR_TEACHER,
+    });
+  } catch (e) {
+    console.error('login error', e);
+    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/teacher/invite/verify  { token }   (public)
+//
+// Lets the "set your password" page greet the teacher by name before they type
+// anything. Read-only: it does not consume the invite, because an invite is only
+// spent by actually setting a password.
+// ---------------------------------------------------------------------------
+router.post('/teacher/invite/verify', async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const result = verifyTeacherInviteToken(token);
+    if (!result.valid) {
+      return res.status(400).json({ code: result.code, error: result.error });
     }
 
-    return res.json({ token: signToken(user), user });
+    const staff = await prisma.staff.findUnique({
+      where: { id: result.staffId },
+      include: { school: true },
+    });
+
+    // A deleted staff member, or one since demoted out of teaching, gets the
+    // same generic answer as a forged token — the invite is simply not valid,
+    // and distinguishing the cases here would confirm to whoever holds the
+    // link that the record exists.
+    if (!staff || !staff.isTeacher) {
+      return res.status(400).json({ code: 'INVALID_INVITE_TOKEN', error: 'This invitation link is invalid.' });
+    }
+    if (staff.isActive === false) {
+      return res.status(403).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
+    }
+    if (staff.passwordHash) {
+      return res.status(409).json({
+        code: 'INVITE_ALREADY_USED',
+        error: 'You have already set your password. Please sign in instead.',
+      });
+    }
+
+    return res.json({
+      name: `${staff.firstName} ${staff.lastName}`.trim(),
+      firstName: staff.firstName,
+      lastName: staff.lastName,
+      email: staff.email,
+      schoolName: staff.school?.name ?? null,
+    });
   } catch (e) {
+    console.error('teacher/invite/verify error', e);
+    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/teacher/set-password  { token, password }   (public)
+//
+// Consumes the invite and logs the teacher straight in, so activation is one
+// step rather than "password set — now go and sign in".
+// ---------------------------------------------------------------------------
+router.post('/teacher/set-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || !password) {
+      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Token and password are required.' });
+    }
+
+    const result = verifyTeacherInviteToken(token);
+    if (!result.valid) {
+      return res.status(400).json({ code: result.code, error: result.error });
+    }
+
+    const staff = await prisma.staff.findUnique({ where: { id: result.staffId } });
+    if (!staff || !staff.isTeacher) {
+      return res.status(400).json({ code: 'INVALID_INVITE_TOKEN', error: 'This invitation link is invalid.' });
+    }
+    if (staff.isActive === false) {
+      return res.status(403).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
+    }
+
+    // The whole "used" check. No column tracks it: a set password IS the record
+    // that the invite was spent, which makes replaying the link a no-op instead
+    // of a way to overwrite someone's existing password.
+    if (staff.passwordHash) {
+      return res.status(409).json({
+        code: 'INVITE_ALREADY_USED',
+        error: 'You have already set your password. Please sign in instead.',
+      });
+    }
+
+    const pwCheck = validatePassword(String(password));
+    if (!pwCheck.valid) {
+      return res.status(400).json({ code: 'WEAK_PASSWORD', error: pwCheck.message });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    await prisma.staff.update({ where: { id: staff.id }, data: { passwordHash } });
+
+    const updated = await prisma.staff.findUnique({
+      where: { id: staff.id },
+      include: { school: true },
+    });
+
+    return res.json({
+      token: signToken(updated, ACTOR_TEACHER),
+      user: publicTeacher(updated),
+      actorType: ACTOR_TEACHER,
+    });
+  } catch (e) {
+    console.error('teacher/set-password error', e);
     res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
   }
 });
@@ -151,7 +348,9 @@ router.post('/signup', async (req, res) => {
       user = await prisma.adminUser.findUnique({ where: { id: created.id }, include: { School: true } });
     }
 
-    return res.status(201).json({ token: signToken(user), user });
+    // actorType mirrors what /login now returns so the client can read it from
+    // either entry point; signup is always an admin.
+    return res.status(201).json({ token: signToken(user), user: publicUser(user), actorType: ACTOR_ADMIN });
   } catch (e) {
     if (e.code === 'P2002') {
       return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'An account with this email or phone number already exists.' });
@@ -271,7 +470,7 @@ router.post('/otp/verify-signup', authMiddleware, async (req, res) => {
     await prisma.adminUser.update({ where: { id: req.user.id }, data: { emailVerified: true } });
 
     const user = await prisma.adminUser.findUnique({ where: { id: req.user.id }, include: { School: true } });
-    return res.json({ user });
+    return res.json({ user: publicUser(user) });
   } catch (e) {
     console.error('otp/verify-signup error', e);
     return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
@@ -285,7 +484,14 @@ router.get('/me', async (req, res) => {
   try {
     const user = req.user;
     if (!user) return res.status(404).json({ error: 'Not found' });
-    res.json({ id: user.id, name: user.name, phoneNumber: user.phoneNumber, role: user.role, schoolId: user.schoolId });
+    res.json({
+      id: user.id,
+      name: user.name,
+      phoneNumber: user.phoneNumber,
+      role: user.role,
+      schoolId: user.schoolId,
+      actorType: user.actorType,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -4,6 +4,7 @@ const { prisma } = require('../db/prisma');
 const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
+const { requireAdmin, requireTeacher } = require('../roleGuards');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -25,7 +26,7 @@ async function getSchoolPeriod(schoolId) {
 // reports as active (live-computed if autoTermEnabled, else the manually set
 // values) — used to default the Finance page's Academic Year/Term filters to
 // "current" instead of "All".
-router.get('/current-period', async (req, res) => {
+router.get('/current-period', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const school = await prisma.school.findUnique({
@@ -40,7 +41,7 @@ router.get('/current-period', async (req, res) => {
 
 // GET /ledger/academic-years — distinct academic years seen in this school's
 // ledger, newest first, for populating the Finance page's filter dropdown.
-router.get('/academic-years', async (req, res) => {
+router.get('/academic-years', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const rows = await prisma.ledgerEntry.findMany({
@@ -59,7 +60,7 @@ router.get('/academic-years', async (req, res) => {
 // rollup for the school-wide Finance page's "Student Transactions" table.
 // Search/class filter which students appear; date range/academic year/term
 // filter which of their ledger entries count toward the charged/paid totals.
-router.get('/student-summary', async (req, res) => {
+router.get('/student-summary', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -149,7 +150,7 @@ router.get('/student-summary', async (req, res) => {
 //                       Allowance, Staff Expense, Damage, uncategorized staff
 //                       payments) plus every standalone Expense row (Utilities,
 //                       Supplies, Maintenance, general/staff Damage, etc.)
-router.get('/transactions', async (req, res) => {
+router.get('/transactions', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const bucket = ['fees', 'payroll', 'others'].includes(req.query.bucket) ? req.query.bucket : 'fees';
@@ -233,7 +234,7 @@ router.get('/transactions', async (req, res) => {
 //     classLevelFeeId and no ChargeCategory, so it can never appear in
 //     per-category first-installment maths. It still raises the student's total
 //     owed, so it does affect No Payment / Owing / Completed / Overpaid.
-router.post('/charge', async (req, res) => {
+router.post('/charge', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { studentId, classLevelFeeId, description, amount, entryDate, paymentMethod } = req.body || {};
@@ -294,7 +295,7 @@ router.post('/charge', async (req, res) => {
 });
 
 // POST /ledger/payment
-router.post('/payment', async (req, res) => {
+router.post('/payment', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { studentId, description, amount, entryDate, paymentMethod } = req.body || {};
@@ -332,7 +333,7 @@ router.post('/payment', async (req, res) => {
 });
 
 // GET /ledger/student/:studentId
-router.get('/student/:studentId', async (req, res) => {
+router.get('/student/:studentId', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { studentId } = req.params;
@@ -373,8 +374,67 @@ router.get('/student/:studentId', async (req, res) => {
   }
 });
 
+// One staff member's ledger: every entry, plus the two totals and the balance
+// they imply. Shared by the admin route (any staff member, addressed by code)
+// and the teacher route (their own, addressed as 'me') so the two can never
+// drift into reporting a different balance for the same person.
+async function sendStaffLedger(res, schoolId, staff) {
+  const STAFF_CATS = ['Salary', 'Staff Expense', 'Damage', 'Bonus', 'Transportation Allowance'];
+  await prisma.chargeCategory.createMany({
+    data: STAFF_CATS.map(name => ({ name, isBuiltIn: true, forStaff: true, schoolId })),
+    skipDuplicates: true,
+  });
+
+  const [entries, agg] = await Promise.all([
+    prisma.ledgerEntry.findMany({
+      where: { staffId: staff.id, schoolId },
+      include: { category: true },
+      orderBy: { entryDate: 'desc' },
+    }),
+    prisma.ledgerEntry.groupBy({
+      by: ['type'],
+      where: { staffId: staff.id, schoolId },
+      _sum: { amount: true },
+    }),
+  ]);
+
+  let totalCharged = 0;
+  let totalPaid = 0;
+  for (const row of agg) {
+    if (row.type === 'CHARGE') totalCharged = row._sum.amount ?? 0;
+    if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
+  }
+
+  res.json({
+    entries: mapWithIdAsCode(entries),
+    totalCharged,
+    totalPaid,
+    balance: totalCharged - totalPaid,
+  });
+}
+
+// GET /ledger/staff/me — the signed-in teacher's own salary ledger.
+//
+// Registered BEFORE '/staff/:staffId' because Express matches in declaration
+// order: the parameterised route would otherwise capture 'me' and look up a
+// staff member whose code is literally "me", which 404s. Same ordering hazard
+// as /staff/me in src/routes/staff.js.
+//
+// The staff row is resolved from the SESSION, never from a parameter, so there
+// is no id for a teacher to substitute in order to read a colleague's pay.
+router.get('/staff/me', requireTeacher, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const staff = await prisma.staff.findFirst({ where: { id: req.user.id, schoolId } });
+    if (!staff) return res.status(404).json({ error: 'Staff not found' });
+    await sendStaffLedger(res, schoolId, staff);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /ledger/staff/:staffId
-router.get('/staff/:staffId', async (req, res) => {
+router.get('/staff/:staffId', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { staffId } = req.params;
@@ -384,45 +444,14 @@ router.get('/staff/:staffId', async (req, res) => {
     });
     if (!staff) return res.status(404).json({ error: 'Staff not found' });
 
-    const STAFF_CATS = ['Salary', 'Staff Expense', 'Damage', 'Bonus', 'Transportation Allowance'];
-    await prisma.chargeCategory.createMany({
-      data: STAFF_CATS.map(name => ({ name, isBuiltIn: true, forStaff: true, schoolId })),
-      skipDuplicates: true,
-    });
-
-    const [entries, agg] = await Promise.all([
-      prisma.ledgerEntry.findMany({
-        where: { staffId: staff.id, schoolId },
-        include: { category: true },
-        orderBy: { entryDate: 'desc' },
-      }),
-      prisma.ledgerEntry.groupBy({
-        by: ['type'],
-        where: { staffId: staff.id, schoolId },
-        _sum: { amount: true },
-      }),
-    ]);
-
-    let totalCharged = 0;
-    let totalPaid = 0;
-    for (const row of agg) {
-      if (row.type === 'CHARGE') totalCharged = row._sum.amount ?? 0;
-      if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
-    }
-
-    res.json({
-      entries: mapWithIdAsCode(entries),
-      totalCharged,
-      totalPaid,
-      balance: totalCharged - totalPaid,
-    });
+    await sendStaffLedger(res, schoolId, staff);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // POST /ledger/staff-charge
-router.post('/staff-charge', async (req, res) => {
+router.post('/staff-charge', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { staffId, categoryId, description, amount, entryDate, paymentMethod } = req.body || {};
@@ -467,7 +496,7 @@ router.post('/staff-charge', async (req, res) => {
 });
 
 // POST /ledger/staff-payment
-router.post('/staff-payment', async (req, res) => {
+router.post('/staff-payment', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { staffId, description, amount, entryDate, paymentMethod } = req.body || {};
@@ -505,7 +534,7 @@ router.post('/staff-payment', async (req, res) => {
 });
 
 // DELETE /ledger/:id
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const { id } = req.params;

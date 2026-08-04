@@ -1,5 +1,18 @@
 {
   "rewrites": [
-    { "source": "/(.*)", "destination": "/src/index.js" }
+    {
+      "source": "/(.*)",
+      "destination": "/src/index.js"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/cron/advance-academic-year",
+      "schedule": "10 2 * * *"
+    },
+    {
+      "path": "/cron/apply-term-end-zeros",
+      "schedule": "25 2 * * *"
+    }
   ]
 }

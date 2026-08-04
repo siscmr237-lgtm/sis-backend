@@ -10,8 +10,31 @@ const {
   setStudentFeeOverride,
   removeStudentFeeOverride,
 } = require('../utils/studentOverrideCharges');
+const { findStudentsWithZeroMarks, findZeroMarkSubjects } = require('../utils/zeroMarks');
+const { applyTermEndZerosQuietly } = require('../utils/termEndZeros');
+const { requireAdmin, getTeacherClassNames } = require('../roleGuards');
+const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
 const router = express.Router();
+
+/**
+ * The extra `where` clause that confines a teacher to their own students, or
+ * `{}` for an admin.
+ *
+ * Student.class is a NAME string, not a foreign key (see the model), so the
+ * scope has to be expressed in names — hence getTeacherClassNames rather than
+ * the class ids.
+ *
+ * A teacher who is class teacher of nothing gets `class: { in: [] }`, which
+ * matches no rows. That is the intended answer: "no classes" must mean "no
+ * students", never "all students". Returning {} here for an empty list would
+ * silently widen the query to the whole school.
+ */
+async function teacherStudentScope(user) {
+  if (user?.actorType !== ACTOR_TEACHER) return {};
+  const classNames = await getTeacherClassNames(user.id, user.schoolId);
+  return { class: { in: classNames } };
+}
 
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
@@ -39,6 +62,10 @@ router.get('/', async (req, res) => {
   try {
   const schoolId = req.user.schoolId;
   const { q, class: cls } = req.query;
+  // Applied as an additional AND term rather than replacing the caller's
+  // `class` filter, so a teacher passing ?class= can only ever narrow within
+  // their own classes — never step outside them.
+  const scope = await teacherStudentScope(req.user);
   const where = {
     schoolId,
     AND: [
@@ -52,15 +79,23 @@ router.get('/', async (req, res) => {
           }
         : {},
       cls && cls !== 'all' ? { class: String(cls) } : {},
+      scope,
     ],
   };
+  // The zero dot has to be right the moment a term ends, and this list is the
+  // request nearly every screen makes, so the sweep rides along here too.
+  await applyTermEndZerosQuietly(prisma, schoolId);
+
   const rows = await prisma.student.findMany({ where, include: { parent: true }, orderBy: { code: 'asc' } });
   // Derived live from the ledger on every read, never stored — see
   // src/utils/feesStatus.js. Two extra queries for the whole page, not one
   // pair per student.
   // Each student's first-installment rule comes from THEIR class level, so the
   // computation needs the class name, not just the id.
-  const status = await computeFeesStatusForStudents(prisma, schoolId, rows.map((r) => ({ id: r.id, class: r.class, feesOverridden: r.feesOverridden })));
+  const [status, zeroMarkIds] = await Promise.all([
+    computeFeesStatusForStudents(prisma, schoolId, rows.map((r) => ({ id: r.id, class: r.class, feesOverridden: r.feesOverridden }))),
+    findStudentsWithZeroMarks(prisma, schoolId, rows.map((r) => r.id)),
+  ]);
   res.json(
     mapWithIdAsCode(rows).map((row, i) => {
       const st = status.get(rows[i].id);
@@ -70,6 +105,8 @@ router.get('/', async (req, res) => {
         feesOverridden: Boolean(rows[i].feesOverridden),
         paymentStatus: st?.paymentStatus ?? null,
         firstInstallmentMet: st?.firstInstallmentMet ?? null,
+        // Drives the red "has a zero" dot — see src/utils/zeroMarks.js.
+        hasZeroMark: zeroMarkIds.has(rows[i].id),
         // The totals the status was derived from — the later Fees column needs
         // them and they are already computed here, so returning them saves the
         // list screen a second round trip per student.
@@ -87,12 +124,25 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
   const schoolId = req.user.schoolId;
+  // Same scope as the list. A teacher who guesses a code from outside their
+  // own classes gets the ordinary 404, not another class's student.
+  const scope = await teacherStudentScope(req.user);
   const s = await prisma.student.findFirst({
-    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
+    where: {
+      schoolId,
+      AND: [{ OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] }, scope],
+    },
     include: { parent: true },
   });
   if (!s) return res.status(404).json({ error: 'Not found' });
-  const status = await computeFeesStatusForStudents(prisma, schoolId, [{ id: s.id, class: s.class, feesOverridden: s.feesOverridden }]);
+  await applyTermEndZerosQuietly(prisma, schoolId);
+  const [status, zeroMarkIds, zeroMarkSubjects] = await Promise.all([
+    computeFeesStatusForStudents(prisma, schoolId, [{ id: s.id, class: s.class, feesOverridden: s.feesOverridden }]),
+    findStudentsWithZeroMarks(prisma, schoolId, [s.id]),
+    // Only the detail view needs the subject NAMES — the list screens just need
+    // the boolean for the dot, so the extra query stays off the list path.
+    findZeroMarkSubjects(prisma, schoolId, s.id),
+  ]);
   const st = status.get(s.id);
   res.json({
     ...withFlatParent(withIdAsCode(s)),
@@ -100,6 +150,9 @@ router.get('/:id', async (req, res) => {
     feesOverridden: Boolean(s.feesOverridden),
     paymentStatus: st?.paymentStatus ?? null,
     firstInstallmentMet: st?.firstInstallmentMet ?? null,
+    hasZeroMark: zeroMarkIds.has(s.id),
+    // Drives the detail page's combined "Has a zero in: …" banner.
+    zeroMarkSubjects,
     // Detail view also gets the raw totals the status was derived from, so a
     // profile screen does not have to re-fetch the ledger to show them.
     totalCharged: st?.totalCharged ?? 0,
@@ -111,7 +164,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-router.post('/', async (req, res) => {
+router.post('/', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const body = req.body || {};
   try {
@@ -144,7 +197,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
@@ -191,7 +244,7 @@ const findStudent = (schoolId, idOrCode) =>
 // The student's current effective structure. When they are NOT overridden this
 // returns their class level's fees, which is exactly what the dialog pre-fills
 // with — the admin adjusts down from the standard rather than rebuilding it.
-router.get('/:id/fee-override', async (req, res) => {
+router.get('/:id/fee-override', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const student = await findStudent(schoolId, req.params.id);
@@ -217,7 +270,7 @@ router.get('/:id/fee-override', async (req, res) => {
 // Detaches the student (if not already) and replaces their snapshot with this
 // COMPLETE set — an omitted fee is removed for them. Then reconciles their
 // existing charges to the new amounts.
-router.put('/:id/fee-override', async (req, res) => {
+router.put('/:id/fee-override', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const student = await findStudent(schoolId, req.params.id);
@@ -262,7 +315,7 @@ router.put('/:id/fee-override', async (req, res) => {
 
 // DELETE /students/:id/fee-override — re-attach to the standard class fees,
 // discarding the custom setup.
-router.delete('/:id/fee-override', async (req, res) => {
+router.delete('/:id/fee-override', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const student = await findStudent(schoolId, req.params.id);
@@ -282,7 +335,7 @@ router.delete('/:id/fee-override', async (req, res) => {
 // same approach scripts/delete-all-schools.js uses for the same reason.
 // The shared Parent record is intentionally left alone: it may still be
 // linked to the student's siblings.
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
