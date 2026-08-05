@@ -1,4 +1,8 @@
 .env
 .env.example
+# Timestamped/suffixed backups of .env — these hold the same live credentials
+# as .env itself, so they must never be committable.
+.env.bak.*
+.env.*.bak
 node_modules/
 logs/
