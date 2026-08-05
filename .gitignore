@@ -1,7 +1,7 @@
 .env
 .env.example
-# Timestamped backups taken before editing .env hold the same live secrets, so
-# they must never be committable — they show up as untracked, not ignored.
+# Timestamped/suffixed backups of .env — these hold the same live credentials
+# as .env itself, so they must never be committable.
 .env.bak.*
 .env.*.bak
 node_modules/
