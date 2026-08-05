@@ -28,14 +28,45 @@ const cronRouter = require('./routes/cron');
 
 const app = express();
 
-app.use(express.json());
-app.options('*', cors());
+const ALLOWED_ORIGINS = [
+  "https://sis-snowy.vercel.app",
+  process.env.ORIGIN || "http://localhost:3000"
+];
 
+// Refusing an origin has to ABORT the request, not just withhold a header.
+//
+// cors@2.8.5 only breaks the middleware chain when this callback yields an
+// Error: look at corsMiddleware in node_modules/cors/lib/index.js — on
+// `cb(null, false)`, and on the plain array form this used to be configured
+// with, it calls next() with NO error. The request then runs to completion and
+// cors merely omits Access-Control-Allow-Origin, so the browser discards a
+// response the server has already produced — writes included. A rejected
+// cross-origin POST still committed its changes; only the reply was thrown
+// away, which also means a client retry could apply it twice.
+//
+// Passing an Error is therefore the whole fix: it is what turns "not allowed"
+// into "not executed".
+function corsOriginCheck(origin, callback) {
+  // No Origin header at all — not a browser cross-origin request. Vercel's cron
+  // invocations, uptime checks, curl and any server-to-server call land here.
+  // They are authorised by CRON_SECRET or a session, never by origin, and they
+  // neither need nor can use an Access-Control-Allow-Origin header.
+  if (!origin) return callback(null, true);
+  if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  const denied = new Error('Origin not allowed');
+  denied.code = 'CORS_ORIGIN_DENIED';
+  return callback(denied);
+}
+
+// Registered FIRST — ahead of express.json() and every route — so a disallowed
+// origin is turned away before anything else in the app touches the request,
+// including body parsing. There is deliberately no app.options('*', cors())
+// blanket handler any more: that answered every preflight permissively with
+// `Access-Control-Allow-Origin: *`, which told the browser to go ahead and send
+// the real request that then executed. cors() below handles preflight for the
+// allowed origins by itself.
 app.use(cors({
-  origin: [
-    "https://sis-snowy.vercel.app",
-    process.env.ORIGIN || "http://localhost:3000"
-  ],
+  origin: corsOriginCheck,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   // Without this, the browser silently drops X-Refreshed-Token from the
@@ -44,6 +75,26 @@ app.use(cors({
   exposedHeaders: ["X-Refreshed-Token"],
   credentials: true,
 }));
+
+// Converts the refusal above into a definitive 403. It sits immediately after
+// the CORS middleware because cors() signals refusal with next(err): Express
+// then skips every remaining ordinary middleware AND every route to reach the
+// next error handler, which is this one. That skip is what guarantees no route
+// handler runs. It applies to the preflight too, so a denied browser is stopped
+// at OPTIONS and never sends the real request at all.
+//
+// Anything that is not a CORS denial is passed along untouched.
+app.use((err, _req, res, next) => {
+  if (err && err.code === 'CORS_ORIGIN_DENIED') {
+    return res.status(403).json({
+      code: 'ORIGIN_NOT_ALLOWED',
+      error: 'This origin is not allowed to call this API.',
+    });
+  }
+  return next(err);
+});
+
+app.use(express.json());
 
 // Nothing this API returns may ever be stored by a shared cache. Every response
 // is either a credential (the login token), data scoped to one school, or an
