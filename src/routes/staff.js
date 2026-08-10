@@ -9,6 +9,7 @@ const {
   requireTeacher,
   getTeacherClasses,
   getTeacherSubjectAssignments,
+  getTeacherTeachingMap,
 } = require('../roleGuards');
 
 const router = express.Router();
@@ -190,6 +191,38 @@ router.get('/me/assignments', requireTeacher, async (req, res) => {
     });
   } catch (e) {
     console.error('staff/me/assignments error', e);
+    res.status(500).json({ error: 'Something went wrong on our end.' });
+  }
+});
+
+// GET /staff/me/teaching
+//
+// Every class this teacher may work in, each with the subjects they may record
+// marks for in it and how many students it holds. One request serves both the
+// dashboard's class list and the Enter Marks class → subject selectors.
+//
+// The list is computed server-side by the same rule the marks endpoints enforce
+// (getTeacherTeachingMap / canTeacherRecordMarks), so the UI can only ever offer
+// what the server would accept. It is deliberately NOT assembled on the client
+// from raw class and subject data, which would make it a suggestion rather than
+// a boundary.
+router.get('/me/teaching', requireTeacher, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const classes = await getTeacherTeachingMap(req.user.id, schoolId);
+
+    // Student counts match on class NAME, not id: Student.class is a string
+    // throughout this codebase (see classLevelOf in src/utils/classLevels.js).
+    const withCounts = await Promise.all(
+      classes.map(async (c) => ({
+        ...c,
+        studentCount: await prisma.student.count({ where: { schoolId, class: c.name } }),
+      })),
+    );
+
+    res.json({ classes: withCounts });
+  } catch (e) {
+    console.error('staff/me/teaching error', e);
     res.status(500).json({ error: 'Something went wrong on our end.' });
   }
 });

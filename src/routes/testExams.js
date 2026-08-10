@@ -9,7 +9,7 @@ const {
   requireAdmin,
   getTeacherClasses,
   getTeacherSubjectAssignments,
-  isTeacherAssignedToClassSubject,
+  canTeacherRecordMarks,
 } = require('../roleGuards');
 const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
@@ -21,7 +21,7 @@ const isTeacher = (user) => user?.actorType === ACTOR_TEACHER;
  * Whether a teacher may see a class at all — either as its class teacher, or by
  * teaching at least one subject in it. Governs which classes' assessments they
  * can list; entering marks is a narrower question, answered per class+subject
- * by isTeacherAssignedToClassSubject.
+ * by canTeacherRecordMarks.
  */
 async function teacherMaySeeClass(user, classId) {
   const [own, pairs] = await Promise.all([
@@ -530,7 +530,7 @@ router.get('/:id/marks', async (req, res) => {
     // on the looser "may see this class".
     if (
       isTeacher(req.user) &&
-      !(await isTeacherAssignedToClassSubject(req.user.id, schoolId, testExam.classId, subject.id))
+      !(await canTeacherRecordMarks(req.user.id, schoolId, testExam.classId, subject.id))
     ) {
       return forbid(res, 'You are not assigned to teach this subject in this class.');
     }
@@ -652,7 +652,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
     // for a class+subject they are actually assigned to.
     if (
       isTeacher(req.user) &&
-      !(await isTeacherAssignedToClassSubject(req.user.id, schoolId, testExam.classId, subject.id))
+      !(await canTeacherRecordMarks(req.user.id, schoolId, testExam.classId, subject.id))
     ) {
       return forbid(res, 'You are not assigned to teach this subject in this class.');
     }

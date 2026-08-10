@@ -1,5 +1,6 @@
 const { prisma } = require('./db/prisma');
 const { ACTOR_ADMIN, ACTOR_TEACHER } = require('./utils/sessionToken');
+const { classLevelOf } = require('./utils/classLevels');
 
 // 403, not 401: the session is perfectly valid, it just belongs to the wrong
 // kind of actor. Returning 401 here would make the frontend's session handling
@@ -98,6 +99,112 @@ async function isTeacherAssignedToClassSubject(staffId, schoolId, classId, subje
   return Boolean(found);
 }
 
+/**
+ * Whether a teacher may record marks for one class+subject pairing.
+ *
+ * This is the authority for marks access, and it unions the TWO independent ways
+ * a teacher can be attached to teaching — which are stored in completely
+ * different places and were previously not both consulted:
+ *
+ *   1. An explicit subject assignment (a ClassSubjectTeacher row) authorises
+ *      exactly that one class+subject pairing, and nothing else.
+ *   2. Being the CLASS TEACHER of a class (Class.classTeacherId) authorises
+ *      every subject that class's LEVEL teaches. Making somebody class teacher
+ *      writes only that one column — it creates no ClassSubjectTeacher rows —
+ *      so a check that looked only at those rows found nothing and refused a
+ *      teacher access to their own class.
+ *
+ * The class-teacher route is still bounded by ClassLevelSubject: it grants every
+ * subject the class actually teaches, not every subject in the school.
+ */
+async function canTeacherRecordMarks(staffId, schoolId, classId, subjectId) {
+  const numericClassId = Number(classId);
+  const numericSubjectId = Number(subjectId);
+  if (!Number.isInteger(numericClassId) || !Number.isInteger(numericSubjectId)) return false;
+
+  if (await isTeacherAssignedToClassSubject(staffId, schoolId, numericClassId, numericSubjectId)) {
+    return true;
+  }
+
+  const cls = await prisma.class.findFirst({
+    where: { id: numericClassId, schoolId: Number(schoolId), classTeacherId: Number(staffId) },
+    select: { name: true },
+  });
+  if (!cls) return false;
+
+  const levelSubject = await prisma.classLevelSubject.findFirst({
+    where: {
+      schoolId: Number(schoolId),
+      classLevel: classLevelOf(cls.name),
+      subjectId: numericSubjectId,
+    },
+    select: { id: true },
+  });
+  return Boolean(levelSubject);
+}
+
+/**
+ * Every class this teacher may work in, each with the subjects they may record
+ * marks for in it — the same rule as canTeacherRecordMarks, resolved in bulk so
+ * the UI can offer exactly what the server would accept and nothing more.
+ *
+ * Computed server-side on purpose. The client must never assemble this list from
+ * raw class/subject data, or it becomes a suggestion rather than a boundary.
+ */
+async function getTeacherTeachingMap(staffId, schoolId) {
+  const sid = Number(staffId);
+  const schId = Number(schoolId);
+
+  const [ownClasses, pairs] = await Promise.all([
+    prisma.class.findMany({
+      where: { schoolId: schId, classTeacherId: sid },
+      select: { id: true, code: true, name: true },
+    }),
+    prisma.classSubjectTeacher.findMany({
+      where: { staffId: sid, class: { schoolId: schId } },
+      select: {
+        classId: true,
+        class: { select: { id: true, code: true, name: true } },
+        subject: { select: { id: true, name: true } },
+      },
+    }),
+  ]);
+
+  const byClass = new Map();
+  for (const c of ownClasses) {
+    byClass.set(c.id, { id: c.id, code: c.code, name: c.name, isClassTeacher: true, subjects: [] });
+  }
+  for (const p of pairs) {
+    if (!p.class || byClass.has(p.classId)) continue;
+    byClass.set(p.classId, {
+      id: p.class.id, code: p.class.code, name: p.class.name, isClassTeacher: false, subjects: [],
+    });
+  }
+
+  for (const entry of byClass.values()) {
+    if (entry.isClassTeacher) {
+      // Subjects belong to the class LEVEL, shared by every section of it.
+      const rows = await prisma.classLevelSubject.findMany({
+        where: { schoolId: schId, classLevel: classLevelOf(entry.name) },
+        select: { subject: { select: { id: true, name: true } } },
+      });
+      entry.subjects = rows
+        .filter((r) => r.subject)
+        .map((r) => ({ id: r.subject.id, name: r.subject.name }));
+    } else {
+      const seen = new Set();
+      for (const p of pairs) {
+        if (p.classId !== entry.id || !p.subject || seen.has(p.subject.id)) continue;
+        seen.add(p.subject.id);
+        entry.subjects.push({ id: p.subject.id, name: p.subject.name });
+      }
+    }
+    entry.subjects.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  return [...byClass.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 module.exports = {
   requireAdmin,
   requireTeacher,
@@ -105,4 +212,6 @@ module.exports = {
   getTeacherClassNames,
   getTeacherSubjectAssignments,
   isTeacherAssignedToClassSubject,
+  canTeacherRecordMarks,
+  getTeacherTeachingMap,
 };
