@@ -374,6 +374,55 @@ router.post('/:id/invite', requireAdmin, async (req, res) => {
   });
 });
 
+// PATCH /staff/:id/access  { isActive }  (admin only)
+//
+// Turns a staff member's ability to sign in on or off. Deliberately its own
+// endpoint rather than another field on PUT /:id: revoking someone's access is a
+// privileged act, not an ordinary profile edit, and keeping it separate means an
+// over-broad form submission can never flip it by accident.
+//
+// Revocation is immediate and needs no session invalidation — loadTeacherActor
+// in src/auth.js re-reads isActive on EVERY authenticated request, so a teacher
+// who is deactivated mid-session is refused on their very next call.
+//
+// Nothing else is touched. In particular passwordHash is left alone, so
+// deactivating and later reactivating returns the teacher to exactly the state
+// they were in, credentials included. It is also independent of isTeacher: a
+// staff member who is not a teacher has no login to revoke, but storing the flag
+// is harmless and keeps this endpoint from needing to care.
+router.patch('/:id/access', requireAdmin, async (req, res) => {
+  const schoolId = req.user.schoolId;
+  const body = req.body || {};
+
+  // Strictly a boolean. A string "false" is truthy in JavaScript, so accepting
+  // anything looser here would let a careless caller enable access while
+  // believing they had removed it.
+  if (typeof body.isActive !== 'boolean') {
+    return res.status(400).json({
+      code: 'MISSING_FIELDS',
+      error: 'isActive must be true or false.',
+    });
+  }
+
+  const found = await prisma.staff.findFirst({
+    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
+  });
+  if (!found) return res.status(404).json({ error: 'Not found' });
+
+  try {
+    const updated = await prisma.staff.update({
+      where: { id: found.id },
+      data: { isActive: body.isActive },
+    });
+    // Same publicStaff() shape as every other response in this file: the hash is
+    // stripped and hasLogin returned in its place, so the caller can refresh the
+    // whole access state from this one response.
+    res.json(publicStaff(updated));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.delete('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
