@@ -5,6 +5,7 @@ const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
 const { ensureLevelFeeDefaults } = require('../utils/feeCategories');
 const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
 const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
+const { ensureDefaultTestExamsForYear } = require('../utils/defaultTestExams');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -359,6 +360,29 @@ router.post('/', async (req, res) => {
       },
       include: classInclude,
     });
+
+    // A new class arrives with the default assessment structure for the whole of
+    // the school's current year, so a teacher never meets an empty Tests & Exams
+    // screen. Best-effort: the class itself is created and returned either way,
+    // because failing the creation over its starting structure would be a worse
+    // outcome than a class the backfill can top up later. Idempotent, so a retry
+    // costs nothing.
+    try {
+      const school = await prisma.school.findUnique({
+        where: { id: schoolId },
+        select: { academicYear: true },
+      });
+      if (school?.academicYear) {
+        await ensureDefaultTestExamsForYear({
+          schoolId,
+          classId: created.id,
+          academicYear: school.academicYear,
+        });
+      }
+    } catch (seedErr) {
+      console.error('default test/exam seeding failed for new class', created.id, seedErr);
+    }
+
     res.status(201).json(created);
   } catch (e) {
     if (e.code === 'P2002') return res.status(409).json({ error: 'A class with this name already exists in this school.' });
