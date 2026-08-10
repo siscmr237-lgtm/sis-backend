@@ -534,6 +534,73 @@ router.post('/staff-payment', requireAdmin, async (req, res) => {
 });
 
 // DELETE /ledger/:id
+// PATCH /ledger/:id  { description?, amount?, entryDate?, paymentMethod? }
+//
+// Corrects a one-off charge or a payment that was entered wrongly.
+//
+// Fee-STRUCTURE charges are refused outright. Those rows are owned by
+// syncLevelFeeCharges — it rewrites them in place whenever the class level's fee
+// changes — so an amount edited here would be silently reverted the next time
+// anything touched that level. The student's fee structure is edited in exactly
+// one place, StudentFeeOverrideDialog, and this endpoint must not become a
+// second one.
+router.patch('/:id', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { id } = req.params;
+    const body = req.body || {};
+
+    const entry = await prisma.ledgerEntry.findFirst({
+      where: { schoolId, OR: [{ code: String(id) }, { id: parseInt(id) || 0 }] },
+    });
+    if (!entry) return res.status(404).json({ error: 'Not found' });
+
+    if (entry.isFeeStructureCharge) {
+      return res.status(409).json({
+        code: 'FEE_STRUCTURE_CHARGE',
+        error: "This charge comes from the student's fee structure. Edit it there instead.",
+      });
+    }
+
+    // Only the fields actually supplied are touched, so a caller sending just an
+    // amount cannot blank out the description by omission.
+    const data = {};
+    if (body.description !== undefined) {
+      const description = String(body.description).trim();
+      if (!description) {
+        return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Description cannot be empty.' });
+      }
+      data.description = description;
+    }
+    if (body.amount !== undefined) {
+      const amount = Number(body.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ code: 'INVALID_AMOUNT', error: 'Enter an amount greater than zero.' });
+      }
+      data.amount = Math.round(amount);
+    }
+    if (body.entryDate !== undefined) {
+      const entryDate = new Date(body.entryDate);
+      if (Number.isNaN(entryDate.getTime())) {
+        return res.status(400).json({ code: 'INVALID_DATE', error: 'Enter a valid date.' });
+      }
+      data.entryDate = entryDate;
+    }
+    if (body.paymentMethod !== undefined) {
+      data.paymentMethod = body.paymentMethod ? String(body.paymentMethod) : null;
+    }
+
+    if (!Object.keys(data).length) {
+      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Nothing to update.' });
+    }
+
+    const updated = await prisma.ledgerEntry.update({ where: { id: entry.id }, data });
+    res.json(withIdAsCode(updated));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 router.delete('/:id', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
