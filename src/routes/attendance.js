@@ -4,10 +4,20 @@ const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 const { requireAdmin, getTeacherClassNames } = require('../roleGuards');
 const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
+const {
+  startOfDayUTC, toDayKey, eachDay, termRange, consistencyOf,
+  CONSISTENCY_CUTOFF, MAX_RANGE_DAYS, TERMS,
+} = require('../utils/attendanceDay');
+const { classLevelOf } = require('../utils/classLevels');
+
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 const isTeacher = (user) => user?.actorType === ACTOR_TEACHER;
+
+/** 'present' is the only status that counts as attending. */
+const PRESENT = 'present';
+const isPresent = (status) => String(status ?? '').trim().toLowerCase() === PRESENT;
 
 /**
  * The student CODES a teacher may mark — AttendanceRecord.personId holds the
@@ -50,7 +60,7 @@ router.get('/', async (req, res) => {
   const where = {
     schoolId,
     AND: [
-      date ? { date: new Date(String(date)) } : {},
+      date ? { date: startOfDayUTC(String(date)) } : {},
       type ? { type: String(type) } : {},
       personId ? { OR: [{ personId: String(personId) }, { personName: { contains: String(personId), mode: 'insensitive' } }] } : {},
       scope,
@@ -58,6 +68,273 @@ router.get('/', async (req, res) => {
   };
   const rows = await prisma.attendanceRecord.findMany({ where, orderBy: { date: 'desc' } });
   res.json(mapWithIdAsCode(rows));
+});
+
+/**
+ * GET /attendance/sheet
+ *   ?classLevel=&section=&from=&to=&term=&academicYear=
+ *
+ * The register for one class over a date range: every student as a row, every
+ * day in range as a column, and whatever was recorded in the cells.
+ *
+ * A SECTION is the unit, exactly as for marks — students belong to a section and
+ * so does a register. classLevel alone is accepted and resolves to the level's
+ * single populated section; where a level has more than one, `section` picks it
+ * and the response says which sections were candidates so the client can offer
+ * the choice.
+ */
+router.get('/sheet', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { classLevel, section, term, academicYear } = req.query;
+
+    const allClasses = await prisma.class.findMany({
+      where: { schoolId },
+      select: { id: true, name: true, code: true },
+    });
+
+    let candidates = classLevel
+      ? allClasses.filter((c) => classLevelOf(c.name) === String(classLevel))
+      : allClasses;
+
+    // A teacher only ever sees their own classes. Applied to the candidate list
+    // itself, so no combination of query params can widen it.
+    if (isTeacher(req.user)) {
+      const allowed = new Set(await getTeacherClassNames(req.user.id, req.user.schoolId));
+      candidates = candidates.filter((c) => allowed.has(c.name));
+      if (!candidates.length) {
+        return res.status(403).json({ code: 'FORBIDDEN', error: 'You do not take the register for that class.' });
+      }
+    }
+    if (!candidates.length) return res.status(404).json({ error: 'Class not found' });
+
+    const counts = await Promise.all(candidates.map(async (c) => ({
+      ...c,
+      studentCount: await prisma.student.count({ where: { schoolId, class: c.name } }),
+    })));
+    const populated = counts.filter((c) => c.studentCount > 0);
+
+    const chosen = section
+      ? counts.find((c) => String(c.id) === String(section) || c.name === String(section))
+      : (populated.length === 1 ? populated[0] : populated[0] ?? counts[0]);
+    if (!chosen) return res.status(404).json({ error: 'Class not found' });
+
+    // Range: an explicit from/to wins; otherwise the term window; otherwise the
+    // whole year up to today, which is what the screen opens on.
+    const school = await prisma.school.findUnique({ where: { id: schoolId }, select: { academicYear: true } });
+    const year = String(academicYear || school?.academicYear || '');
+    let from = startOfDayUTC(req.query.from);
+    let to = startOfDayUTC(req.query.to);
+    if (from && !to) to = from;                    // From alone means that single day
+    if (!from) {
+      const window = term ? termRange(year, String(term)) : null;
+      if (window) { from = window.from; to = window.to; }
+      else {
+        // Whole academic year to date: Term 1 start through today.
+        const t1 = termRange(year, 'Term 1');
+        const t3 = termRange(year, 'Term 3');
+        from = t1?.from ?? startOfDayUTC(new Date());
+        to = t3?.to ?? startOfDayUTC(new Date());
+      }
+    }
+    const days = eachDay(from, to);
+    if (!days.length) return res.status(400).json({ error: 'Invalid date range.' });
+
+    const students = await prisma.student.findMany({
+      where: { schoolId, class: chosen.name },
+      select: { id: true, code: true, firstName: true, lastName: true },
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+    });
+
+    const records = await prisma.attendanceRecord.findMany({
+      where: {
+        schoolId,
+        type: 'student',
+        personId: { in: students.map((s) => s.code) },
+        date: { gte: days[0], lte: days[days.length - 1] },
+      },
+      select: { personId: true, date: true, status: true },
+    });
+
+    const byStudentDay = new Map();
+    for (const r of records) byStudentDay.set(`${r.personId}|${toDayKey(r.date)}`, r.status);
+
+    res.json({
+      classLevel: classLevel ? String(classLevel) : classLevelOf(chosen.name),
+      section: { id: chosen.id, name: chosen.name, code: chosen.code },
+      // Only offered when the choice is real, mirroring the marks flow.
+      sectionChoices: populated.length > 1 ? populated.map((c) => ({ id: c.id, name: c.name, studentCount: c.studentCount })) : [],
+      academicYear: year,
+      term: term ? String(term) : null,
+      from: toDayKey(from),
+      to: toDayKey(to),
+      truncated: days.length >= MAX_RANGE_DAYS,
+      days: days.map(toDayKey),
+      students: students.map((s) => {
+        const cells = days.map((d) => {
+          const status = byStudentDay.get(`${s.code}|${toDayKey(d)}`) ?? null;
+          return { date: toDayKey(d), status, present: status == null ? null : isPresent(status) };
+        });
+        const recorded = cells.filter((c) => c.status != null).length;
+        const present = cells.filter((c) => c.present === true).length;
+        return {
+          studentId: s.code,
+          firstName: s.firstName,
+          lastName: s.lastName,
+          cells,
+          recorded,
+          present,
+          ...consistencyOf(present, recorded),
+        };
+      }),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * GET /attendance/consistency?studentId=&term=&academicYear=
+ *
+ * The per-student per-term attendance percentage and its Consistent /
+ * Inconsistent verdict — the figure the report card will consume. Exposed as its
+ * own endpoint so the report card never has to re-derive the rule, and there is
+ * exactly one place the 60% cutoff lives.
+ *
+ * Omit `term` for every term of the year in one response.
+ */
+router.get('/consistency', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { studentId, term } = req.query;
+    if (!studentId) return res.status(400).json({ error: 'studentId is required' });
+
+    const student = await prisma.student.findFirst({
+      where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(String(studentId), 10) || 0 }] },
+      select: { id: true, code: true, firstName: true, lastName: true, class: true },
+    });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    if (isTeacher(req.user)) {
+      const allowed = new Set(await getTeacherClassNames(req.user.id, req.user.schoolId));
+      if (!allowed.has(student.class)) {
+        return res.status(403).json({ code: 'FORBIDDEN', error: 'That student is not in your class.' });
+      }
+    }
+
+    const school = await prisma.school.findUnique({ where: { id: schoolId }, select: { academicYear: true } });
+    const year = String(req.query.academicYear || school?.academicYear || '');
+    const wanted = term ? [String(term)] : TERMS;
+
+    const terms = [];
+    for (const t of wanted) {
+      const window = termRange(year, t);
+      if (!window) { terms.push({ term: t, from: null, to: null, recorded: 0, present: 0, ...consistencyOf(0, 0) }); continue; }
+      const rows = await prisma.attendanceRecord.findMany({
+        where: {
+          schoolId, type: 'student', personId: student.code,
+          date: { gte: window.from, lte: window.to },
+        },
+        select: { status: true },
+      });
+      const recorded = rows.length;
+      const present = rows.filter((r) => isPresent(r.status)).length;
+      terms.push({
+        term: t,
+        from: toDayKey(window.from),
+        to: toDayKey(window.to),
+        recorded,
+        present,
+        ...consistencyOf(present, recorded),
+      });
+    }
+
+    res.json({
+      studentId: student.code,
+      firstName: student.firstName,
+      lastName: student.lastName,
+      academicYear: year,
+      cutoff: CONSISTENCY_CUTOFF,
+      terms,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * POST /attendance/mark  { date, records: [{ studentId, present }] }
+ *
+ * Marks one DAY for a set of students, idempotently.
+ *
+ * Replaces the create-or-update-by-code dance for the register case: the caller
+ * says who was present on a date and the server upserts against the unique
+ * (schoolId, type, personId, date) key added in
+ * 20260811100000_attendance_one_record_per_person_per_day. Re-marking the same
+ * day therefore corrects it rather than adding a second row — which is what the
+ * old path did whenever the client did not happen to know the existing record's
+ * code, and what would have double-counted in every percentage above.
+ */
+router.post('/mark', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { date, records } = req.body || {};
+    const day = startOfDayUTC(date);
+    if (!day) return res.status(400).json({ error: 'A valid date is required.' });
+    if (!Array.isArray(records) || !records.length) {
+      return res.status(400).json({ error: 'records array required' });
+    }
+
+    const codes = records.map((r) => String(r.studentId)).filter(Boolean);
+    const students = await prisma.student.findMany({
+      where: { schoolId, code: { in: codes } },
+      select: { code: true, firstName: true, lastName: true, class: true },
+    });
+    const byCode = new Map(students.map((s) => [s.code, s]));
+
+    for (const code of codes) {
+      if (!byCode.has(code)) return res.status(400).json({ error: `Unknown student ${code}` });
+    }
+
+    if (isTeacher(req.user)) {
+      const allowed = new Set(await getTeacherClassNames(req.user.id, req.user.schoolId));
+      for (const code of codes) {
+        if (!allowed.has(byCode.get(code).class)) {
+          return res.status(403).json({
+            code: 'FORBIDDEN',
+            error: 'You can only mark attendance for students in your own class.',
+          });
+        }
+      }
+    }
+
+    const ops = records.map((r) => {
+      const s = byCode.get(String(r.studentId));
+      const status = r.present ? 'present' : 'absent';
+      return prisma.attendanceRecord.upsert({
+        where: {
+          schoolId_type_personId_date: {
+            schoolId, type: 'student', personId: s.code, date: day,
+          },
+        },
+        update: { status, personName: `${s.firstName} ${s.lastName}`.trim() },
+        create: {
+          code: genCode('ATT'),
+          schoolId,
+          type: 'student',
+          personId: s.code,
+          personName: `${s.firstName} ${s.lastName}`.trim(),
+          date: day,
+          status,
+        },
+      });
+    });
+
+    const saved = await prisma.$transaction(ops);
+    res.json({ date: toDayKey(day), saved: saved.length });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 router.post('/bulk', async (req, res) => {
@@ -115,7 +392,7 @@ router.post('/bulk', async (req, res) => {
         : prisma.attendanceRecord.create({
             data: {
               code: genCode('ATT'),
-              date: new Date(r.date),
+              date: startOfDayUTC(r.date),
               type: r.type,
               personId: r.personId,
               personName: r.personName,
@@ -139,7 +416,7 @@ router.post('/', requireAdmin, async (req, res) => {
     const created = await prisma.attendanceRecord.create({
       data: {
         code: body.id || genCode('ATT'),
-        date: body.date ? new Date(body.date) : new Date(),
+        date: startOfDayUTC(body.date ?? new Date()),
         type: body.type,
         personId: body.personId,
         personName: body.personName,
@@ -163,7 +440,7 @@ router.put('/:id', requireAdmin, async (req, res) => {
       where: { id: found.id },
       data: {
         ...req.body,
-        date: req.body?.date ? new Date(req.body.date) : undefined,
+        date: req.body?.date ? startOfDayUTC(req.body.date) : undefined,
       },
     });
     res.json(withIdAsCode(updated));

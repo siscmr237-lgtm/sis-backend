@@ -156,6 +156,15 @@ model AttendanceRecord {
   status     String
   remarks    String?
 
+  /// One record per person per DAY. Attendance is a yes/no fact about a date, so
+  /// a second row for the same person and day is never a second fact — it is a
+  /// duplicate that double-counts in every percentage derived from it, including
+  /// the term consistency figure the report card consumes.
+  ///
+  /// `date` is normalised to midnight UTC on write (see src/utils/attendanceDay.js);
+  /// without that this index would key on the timestamp and happily admit two
+  /// rows for the same calendar day.
+  @@unique([schoolId, type, personId, date])
   @@index([schoolId, date])
   @@index([schoolId, personId])
 }
