@@ -175,7 +175,11 @@ router.get('/transactions', requireAdmin, async (req, res) => {
           COALESCE(st."firstName" || ' ' || st."lastName", sf."firstName" || ' ' || sf."lastName") AS "partyName",
           le.amount AS amount,
           le."entryDate" AS "entryDate",
-          le."paymentMethod" AS "paymentMethod"
+          le."paymentMethod" AS "paymentMethod",
+          -- Carried so the page can warn before deleting one: these rows are
+          -- owned by syncLevelFeeCharges and come back the next time that class
+          -- level's fees are saved.
+          le."isFeeStructureCharge" AS "isFeeStructureCharge"
         FROM "LedgerEntry" le
         LEFT JOIN "ChargeCategory" cc ON cc.id = le."categoryId"
         LEFT JOIN "Student" st ON st.id = le."studentId"
@@ -193,7 +197,8 @@ router.get('/transactions', requireAdmin, async (req, res) => {
           ex.payee AS "partyName",
           ex.amount AS amount,
           ex.date AS "entryDate",
-          ex."paymentMethod" AS "paymentMethod"
+          ex."paymentMethod" AS "paymentMethod",
+          FALSE AS "isFeeStructureCharge"
         FROM "Expense" ex
         WHERE ex."schoolId" = ${schoolId}
       )
