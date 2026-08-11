@@ -351,26 +351,21 @@ router.post('/payment', requireAdmin, async (req, res) => {
     });
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
 
-    // A payment SHOULD name the category it settles — an untagged payment is
-    // what caused paying Tuition not to clear Tuition, since the money joined
-    // one pool and was absorbed by whichever charge was oldest.
+    // A payment MUST name the category it settles. An untagged payment is what
+    // caused paying Tuition not to clear Tuition: the money joined one pool and
+    // was absorbed by whichever charge happened to be oldest.
     //
-    // Not yet rejected when absent, deliberately: the dialog that supplies it is
-    // the next change, and refusing untagged payments before it ships would
-    // break the only way the school currently records money. Flip this to a 400
-    // once the category-first dialog is live. Everything below — the ownership
-    // check and the cap — applies in full the moment a key IS given.
+    // Now required, because the category-first dialog always supplies it. This is
+    // also what closes the overpayment gap — without a category there is no
+    // figure to cap against, so an untagged payment could exceed what is owed.
+    // Rows recorded before tagging existed keep their null and are still read
+    // correctly by the oldest-first fallback in feesStatus; only NEW payments
+    // must declare themselves.
     if (!feeKey) {
-      const { academicYear: ay, term: tm } = await getSchoolPeriod(schoolId);
-      const legacy = await prisma.ledgerEntry.create({
-        data: {
-          code: genCode('PMT'), type: 'PAYMENT', schoolId, studentId: student.id,
-          categoryId: null, description, amount: amt,
-          entryDate: new Date(entryDate), paymentMethod: paymentMethod || null,
-          academicYear: ay, term: tm,
-        },
+      return res.status(400).json({
+        code: 'CATEGORY_REQUIRED',
+        error: 'Choose which fee this payment is for.',
       });
-      return res.status(201).json(withIdAsCode(legacy));
     }
 
     const [structure, entries] = await Promise.all([
