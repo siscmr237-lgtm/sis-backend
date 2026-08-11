@@ -165,23 +165,64 @@ router.get('/compiled-scores', requireAdmin, async (req, res) => {
 router.get('/class-ranking', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const { classId } = req.query;
-    if (!classId) return res.status(400).json({ error: 'classId is required' });
+    const { classId, classLevel } = req.query;
 
-    const cls = await resolveClass(schoolId, classId);
-    if (!cls) return res.status(404).json({ error: 'Class not found' });
+    // Two ways in, so the report-card caller's classId keeps working unchanged
+    // while the ranking screen can ask for a whole LEVEL. A level spans its
+    // sections: ranking is a comparison between students, and the students of
+    // "Class 1" are all of them, not just the ones in section A. Safe to span
+    // here in a way mark ENTRY is not, because nothing is written.
+    let sections = [];
+    if (classLevel) {
+      const all = await prisma.class.findMany({ where: { schoolId }, select: { id: true, name: true, code: true } });
+      sections = all.filter((c) => classLevelOf(c.name) === String(classLevel));
+      if (!sections.length) return res.status(404).json({ error: 'Class level not found' });
+    } else if (classId) {
+      const cls = await resolveClass(schoolId, classId);
+      if (!cls) return res.status(404).json({ error: 'Class not found' });
+      sections = [cls];
+    } else {
+      return res.status(400).json({ error: 'classId or classLevel is required' });
+    }
 
     await applyTermEndZerosQuietly(prisma, schoolId);
 
     const { academicYear, term } = resolvePeriod(req);
 
-    const [students, testExams] = await Promise.all([
+    // Every filter is OPTIONAL and narrowing. Absent means "everything in the
+    // active year", which is what the screen shows before anything is picked.
+    const csv = (v) => String(v ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    const termList = csv(req.query.terms);
+    // `term` (singular) is the pre-existing single-term parameter; honoured when
+    // no multi-term list is given so existing callers are unaffected.
+    const terms = termList.length ? termList : (req.query.terms !== undefined ? [] : (term ? [term] : []));
+    const examNames = new Set(csv(req.query.testExams).map((s) => s.toLowerCase()));
+    const subjectIds = csv(req.query.subjectIds).map((s) => parseInt(s, 10)).filter(Number.isInteger);
+
+    const sectionIds = sections.map((s) => s.id);
+    const sectionNames = sections.map((s) => s.name);
+
+    const [students, allTestExams] = await Promise.all([
       prisma.student.findMany({
-        where: { schoolId, class: cls.name },
+        where: { schoolId, class: { in: sectionNames } },
         orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
       }),
-      prisma.testExam.findMany({ where: { schoolId, classId: cls.id, academicYear, term }, select: { id: true } }),
+      prisma.testExam.findMany({
+        where: {
+          schoolId,
+          classId: { in: sectionIds },
+          academicYear,
+          ...(terms.length ? { term: { in: terms } } : {}),
+        },
+        select: { id: true, name: true, term: true },
+      }),
     ]);
+
+    // Assessments are filtered by NAME, not id: each section holds its own row
+    // for "Test 1", so picking that assessment for a level means all of them.
+    const testExams = examNames.size
+      ? allTestExams.filter((t) => examNames.has(String(t.name).trim().toLowerCase()))
+      : allTestExams;
     const testExamIds = testExams.map((t) => t.id);
 
     // totalPossible is now PER STUDENT, not one figure for the class: two
@@ -193,8 +234,16 @@ router.get('/class-ranking', requireAdmin, async (req, res) => {
     let tallyByStudent = new Map();
     if (testExamIds.length && students.length) {
       const [totals, marks] = await Promise.all([
+        // The subject filter is applied HERE, to the configured totals, which is
+        // what makes every scope rule fall out of one code path: tallyForStudent
+        // folds marks against exactly these pairs, so restricting the pairs
+        // restricts the ranking. It also preserves the "no total = not counted"
+        // rule for free — a subject without a total has no row to fold against.
         prisma.testExamSubjectTotal.findMany({
-          where: { testExamId: { in: testExamIds } },
+          where: {
+            testExamId: { in: testExamIds },
+            ...(subjectIds.length ? { subjectId: { in: subjectIds } } : {}),
+          },
           select: { testExamId: true, subjectId: true, totalMarks: true },
         }),
         prisma.studentMark.findMany({
@@ -247,7 +296,25 @@ router.get('/class-ranking', requireAdmin, async (req, res) => {
       row.rank = rank;
     });
 
-    res.json({ classId: cls.code, academicYear, term, totalStudents: rows.length, rankings: rows });
+    res.json({
+      // Echoed back so the caller can label what it is showing. Both metrics
+      // RANK on the same figure — percentage of what each student was actually
+      // out of — because that is the only exemption-fair ordering: a student
+      // excused from a paper must not be punished for the marks they never had
+      // the chance to earn. The difference is what the screen puts in front of
+      // people: an average across subjects, or a total of the chosen ones.
+      metric: subjectIds.length ? 'total' : 'average',
+      classId: sections.length === 1 ? sections[0].code : undefined,
+      classLevel: classLevel ? String(classLevel) : undefined,
+      sections: sections.map((s) => s.name),
+      academicYear,
+      term,
+      terms,
+      testExams: testExams.map((t) => t.name).filter((v, i, a) => a.indexOf(v) === i),
+      subjectIds,
+      totalStudents: rows.length,
+      rankings: rows,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
