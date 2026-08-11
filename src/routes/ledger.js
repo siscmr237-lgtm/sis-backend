@@ -239,7 +239,7 @@ router.get('/transactions', requireAdmin, async (req, res) => {
 router.post('/charge', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const { studentId, classLevelFeeId, description, amount, entryDate, paymentMethod } = req.body || {};
+    const { studentId, classLevelFeeId, description, note, amount, entryDate, paymentMethod } = req.body || {};
 
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
@@ -282,6 +282,10 @@ router.post('/charge', requireAdmin, async (req, res) => {
         isFeeStructureCharge: false,
         categoryId: null,
         description: String(description || '').trim() || fee.name,
+        // The longer reason, when one was given. A standalone charge raised from
+        // Edit This Student's Fees offers it; a fee-category charge has no use
+        // for it.
+        note: String(note || '').trim() || null,
         amount: Math.round(amt),
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,
@@ -319,7 +323,7 @@ router.get('/student/:studentId/owing', requireAdmin, async (req, res) => {
         where: { schoolId, studentId: student.id },
         select: {
           id: true, code: true, type: true, amount: true, entryDate: true, description: true,
-          classLevelFeeId: true, studentFeeOverrideId: true,
+          classLevelFeeId: true, studentFeeOverrideId: true, settlesEntryId: true, note: true,
         },
       }),
     ]);
@@ -374,7 +378,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
         where: { schoolId, studentId: student.id },
         select: {
           id: true, code: true, type: true, amount: true, entryDate: true, description: true,
-          classLevelFeeId: true, studentFeeOverrideId: true,
+          classLevelFeeId: true, studentFeeOverrideId: true, settlesEntryId: true, note: true,
         },
       }),
     ]);
@@ -410,11 +414,14 @@ router.post('/payment', requireAdmin, async (req, res) => {
         schoolId,
         studentId: student.id,
         categoryId: null,
-        // The linkage that makes the payment count against its own category —
-        // the same pair of columns CHARGE rows already use, read back by
-        // feeKeyOf().
+        // The linkage that makes the payment count against its own category.
+        // A fee category uses the same columns CHARGE rows already carry; a
+        // standalone charge is reached by pointing at the charge entry itself.
+        // Exactly one of the three is ever set, and feeKeyOf() reads whichever
+        // it is back out.
         classLevelFeeId: target.classLevelFeeId ?? null,
         studentFeeOverrideId: target.studentFeeOverrideId ?? null,
+        settlesEntryId: target.settlesEntryId ?? null,
         description,
         amount: amt,
         entryDate: new Date(entryDate),

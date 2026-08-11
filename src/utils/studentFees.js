@@ -17,7 +17,20 @@ const { classLevelOf } = require('./classLevels');
 function feeKeyOf(entry) {
   if (entry.studentFeeOverrideId != null) return `o${entry.studentFeeOverrideId}`;
   if (entry.classLevelFeeId != null) return `c${entry.classLevelFeeId}`;
-  return null; // one-off charge: outside every fee structure
+  // A PAYMENT that settles a specific standalone charge. `x` is the charge's own
+  // entry id, which is also the key computeOwingByCategory gives that charge, so
+  // the two line up without either side knowing about the other.
+  if (entry.settlesEntryId != null) return `x${entry.settlesEntryId}`;
+  return null; // a charge outside every fee structure, or untagged money
+}
+
+/**
+ * The key a standalone CHARGE is settled under. Kept beside feeKeyOf so the two
+ * halves of the convention live together: a charge is `x<its own id>`, and a
+ * payment reaches it by pointing settlesEntryId at that id.
+ */
+function standaloneChargeKey(entryId) {
+  return `x${entryId}`;
 }
 
 async function getStudentFeeStructure(prisma, schoolId, student) {
@@ -110,4 +123,4 @@ async function getFeeStructuresForStudents(prisma, schoolId, students) {
   return out;
 }
 
-module.exports = { feeKeyOf, getStudentFeeStructure, getFeeStructuresForStudents };
+module.exports = { feeKeyOf, standaloneChargeKey, getStudentFeeStructure, getFeeStructuresForStudents };

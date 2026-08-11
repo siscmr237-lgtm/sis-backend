@@ -1,4 +1,4 @@
-const { feeKeyOf, getFeeStructuresForStudents } = require('./studentFees');
+const { feeKeyOf, standaloneChargeKey, getFeeStructuresForStudents } = require('./studentFees');
 
 /**
  * Two derived fee values per student, computed live from ledger entries and
@@ -170,7 +170,7 @@ async function computeFeesStatusForStudents(prisma, schoolId, students) {
       where: { schoolId, studentId: { in: ids } },
       select: {
         id: true, studentId: true, type: true, amount: true, entryDate: true,
-        classLevelFeeId: true, studentFeeOverrideId: true,
+        classLevelFeeId: true, studentFeeOverrideId: true, settlesEntryId: true, note: true,
       },
     }),
     getFeeStructuresForStudents(prisma, schoolId, students),
@@ -221,7 +221,7 @@ function computeOwingByCategory(entries, fees = []) {
     const key = feeKeyOf(e);
     if (e.type === 'CHARGE') {
       if (key == null) {
-        oneOffs.push({ id: e.id, code: e.code, description: e.description, amount, entryDate: e.entryDate });
+        oneOffs.push({ id: e.id, code: e.code, description: e.description, note: e.note ?? null, amount, entryDate: e.entryDate });
       } else {
         chargedByKey.set(key, (chargedByKey.get(key) ?? 0) + amount);
       }
@@ -258,29 +258,32 @@ function computeOwingByCategory(entries, fees = []) {
     .filter((row) => row.charged > 0)
     .map((row) => ({ ...row, kind: 'fee', payable: true, owing: Math.max(0, row.charged - row.paid) }));
 
-  // One-off charges are listed so the dialog can SHOW what else is outstanding,
-  // but they are not individually payable yet and say so.
+  // Standalone charges are now first-class payable categories, settled by a
+  // payment whose settlesEntryId points at the charge itself. Each is its own row
+  // rather than a merged bucket, because they are individual events ("replaced
+  // textbook", "broken window") and merging them would make it impossible to say
+  // which one a payment cleared.
   //
-  // A payment can only point at a ClassLevelFee or a StudentFeeOverride —
-  // LedgerEntry has no link from a payment to another entry — so there is no way
-  // to record "this money settled that specific fine" without a new column. The
-  // intended fix is the other direction: charges raised through Edit This
-  // Student's Fees become entries in the student's own structure, which are
-  // first-class categories with a link that already exists. Until a charge is
-  // raised that way it stays settleable only by an untagged payment.
+  // Note what this does NOT do: it leaves the student's fee structure alone. These
+  // charges are not StudentFeeOverride rows, so raising one cannot flip
+  // feesOverridden and convert a student on standard class fees to custom fees.
   for (const c of oneOffs) {
+    const key = standaloneChargeKey(c.id);
+    const paid = paidByKey.get(key) ?? 0;
     categories.push({
-      kind: 'oneOff',
-      key: `x${c.id}`,
-      name: c.description || 'One-off charge',
+      kind: 'charge',
+      key,
+      name: c.description || 'Charge',
+      note: c.note ?? null,
       chargeId: c.id,
       chargeCode: c.code,
       classLevelFeeId: null,
       studentFeeOverrideId: null,
+      settlesEntryId: c.id,
       charged: c.amount,
-      paid: 0,
-      owing: c.amount,
-      payable: false,
+      paid,
+      owing: Math.max(0, c.amount - paid),
+      payable: true,
     });
   }
 

@@ -566,7 +566,30 @@ model LedgerEntry {
   /// own structure. Both null means a one-off charge, outside any fee structure.
   studentFeeOverride   StudentFeeOverride? @relation(fields: [studentFeeOverrideId], references: [id], onDelete: Cascade)
   studentFeeOverrideId Int?
+  /// The short label shown wherever this entry is listed — for a charge raised by
+  /// hand this is its NAME ("Broken window", "Trip"). Required, and long-standing.
   description   String
+  /// The longer reason behind a charge, beyond that label. Nullable because
+  /// nothing that already exists has one and most entries never need one; the
+  /// charge form offers it as an optional third field.
+  note          String?
+  /// For a PAYMENT, the specific CHARGE it settles.
+  ///
+  /// This is what makes a standalone charge — a fine, a replaced book — payable
+  /// on its own. Fee-structure money is tied to a ClassLevelFee or a
+  /// StudentFeeOverride, but a one-off charge belongs to no structure, so before
+  /// this there was no way to say "this money settled that fine" and such charges
+  /// could only be cleared by an untagged payment.
+  ///
+  /// Deliberately NOT modelled as a StudentFeeOverride: that would flip
+  /// feesOverridden and silently convert the student to custom fees, when a fine
+  /// has nothing to do with their fee structure.
+  ///
+  /// ON DELETE SET NULL, never cascade: deleting a charge must not delete the
+  /// money someone actually handed over. The payment survives, untagged.
+  settles         LedgerEntry?  @relation("EntrySettlement", fields: [settlesEntryId], references: [id], onDelete: SetNull)
+  settlesEntryId  Int?
+  settledBy       LedgerEntry[] @relation("EntrySettlement")
   amount        Int
   entryDate     DateTime
   paymentMethod String?
@@ -581,6 +604,9 @@ model LedgerEntry {
   @@index([schoolId, academicYear, term])
   @@index([classLevelFeeId])
   @@index([studentFeeOverrideId])
+  /// Drives "how much of this charge has been settled?", which the owing endpoint
+  /// asks per standalone charge.
+  @@index([settlesEntryId])
 }
 
 model AdminUser {
