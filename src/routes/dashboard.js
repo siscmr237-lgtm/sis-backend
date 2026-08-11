@@ -1,7 +1,24 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { buildSetupChecklist } = require('../utils/setupChecklist');
 
 const router = express.Router();
+
+// GET /dashboard/setup-checklist — "Get your school ready".
+//
+// Declared before '/' only for readability; Express matches on the full path so
+// the order of these two is not load-bearing.
+//
+// Answered from live data on every call and never cached. The card it feeds is
+// pure guidance: it gates nothing, and a school that ignores it entirely can
+// still use every screen.
+router.get('/setup-checklist', async (req, res) => {
+  try {
+    res.json(await buildSetupChecklist(prisma, req.user.schoolId));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 router.get('/', async (req, res) => {
   try {
