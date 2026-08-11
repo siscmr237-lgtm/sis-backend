@@ -54,6 +54,48 @@ function publicStaffList(rows) {
   return (rows || []).map(publicStaff);
 }
 
+/**
+ * Attaches what each staff member currently owes the school, which is what the
+ * red dot beside their name means.
+ *
+ * Two queries for the whole list rather than a pair per person: the staff list
+ * is rendered per row, and a per-row round trip is how a five-person list turns
+ * into eleven queries.
+ *
+ * A fine is outstanding to the extent nothing has been netted off it yet —
+ * `amount` less every PAYMENT pointing at it through settlesEntryId. That is the
+ * same definition utils/staffPayroll.js uses, and it has to stay the same one:
+ * a dot that disagreed with the payroll dialog about whether a debt was cleared
+ * would be worse than no dot.
+ */
+async function withOutstandingCharges(schoolId, staffRows) {
+  const ids = staffRows.map((s) => s.id).filter((id) => Number.isFinite(id));
+  if (!ids.length) return staffRows;
+
+  const charges = await prisma.ledgerEntry.findMany({
+    where: { schoolId, staffId: { in: ids }, type: 'CHARGE', category: { staffOwes: true } },
+    select: { id: true, staffId: true, amount: true },
+  });
+  if (!charges.length) return staffRows.map((s) => ({ ...s, outstandingCharges: 0 }));
+
+  const settlements = await prisma.ledgerEntry.groupBy({
+    by: ['settlesEntryId'],
+    where: { schoolId, type: 'PAYMENT', settlesEntryId: { in: charges.map((c) => c.id) } },
+    _sum: { amount: true },
+  });
+  const settledByCharge = new Map(settlements.map((s) => [s.settlesEntryId, s._sum.amount ?? 0]));
+
+  const owedByStaff = new Map();
+  for (const c of charges) {
+    // Clamped per charge, never in aggregate: an overpaid fine must not create
+    // credit that hides a different fine that is genuinely outstanding.
+    const outstanding = Math.max(0, c.amount - (settledByCharge.get(c.id) ?? 0));
+    owedByStaff.set(c.staffId, (owedByStaff.get(c.staffId) ?? 0) + outstanding);
+  }
+
+  return staffRows.map((s) => ({ ...s, outstandingCharges: owedByStaff.get(s.id) ?? 0 }));
+}
+
 // ---------------------------------------------------------------------------
 // Teacher self-service — /staff/me
 //
@@ -249,14 +291,15 @@ router.get('/', requireAdmin, async (req, res) => {
     ],
   };
   const rows = await prisma.staff.findMany({ where, orderBy: { code: 'asc' } });
-  res.json(publicStaffList(rows));
+  res.json(await withOutstandingCharges(schoolId, publicStaffList(rows)));
 });
 
 router.get('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const s = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!s) return res.status(404).json({ error: 'Not found' });
-  res.json(publicStaff(s));
+  const [withCharges] = await withOutstandingCharges(schoolId, [publicStaff(s)]);
+  res.json(withCharges);
 });
 
 router.post('/', requireAdmin, async (req, res) => {

@@ -7,6 +7,16 @@ const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/acad
 const { requireAdmin, requireTeacher } = require('../roleGuards');
 const { computeOwingByCategory } = require('../utils/feesStatus');
 const { getStudentFeeStructure } = require('../utils/studentFees');
+const {
+  STAFF_DEBT_CATEGORIES,
+  PAYROLL_METHODS,
+  ensureStaffCategories,
+  academicYearMonths,
+  isMonthOfYear,
+  outstandingStaffCharges,
+  staffLedgerTotals,
+  computeNetPay,
+} = require('../utils/staffPayroll');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -488,37 +498,23 @@ router.get('/student/:studentId', requireAdmin, async (req, res) => {
 // and the teacher route (their own, addressed as 'me') so the two can never
 // drift into reporting a different balance for the same person.
 async function sendStaffLedger(res, schoolId, staff) {
-  const STAFF_CATS = ['Salary', 'Staff Expense', 'Damage', 'Bonus', 'Transportation Allowance'];
-  await prisma.chargeCategory.createMany({
-    data: STAFF_CATS.map(name => ({ name, isBuiltIn: true, forStaff: true, schoolId })),
-    skipDuplicates: true,
+  await ensureStaffCategories(prisma, schoolId);
+
+  // One read, several answers. Totals used to come from a groupBy, but the two
+  // directions of staff money cannot be separated by type alone any more — a
+  // fine and a salary accrual are both CHARGE rows — so they are derived from
+  // the rows themselves, which are being fetched regardless.
+  const entries = await prisma.ledgerEntry.findMany({
+    where: { staffId: staff.id, schoolId },
+    include: { category: true },
+    orderBy: { entryDate: 'desc' },
   });
 
-  const [entries, agg] = await Promise.all([
-    prisma.ledgerEntry.findMany({
-      where: { staffId: staff.id, schoolId },
-      include: { category: true },
-      orderBy: { entryDate: 'desc' },
-    }),
-    prisma.ledgerEntry.groupBy({
-      by: ['type'],
-      where: { staffId: staff.id, schoolId },
-      _sum: { amount: true },
-    }),
-  ]);
-
-  let totalCharged = 0;
-  let totalPaid = 0;
-  for (const row of agg) {
-    if (row.type === 'CHARGE') totalCharged = row._sum.amount ?? 0;
-    if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
-  }
-
+  const totals = staffLedgerTotals(entries);
   res.json({
     entries: mapWithIdAsCode(entries),
-    totalCharged,
-    totalPaid,
-    balance: totalCharged - totalPaid,
+    ...totals,
+    charges: mapWithIdAsCode(outstandingStaffCharges(entries)),
   });
 }
 
@@ -560,26 +556,40 @@ router.get('/staff/:staffId', requireAdmin, async (req, res) => {
 });
 
 // POST /ledger/staff-charge
+//
+// A fine against a staff member: broken property, late coming, uniform,
+// misconduct, other. It sits on their account and is settled ONLY by being
+// netted off a payroll run — no payment method is taken here, because nothing
+// changes hands at the moment a fine is raised.
 router.post('/staff-charge', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const { staffId, categoryId, description, amount, entryDate, paymentMethod } = req.body || {};
+    const { staffId, categoryId, description, note, amount, entryDate } = req.body || {};
 
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
     if (!description) return res.status(400).json({ error: 'description required' });
     if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
 
+    await ensureStaffCategories(prisma, schoolId);
     const [staff, category] = await Promise.all([
-      prisma.staff.findFirst({
-        where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] },
-      }),
+      findStaff(schoolId, staffId),
       prisma.chargeCategory.findFirst({
         where: { id: parseInt(categoryId) || 0, schoolId },
       }),
     ]);
     if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
     if (!category) return res.status(400).json({ error: 'Invalid categoryId' });
+    // Direction is checked, not assumed. A charge under Salary or Bonus would
+    // mean the school owes the staff member MORE, which is the opposite of what
+    // this route is for, and it would then show up as a debt to be netted off
+    // their own pay.
+    if (!category.staffOwes) {
+      return res.status(400).json({
+        code: 'NOT_A_STAFF_CHARGE',
+        error: `"${category.name}" is money the school owes staff, not a charge against them. Pick one of: ${STAFF_DEBT_CATEGORIES.join(', ')}.`,
+      });
+    }
 
     const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
@@ -590,9 +600,10 @@ router.post('/staff-charge', requireAdmin, async (req, res) => {
         staffId: staff.id,
         categoryId: category.id,
         description,
+        note: String(note || '').trim() || null,
         amount: amt,
         entryDate: new Date(entryDate),
-        paymentMethod: paymentMethod || null,
+        paymentMethod: null,
         academicYear,
         term,
       },
@@ -600,6 +611,242 @@ router.post('/staff-charge', requireAdmin, async (req, res) => {
     });
     res.status(201).json(withIdAsCode(entry));
   } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Payroll
+// ---------------------------------------------------------------------------
+
+/** Resolve a staff member by code or numeric id, within this school only. */
+function findStaff(schoolId, staffId) {
+  return prisma.staff.findFirst({
+    where: { schoolId, OR: [{ code: String(staffId) }, { id: parseInt(staffId) || 0 }] },
+  });
+}
+
+// GET /ledger/staff/:staffId/payroll
+//
+// Everything the Record Payroll dialog needs, in one request: the months of the
+// ACTIVE academic year with the paid ones marked, this person's set salary (the
+// cap on the salary portion), and the fines that could be settled out of the
+// run. One endpoint rather than three because the net-pay figure is computed
+// from all of it at once, and a dialog assembled from three separately-loading
+// calls can show a net that is briefly wrong.
+router.get('/staff/:staffId/payroll', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const staff = await findStaff(schoolId, req.params.staffId);
+    if (!staff) return res.status(404).json({ error: 'Staff not found' });
+
+    await ensureStaffCategories(prisma, schoolId);
+    const { academicYear } = await getSchoolPeriod(schoolId);
+
+    const entries = await prisma.ledgerEntry.findMany({
+      where: { staffId: staff.id, schoolId },
+      include: { category: true },
+    });
+
+    // A month is paid iff a row carries its key — the same fact the unique index
+    // enforces, so the list offered and the constraint that would reject the
+    // write are reading the identical thing.
+    const runs = new Map();
+    for (const e of entries) if (e.payrollMonth) runs.set(e.payrollMonth, e);
+
+    const months = academicYearMonths(academicYear).map((m) => {
+      const run = runs.get(m.key);
+      return {
+        ...m,
+        paid: Boolean(run),
+        paidOn: run?.entryDate ?? null,
+        paidAmount: run?.amount ?? null,
+        entryId: run?.code ?? null,
+      };
+    });
+
+    res.json({
+      staffId: staff.code,
+      staffName: `${staff.firstName} ${staff.lastName}`,
+      salary: staff.salary,
+      academicYear,
+      months,
+      unpaidMonths: months.filter((m) => !m.paid),
+      charges: mapWithIdAsCode(outstandingStaffCharges(entries)),
+      paymentMethods: PAYROLL_METHODS,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /ledger/staff-payroll
+//
+// One month's pay, recorded as one payroll row plus one settlement row per fine
+// being cleared out of it.
+//
+//   net = salary portion + bonus - everything settled
+//
+// The salary portion is capped at the staff member's set salary; the BONUS is
+// deliberately outside that cap, since a bonus is paid on top of salary and a
+// cap that blocked it would be capping the wrong number.
+//
+// Settlement is the only way a staff fine is ever cleared — there is no
+// staff-pays-the-school-directly path, by design, because having both would let
+// the same debt be discharged twice.
+router.post('/staff-payroll', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const {
+      staffId, month, amount, bonus, bonusNote, entryDate, paymentMethod,
+      settleChargeIds, category,
+    } = req.body || {};
+
+    const staff = await findStaff(schoolId, staffId);
+    if (!staff) return res.status(400).json({ error: 'Invalid staffId' });
+
+    // Salary is the only category for now, but it is validated rather than
+    // assumed so adding a second one later cannot silently accept anything.
+    if (category != null && category !== 'Salary') {
+      return res.status(400).json({ code: 'UNKNOWN_CATEGORY', error: 'Payroll can only be recorded under Salary.' });
+    }
+    if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
+    if (!PAYROLL_METHODS.includes(paymentMethod)) {
+      return res.status(400).json({
+        code: 'INVALID_METHOD',
+        error: `Payment method must be one of: ${PAYROLL_METHODS.join(', ')}.`,
+      });
+    }
+
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
+    if (!month || !isMonthOfYear(academicYear, month)) {
+      return res.status(400).json({
+        code: 'INVALID_MONTH',
+        error: `month must be one of the twelve months of ${academicYear}.`,
+      });
+    }
+
+    const salaryPortion = Math.round(Number(amount) || 0);
+    const bonusAmount = Math.round(Number(bonus) || 0);
+    if (salaryPortion <= 0) {
+      return res.status(400).json({ code: 'AMOUNT_REQUIRED', error: 'Enter the salary amount being paid.' });
+    }
+    if (salaryPortion > staff.salary) {
+      return res.status(400).json({
+        code: 'EXCEEDS_SALARY',
+        error: `The salary portion cannot exceed ${staff.salary.toLocaleString()} FCFA. A bonus is recorded separately and is not capped.`,
+      });
+    }
+    if (bonusAmount < 0) return res.status(400).json({ error: 'bonus cannot be negative' });
+    if (bonusAmount > 0 && !String(bonusNote || '').trim()) {
+      return res.status(400).json({ code: 'BONUS_NOTE_REQUIRED', error: 'Say what the bonus is for.' });
+    }
+
+    // --- the fines being settled out of this run -----------------------------
+    const requested = Array.isArray(settleChargeIds) ? settleChargeIds.map(String) : [];
+    const entries = await prisma.ledgerEntry.findMany({
+      where: { staffId: staff.id, schoolId },
+      include: { category: true },
+    });
+
+    if (entries.some((e) => e.payrollMonth === month)) {
+      return res.status(409).json({
+        code: 'MONTH_ALREADY_PAID',
+        error: 'That month has already been paid for this staff member.',
+      });
+    }
+
+    const outstanding = outstandingStaffCharges(entries);
+    const byCode = new Map(outstanding.map((c) => [c.code, c]));
+    const toSettle = [];
+    for (const code of requested) {
+      const charge = byCode.get(code);
+      if (!charge) {
+        return res.status(400).json({
+          code: 'INVALID_CHARGE',
+          error: 'One of the selected charges is not an outstanding charge on this staff member.',
+        });
+      }
+      toSettle.push(charge);
+    }
+
+    const settledTotal = toSettle.reduce((sum, c) => sum + c.outstanding, 0);
+    const net = computeNetPay(salaryPortion, bonusAmount, settledTotal);
+    if (net.net < 0) {
+      return res.status(400).json({
+        code: 'NET_NEGATIVE',
+        error: `The selected charges (${settledTotal.toLocaleString()} FCFA) come to more than this month's pay (${net.gross.toLocaleString()} FCFA). Settle fewer of them.`,
+      });
+    }
+
+    const label = academicYearMonths(academicYear).find((m) => m.key === month)?.label ?? month;
+    const salaryCategory = await prisma.chargeCategory.findFirst({ where: { schoolId, name: 'Salary', forStaff: true } });
+    const when = new Date(entryDate);
+
+    // One transaction: a run that recorded the pay but not the settlements would
+    // leave fines outstanding that the staff member has already been docked for.
+    const written = await prisma.$transaction(async (tx) => {
+      const run = await tx.ledgerEntry.create({
+        data: {
+          code: genCode('PAY'),
+          type: 'PAYMENT',
+          schoolId,
+          staffId: staff.id,
+          categoryId: salaryCategory?.id ?? null,
+          description: `Payroll — ${label}`,
+          note: bonusAmount > 0 ? String(bonusNote).trim() : null,
+          // The row holds the GROSS. The salary portion is amount - payrollBonus,
+          // and the net is derived by subtracting the settlements that point at
+          // this same run's date — storing net here would lose the split.
+          amount: net.gross,
+          payrollBonus: bonusAmount > 0 ? bonusAmount : null,
+          payrollMonth: month,
+          entryDate: when,
+          paymentMethod,
+          academicYear,
+          term,
+        },
+      });
+
+      const settlements = [];
+      for (const charge of toSettle) {
+        settlements.push(await tx.ledgerEntry.create({
+          data: {
+            code: genCode('NET'),
+            type: 'PAYMENT',
+            schoolId,
+            staffId: staff.id,
+            categoryId: charge.categoryId ?? null,
+            settlesEntryId: charge.id,
+            description: `${charge.description} — settled from ${label} payroll`,
+            amount: charge.outstanding,
+            entryDate: when,
+            paymentMethod,
+            academicYear,
+            term,
+          },
+        }));
+      }
+      return { run, settlements };
+    });
+
+    res.status(201).json({
+      payroll: withIdAsCode(written.run),
+      settlements: mapWithIdAsCode(written.settlements),
+      month,
+      monthLabel: label,
+      ...net,
+    });
+  } catch (e) {
+    // The unique index is the real guard against paying a month twice; this is
+    // the same answer the pre-check gives, for the case where two admins submit
+    // at once and one loses the race.
+    if (e.code === 'P2002') {
+      return res.status(409).json({
+        code: 'MONTH_ALREADY_PAID',
+        error: 'That month has already been paid for this staff member.',
+      });
+    }
     res.status(400).json({ error: e.message });
   }
 });

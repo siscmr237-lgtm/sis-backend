@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { ensureStaffCategories } = require('../utils/staffPayroll');
 
 const router = express.Router();
 
@@ -13,7 +14,17 @@ router.get('/', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const forStaff = req.query.forStaff === 'true';
-    const items = await prisma.chargeCategory.findMany({ where: { schoolId, forStaff }, orderBy: { name: 'asc' } });
+    // Seeded here as well as in the staff ledger route, because the staff
+    // Finance tab requests both AT THE SAME TIME. Seeding from only one side
+    // would hand the charge form a list missing the five fine categories
+    // whenever this request won the race.
+    if (forStaff) await ensureStaffCategories(prisma, schoolId);
+    const items = await prisma.chargeCategory.findMany({
+      where: { schoolId, forStaff },
+      // Fines last, so the direction of the list is not something you have to
+      // read the names to work out.
+      orderBy: [{ staffOwes: 'asc' }, { name: 'asc' }],
+    });
     res.json(items);
   } catch (e) {
     res.status(500).json({ error: e.message });
