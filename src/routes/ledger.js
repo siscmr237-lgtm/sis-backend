@@ -362,7 +362,6 @@ router.post('/payment', requireAdmin, async (req, res) => {
 
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
-    if (!description) return res.status(400).json({ error: 'description required' });
     if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
 
     const student = await prisma.student.findFirst({
@@ -437,7 +436,11 @@ router.post('/payment', requireAdmin, async (req, res) => {
         classLevelFeeId: target.classLevelFeeId ?? null,
         studentFeeOverrideId: target.studentFeeOverrideId ?? null,
         settlesEntryId: target.settlesEntryId ?? null,
-        description,
+        // Notes are optional in the dialog and are no longer pre-filled, so an
+        // empty one falls back to the category being paid. The column is NOT
+        // NULL and this is the label every ledger table shows, so a blank
+        // description would render as an empty row rather than as "no note".
+        description: String(description || '').trim() || target.name,
         amount: amt,
         entryDate: new Date(entryDate),
         paymentMethod: paymentMethod || null,

@@ -37,6 +37,69 @@ const PAYMENT_STATUS = {
 };
 
 /**
+ * Applies a student's money to their fee-linked CHARGE rows, and returns those
+ * charges with `remaining` filled in.
+ *
+ * THE one place this allocation happens. It used to be written out twice — once
+ * for the payment status and once for the per-category owing figures — and the
+ * two copies did not agree: the status walked the charges oldest-first by date,
+ * while the owing calculation walked the fee STRUCTURE, which arrives in
+ * alphabetical order. So a single untagged payment recorded for Tuition was
+ * reported against Tuition by the dot and against Books and PTA by the Record
+ * Payment dialog, which then hid both as fully paid. Same rows, same money, two
+ * answers. One implementation is the fix; the comment on computeOwingByCategory
+ * had claimed they already shared this rule.
+ *
+ * Order matters and is deliberate:
+ *
+ *   1. TAGGED money first, and only against its own category. This is what makes
+ *      paying Tuition clear Tuition — money handed over for one fee can never be
+ *      absorbed by another.
+ *   2. UNTAGGED money then fills what is left, OLDEST CHARGE FIRST by entryDate.
+ *      Rows recorded before payments carried a category genuinely have none, and
+ *      re-guessing one for them would be inventing data; oldest-first is the
+ *      least surprising thing left. Alphabetical never was — it made the answer
+ *      depend on what the categories happened to be called.
+ *
+ * Tagged money that exceeds its own category does NOT spill over, in either
+ * pass: it was given for that category, and moving it would undo the point of
+ * having tagged it.
+ *
+ * @param charges     [{ feeId, amount, remaining, entryDate, id }] — feeId null for one-offs
+ * @param taggedPaid  Map of feeKey -> amount paid naming that key
+ * @param untaggedPaid  total of payments naming no key
+ * @returns the FEE-LINKED charges only, sorted oldest first, with `remaining` set
+ */
+function allocateToFeeCharges(charges, taggedPaid, untaggedPaid) {
+  // One-off charges are excluded on purpose. A fine or a trip is outside the fee
+  // structure, and if it sat in this queue it would absorb payment that would
+  // otherwise have covered a required category — a student who has paid their
+  // first installment does not stop having paid it because they were later fined.
+  const feeCharges = charges.filter((c) => c.feeId != null);
+  feeCharges.sort((a, b) => a.entryDate - b.entryDate || a.id - b.id);
+
+  // Copied, so a caller's map is not silently drained by calling this.
+  const remainingTagged = new Map(taggedPaid);
+  for (const c of feeCharges) {
+    const available = remainingTagged.get(c.feeId) ?? 0;
+    if (available <= 0) continue;
+    const take = Math.min(available, c.remaining);
+    c.remaining -= take;
+    remainingTagged.set(c.feeId, available - take);
+  }
+
+  let pool = untaggedPaid;
+  for (const c of feeCharges) {
+    if (pool <= 0) break;
+    const take = Math.min(pool, c.remaining);
+    c.remaining -= take;
+    pool -= take;
+  }
+
+  return feeCharges;
+}
+
+/**
  * @param entries  this student's LedgerEntry rows: { id, type, classLevelFeeId, amount, entryDate }
  * @param config   the student's LEVEL first-installment rule:
  *                 [{ classLevelFeeId, percent }] — only fees the level opted in
@@ -102,31 +165,7 @@ function computeStudentFeesStatus(entries, config = []) {
   // paid their first installment does not stop having paid it because they were
   // later fined. One-off charges still count in totalCharged, so they do move
   // paymentStatus toward Owing; they simply play no part in per-category maths.
-  const feeCharges = charges.filter((c) => c.feeId != null);
-  feeCharges.sort((a, b) => a.entryDate - b.entryDate || a.id - b.id);
-
-  // Tagged money first, and only against its own category. This is what fixes
-  // paying Tuition not clearing Tuition: previously every payment joined one
-  // pool and was absorbed by whichever charge happened to be oldest, so money
-  // handed over for Tuition could settle a Uniform charge instead.
-  for (const c of feeCharges) {
-    const available = taggedPaid.get(c.feeId) ?? 0;
-    if (available <= 0) continue;
-    const take = Math.min(available, c.remaining);
-    c.remaining -= take;
-    taggedPaid.set(c.feeId, available - take);
-  }
-
-  // Untagged money then fills what is left, oldest first, as before. Tagged
-  // money that exceeded its own category does NOT spill over — it was given for
-  // that category, and moving it would undo the point of tagging it.
-  let pool = untaggedPaid;
-  for (const c of feeCharges) {
-    if (pool <= 0) break;
-    const take = Math.min(pool, c.remaining);
-    c.remaining -= take;
-    pool -= take;
-  }
+  const feeCharges = allocateToFeeCharges(charges, taggedPaid, untaggedPaid);
 
   const chargedByFee = new Map();
   const paidByFee = new Map();
@@ -211,8 +250,8 @@ async function computeFeesStatusForStudents(prisma, schoolId, students) {
  * @param fees    their effective structure from getStudentFeeStructure().fees
  */
 function computeOwingByCategory(entries, fees = []) {
-  const chargedByKey = new Map();
-  const paidByKey = new Map();
+  const taggedPaid = new Map();
+  const feeCharges = [];
   const oneOffs = [];
   let untaggedPaid = 0;
 
@@ -223,40 +262,51 @@ function computeOwingByCategory(entries, fees = []) {
       if (key == null) {
         oneOffs.push({ id: e.id, code: e.code, description: e.description, note: e.note ?? null, amount, entryDate: e.entryDate });
       } else {
-        chargedByKey.set(key, (chargedByKey.get(key) ?? 0) + amount);
+        feeCharges.push({
+          feeId: key, amount, remaining: amount, id: e.id,
+          entryDate: new Date(e.entryDate).getTime(),
+        });
       }
     } else if (e.type === 'PAYMENT') {
       if (key == null) untaggedPaid += amount;
-      else paidByKey.set(key, (paidByKey.get(key) ?? 0) + amount);
+      else taggedPaid.set(key, (taggedPaid.get(key) ?? 0) + amount);
     }
   }
 
-  // Untagged money is spread oldest-first over fee charges, matching the status
-  // calculation, so a legacy payment reduces what the dialog shows as owing
-  // rather than sitting invisibly on the account.
-  const feeRows = fees.map((f) => ({
-    key: f.key,
-    name: f.name,
-    classLevelFeeId: f.classLevelFeeId ?? null,
-    studentFeeOverrideId: f.overrideId ?? null,
-    charged: chargedByKey.get(f.key) ?? 0,
-    paid: paidByKey.get(f.key) ?? 0,
-  }));
-
-  let pool = untaggedPaid;
-  for (const row of feeRows) {
-    if (pool <= 0) break;
-    const outstanding = Math.max(0, row.charged - row.paid);
-    const take = Math.min(pool, outstanding);
-    row.paid += take;
-    pool -= take;
+  // The SAME allocation the payment status uses, not a second one written to
+  // look similar. What is owed per category is now whatever those charges have
+  // left over after tagged money has settled its own and untagged money has
+  // filled in oldest-first.
+  const allocated = allocateToFeeCharges(feeCharges, taggedPaid, untaggedPaid);
+  const chargedByKey = new Map();
+  const paidByKey = new Map();
+  for (const c of allocated) {
+    chargedByKey.set(c.feeId, (chargedByKey.get(c.feeId) ?? 0) + c.amount);
+    paidByKey.set(c.feeId, (paidByKey.get(c.feeId) ?? 0) + (c.amount - c.remaining));
   }
 
-  const categories = feeRows
-    // A fee with nothing charged is not payable: there is no debt to settle, and
-    // offering it would invite money against a category the student is not billed.
-    .filter((row) => row.charged > 0)
-    .map((row) => ({ ...row, kind: 'fee', payable: true, owing: Math.max(0, row.charged - row.paid) }));
+  // EVERY fee in the student's structure, including ones with nothing charged
+  // and ones already settled. They used to be filtered out, which meant the
+  // Record Payment dialog could not distinguish "this fee does not apply" from
+  // "this fee is paid" from "this class has no such fee" — all three simply
+  // vanished, and a class with five categories showed three with no explanation.
+  // Whether an entry can be paid against is a separate question from whether it
+  // should be listed, and `owing` already answers the first.
+  const categories = fees.map((f) => {
+    const charged = chargedByKey.get(f.key) ?? 0;
+    const paid = paidByKey.get(f.key) ?? 0;
+    return {
+      key: f.key,
+      name: f.name,
+      classLevelFeeId: f.classLevelFeeId ?? null,
+      studentFeeOverrideId: f.overrideId ?? null,
+      charged,
+      paid,
+      kind: 'fee',
+      payable: true,
+      owing: Math.max(0, charged - paid),
+    };
+  });
 
   // Standalone charges are now first-class payable categories, settled by a
   // payment whose settlesEntryId points at the charge itself. Each is its own row
@@ -269,7 +319,10 @@ function computeOwingByCategory(entries, fees = []) {
   // feesOverridden and convert a student on standard class fees to custom fees.
   for (const c of oneOffs) {
     const key = standaloneChargeKey(c.id);
-    const paid = paidByKey.get(key) ?? 0;
+    // Read from the RAW tagged totals, not the allocation above: a standalone
+    // charge is settled by a payment pointing straight at it, and it is
+    // deliberately not in the fee-charge queue that untagged money fills.
+    const paid = taggedPaid.get(key) ?? 0;
     categories.push({
       kind: 'charge',
       key,
