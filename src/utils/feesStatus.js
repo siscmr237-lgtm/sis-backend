@@ -50,6 +50,14 @@ function computeStudentFeesStatus(entries, config = []) {
   let totalCharged = 0;
   let totalPaid = 0;
 
+  // Payments now carry the fee they settle, so they are held apart by key: a
+  // TAGGED payment may only ever reduce its own category, while an untagged one
+  // still falls back to oldest-first. The fallback is not legacy tolerance for
+  // its own sake — rows recorded before payments were tagged genuinely have no
+  // category, and re-guessing one for them would be inventing data.
+  const taggedPaid = new Map();
+  let untaggedPaid = 0;
+
   for (const e of entries) {
     const amount = Number(e.amount) || 0;
     if (e.type === 'CHARGE') {
@@ -63,6 +71,9 @@ function computeStudentFeesStatus(entries, config = []) {
       });
     } else if (e.type === 'PAYMENT') {
       totalPaid += amount;
+      const key = feeKeyOf(e);
+      if (key != null) taggedPaid.set(key, (taggedPaid.get(key) ?? 0) + amount);
+      else untaggedPaid += amount;
     }
   }
 
@@ -93,7 +104,23 @@ function computeStudentFeesStatus(entries, config = []) {
   // paymentStatus toward Owing; they simply play no part in per-category maths.
   const feeCharges = charges.filter((c) => c.feeId != null);
   feeCharges.sort((a, b) => a.entryDate - b.entryDate || a.id - b.id);
-  let pool = totalPaid;
+
+  // Tagged money first, and only against its own category. This is what fixes
+  // paying Tuition not clearing Tuition: previously every payment joined one
+  // pool and was absorbed by whichever charge happened to be oldest, so money
+  // handed over for Tuition could settle a Uniform charge instead.
+  for (const c of feeCharges) {
+    const available = taggedPaid.get(c.feeId) ?? 0;
+    if (available <= 0) continue;
+    const take = Math.min(available, c.remaining);
+    c.remaining -= take;
+    taggedPaid.set(c.feeId, available - take);
+  }
+
+  // Untagged money then fills what is left, oldest first, as before. Tagged
+  // money that exceeded its own category does NOT spill over — it was given for
+  // that category, and moving it would undo the point of tagging it.
+  let pool = untaggedPaid;
   for (const c of feeCharges) {
     if (pool <= 0) break;
     const take = Math.min(pool, c.remaining);
@@ -166,4 +193,103 @@ async function computeFeesStatusForStudents(prisma, schoolId, students) {
   return out;
 }
 
-module.exports = { PAYMENT_STATUS, computeStudentFeesStatus, computeFeesStatusForStudents };
+/**
+ * What a student still owes, per category — the list the Record Payment dialog
+ * offers and the cap it enforces.
+ *
+ * Deliberately derived from the same entries and the same tagging rule as
+ * computeStudentFeesStatus, so the figure the dialog caps against is the figure
+ * the status is computed from. Two implementations would drift, and the symptom
+ * would be a dialog that refuses a payment the account says is owed.
+ *
+ * Returns one row per fee in the student's effective structure, plus one per
+ * one-off charge. A one-off is its own row rather than being grouped: they are
+ * individual events ("replaced textbook", "trip"), and merging them would make
+ * it impossible to say which one a payment settled.
+ *
+ * @param entries the student's LedgerEntry rows
+ * @param fees    their effective structure from getStudentFeeStructure().fees
+ */
+function computeOwingByCategory(entries, fees = []) {
+  const chargedByKey = new Map();
+  const paidByKey = new Map();
+  const oneOffs = [];
+  let untaggedPaid = 0;
+
+  for (const e of entries) {
+    const amount = Number(e.amount) || 0;
+    const key = feeKeyOf(e);
+    if (e.type === 'CHARGE') {
+      if (key == null) {
+        oneOffs.push({ id: e.id, code: e.code, description: e.description, amount, entryDate: e.entryDate });
+      } else {
+        chargedByKey.set(key, (chargedByKey.get(key) ?? 0) + amount);
+      }
+    } else if (e.type === 'PAYMENT') {
+      if (key == null) untaggedPaid += amount;
+      else paidByKey.set(key, (paidByKey.get(key) ?? 0) + amount);
+    }
+  }
+
+  // Untagged money is spread oldest-first over fee charges, matching the status
+  // calculation, so a legacy payment reduces what the dialog shows as owing
+  // rather than sitting invisibly on the account.
+  const feeRows = fees.map((f) => ({
+    key: f.key,
+    name: f.name,
+    classLevelFeeId: f.classLevelFeeId ?? null,
+    studentFeeOverrideId: f.overrideId ?? null,
+    charged: chargedByKey.get(f.key) ?? 0,
+    paid: paidByKey.get(f.key) ?? 0,
+  }));
+
+  let pool = untaggedPaid;
+  for (const row of feeRows) {
+    if (pool <= 0) break;
+    const outstanding = Math.max(0, row.charged - row.paid);
+    const take = Math.min(pool, outstanding);
+    row.paid += take;
+    pool -= take;
+  }
+
+  const categories = feeRows
+    // A fee with nothing charged is not payable: there is no debt to settle, and
+    // offering it would invite money against a category the student is not billed.
+    .filter((row) => row.charged > 0)
+    .map((row) => ({ ...row, kind: 'fee', payable: true, owing: Math.max(0, row.charged - row.paid) }));
+
+  // One-off charges are listed so the dialog can SHOW what else is outstanding,
+  // but they are not individually payable yet and say so.
+  //
+  // A payment can only point at a ClassLevelFee or a StudentFeeOverride —
+  // LedgerEntry has no link from a payment to another entry — so there is no way
+  // to record "this money settled that specific fine" without a new column. The
+  // intended fix is the other direction: charges raised through Edit This
+  // Student's Fees become entries in the student's own structure, which are
+  // first-class categories with a link that already exists. Until a charge is
+  // raised that way it stays settleable only by an untagged payment.
+  for (const c of oneOffs) {
+    categories.push({
+      kind: 'oneOff',
+      key: `x${c.id}`,
+      name: c.description || 'One-off charge',
+      chargeId: c.id,
+      chargeCode: c.code,
+      classLevelFeeId: null,
+      studentFeeOverrideId: null,
+      charged: c.amount,
+      paid: 0,
+      owing: c.amount,
+      payable: false,
+    });
+  }
+
+  return categories;
+}
+
+module.exports = {
+  PAYMENT_STATUS,
+  computeStudentFeesStatus,
+  computeFeesStatusForStudents,
+  computeOwingByCategory,
+};

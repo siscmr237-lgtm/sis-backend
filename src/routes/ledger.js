@@ -5,6 +5,8 @@ const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
+const { computeOwingByCategory } = require('../utils/feesStatus');
+const { getStudentFeeStructure } = require('../utils/studentFees');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -295,10 +297,49 @@ router.post('/charge', requireAdmin, async (req, res) => {
 });
 
 // POST /ledger/payment
+/**
+ * GET /ledger/student/:studentId/owing
+ *
+ * What this student still owes, per category — the list the Record Payment
+ * dialog offers and the ceiling it enforces. Computed by computeOwingByCategory
+ * from the same ledger rows and the same tagging rule the payment status uses,
+ * so the cap can never disagree with the account.
+ */
+router.get('/student/:studentId/owing', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const student = await prisma.student.findFirst({
+      where: { schoolId, OR: [{ code: String(req.params.studentId) }, { id: parseInt(req.params.studentId) || 0 }] },
+    });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const [structure, entries] = await Promise.all([
+      getStudentFeeStructure(prisma, schoolId, student),
+      prisma.ledgerEntry.findMany({
+        where: { schoolId, studentId: student.id },
+        select: {
+          id: true, code: true, type: true, amount: true, entryDate: true, description: true,
+          classLevelFeeId: true, studentFeeOverrideId: true,
+        },
+      }),
+    ]);
+
+    const categories = computeOwingByCategory(entries, structure.fees);
+    res.json({
+      studentId: student.code,
+      overridden: Boolean(student.feesOverridden),
+      categories,
+      totalOwing: categories.reduce((n, c) => n + c.owing, 0),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.post('/payment', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const { studentId, description, amount, entryDate, paymentMethod } = req.body || {};
+    const { studentId, description, amount, entryDate, paymentMethod, feeKey } = req.body || {};
 
     const amt = Number(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
@@ -310,6 +351,62 @@ router.post('/payment', requireAdmin, async (req, res) => {
     });
     if (!student) return res.status(400).json({ error: 'Invalid studentId' });
 
+    // A payment SHOULD name the category it settles — an untagged payment is
+    // what caused paying Tuition not to clear Tuition, since the money joined
+    // one pool and was absorbed by whichever charge was oldest.
+    //
+    // Not yet rejected when absent, deliberately: the dialog that supplies it is
+    // the next change, and refusing untagged payments before it ships would
+    // break the only way the school currently records money. Flip this to a 400
+    // once the category-first dialog is live. Everything below — the ownership
+    // check and the cap — applies in full the moment a key IS given.
+    if (!feeKey) {
+      const { academicYear: ay, term: tm } = await getSchoolPeriod(schoolId);
+      const legacy = await prisma.ledgerEntry.create({
+        data: {
+          code: genCode('PMT'), type: 'PAYMENT', schoolId, studentId: student.id,
+          categoryId: null, description, amount: amt,
+          entryDate: new Date(entryDate), paymentMethod: paymentMethod || null,
+          academicYear: ay, term: tm,
+        },
+      });
+      return res.status(201).json(withIdAsCode(legacy));
+    }
+
+    const [structure, entries] = await Promise.all([
+      getStudentFeeStructure(prisma, schoolId, student),
+      prisma.ledgerEntry.findMany({
+        where: { schoolId, studentId: student.id },
+        select: {
+          id: true, code: true, type: true, amount: true, entryDate: true, description: true,
+          classLevelFeeId: true, studentFeeOverrideId: true,
+        },
+      }),
+    ]);
+
+    const categories = computeOwingByCategory(entries, structure.fees);
+    const target = categories.find((c) => c.key === String(feeKey));
+    if (!target) {
+      return res.status(400).json({ code: 'UNKNOWN_CATEGORY', error: 'That fee is not on this student\'s account.' });
+    }
+    if (!target.payable) {
+      return res.status(400).json({
+        code: 'CATEGORY_NOT_PAYABLE',
+        error: `"${target.name}" cannot be paid against directly yet.`,
+      });
+    }
+
+    // The cap is enforced HERE, not only in the dialog: a client can be edited,
+    // and an overpayment recorded against a category would make that category
+    // read as more-than-settled while the money is really unallocated.
+    if (amt > target.owing) {
+      return res.status(400).json({
+        code: 'EXCEEDS_OWING',
+        error: `That is more than the ${target.owing.toLocaleString()} still owed for ${target.name}.`,
+        owing: target.owing,
+      });
+    }
+
     const { academicYear, term } = await getSchoolPeriod(schoolId);
     const entry = await prisma.ledgerEntry.create({
       data: {
@@ -318,6 +415,11 @@ router.post('/payment', requireAdmin, async (req, res) => {
         schoolId,
         studentId: student.id,
         categoryId: null,
+        // The linkage that makes the payment count against its own category —
+        // the same pair of columns CHARGE rows already use, read back by
+        // feeKeyOf().
+        classLevelFeeId: target.classLevelFeeId ?? null,
+        studentFeeOverrideId: target.studentFeeOverrideId ?? null,
         description,
         amount: amt,
         entryDate: new Date(entryDate),
