@@ -3,6 +3,7 @@ const { prisma } = require('../db/prisma');
 const { CLASS_CATALOG } = require('../utils/classCatalog');
 const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
 const { ensureLevelFeeDefaults } = require('../utils/feeCategories');
+const { feeSetupPayload, clearNoFeesDeclaration } = require('../utils/levelFees');
 const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
 const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
 const { ensureDefaultTestExamsForYear } = require('../utils/defaultTestExams');
@@ -42,6 +43,24 @@ router.get('/levels', async (req, res) => {
   try {
     const levels = await listSchoolClassLevels(prisma, req.user.schoolId);
     res.json({ levels });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /classes/levels/fee-setup
+// Which levels still need fees, which are declared free, and where a walk goes
+// next. Declared before '/levels/:level/...' for readability only — the paths
+// have different segment counts, so ordering is not load-bearing here.
+//
+// This is the fee dialog's whole picture of the walk. It contains no rule of its
+// own: it returns utils/levelFees.js verbatim, which is the same function the
+// setup checklist's fees step is ticked by. That shared answer is the point —
+// a dialog with its own idea of "done" can hand back a level the checklist still
+// wants, and the two send the user round in circles.
+router.get('/levels/fee-setup', async (req, res) => {
+  try {
+    res.json(await feeSetupPayload(prisma, req.user.schoolId, req.query.after));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -174,6 +193,15 @@ router.put('/levels/:level/fees', async (req, res) => {
       }
     }
 
+    // A level that charges something is not a free level. Clearing this here,
+    // on the write, is what stops the two facts drifting apart: the declaration
+    // cannot outlive the decision it described. levelFeeSetupStatus also ignores
+    // a stale row, so the invariant holds from both ends.
+    let noFeesCleared = false;
+    if (parsed.some((p) => p.amount > 0)) {
+      noFeesCleared = await clearNoFeesDeclaration(prisma, schoolId, level);
+    }
+
     const rebill = await syncLevelFeeCharges(prisma, schoolId, level);
     const updated = await prisma.classLevelFee.findMany({
       where: { schoolId, classLevel: level },
@@ -214,11 +242,77 @@ router.put('/levels/:level/fees', async (req, res) => {
       rebill,
       changedFees,
       detachedStudents,
+      noFeesCleared,
+      // Recomputed AFTER the write, so the dialog is told where to go next by
+      // the same function the checklist is ticked by, rather than guessing from
+      // what it just sent. Saving every amount at 0 leaves this level still in
+      // missingLevels, and that is correct — it bills nobody anything.
+      feeSetup: await feeSetupPayload(prisma, schoolId, level),
     });
   } catch (e) {
     if (e.code === 'P2002') {
       return res.status(409).json({ error: 'Two fees on this level cannot share a name.' });
     }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /classes/levels/:level/no-fees
+//
+// "This level charges nothing." Records the declaration and returns the walk's
+// new position, so the caller can move on the same way a save does.
+//
+// Refuses when the level has a fee above 0, because that is a contradiction
+// rather than a preference — the level demonstrably charges. The dialog offers
+// the action either way; the error is what names the reason.
+//
+// The zero-amount rows are deleted. Those are the placeholders GET .../fees
+// seeds on first open, they bill nobody anything, and leaving five phantom
+// categories on a level the school has just said is free would show up on every
+// one of its students' fee breakdowns. Nothing with a real amount is ever
+// removed here — that case returned 409 above.
+//
+// Idempotent: declaring a level free twice is one fact stated twice.
+router.post('/levels/:level/no-fees', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const known = await listSchoolClassLevels(prisma, schoolId);
+    if (!known.includes(level)) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    const fees = await prisma.classLevelFee.findMany({
+      where: { schoolId, classLevel: level },
+      select: { id: true, name: true, amount: true },
+    });
+    const charged = fees.filter((f) => f.amount > 0);
+    if (charged.length) {
+      return res.status(409).json({
+        error: `${level} already charges ${charged.map((f) => f.name).join(', ')}. `
+          + 'Set those amounts to 0 or remove them first if this level is free.',
+      });
+    }
+
+    if (fees.length) {
+      await prisma.classLevelFee.deleteMany({ where: { schoolId, classLevel: level } });
+      // The deletions cascade to their charges; this clears anything the sync
+      // still considers outstanding for the level.
+      await syncLevelFeeCharges(prisma, schoolId, level);
+    }
+
+    await prisma.classLevelNoFees.upsert({
+      where: { schoolId_classLevel: { schoolId, classLevel: level } },
+      create: { schoolId, classLevel: level },
+      update: {},
+    });
+
+    res.json({
+      classLevel: level,
+      removedEmptyFees: fees.length,
+      feeSetup: await feeSetupPayload(prisma, schoolId, level),
+    });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });

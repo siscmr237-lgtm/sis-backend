@@ -455,6 +455,7 @@ model School {
   Subject                   Subject[]
   chargeCategories          ChargeCategory[]
   classLevelFees            ClassLevelFee[]
+  classLevelNoFees          ClassLevelNoFees[]
   classLevelSubjects        ClassLevelSubject[]
   studentFeeOverrides       StudentFeeOverride[]
   ledgerEntries             LedgerEntry[]
@@ -523,6 +524,36 @@ model ClassLevelFee {
 
   @@unique([schoolId, classLevel, name])
   @@index([schoolId, classLevel])
+}
+
+/// A class level the school has declared it charges NOTHING for.
+///
+/// Needed because "this level has no fees" and "nobody has set this level's fees
+/// up yet" look identical in the data, and the setup checklist has to tell them
+/// apart — otherwise a school with a free nursery can never finish the fees step
+/// and the card nags forever. A row here is an explicit statement, not an
+/// absence.
+///
+/// A LEVEL, not a class, matching ClassLevelFee: fees belong to the level and
+/// every section shares one structure, so the declaration has to sit at the same
+/// grain or the two could disagree about a single section.
+///
+/// The invariant this must never break: a level cannot be both free and charged.
+/// Saving any fee with an amount above 0 deletes the row (see PUT
+/// /classes/levels/:level/fees), and levelFeeSetupStatus ignores the row anyway
+/// whenever the level has a charged fee, so even a stale row cannot produce the
+/// contradiction.
+model ClassLevelNoFees {
+  id         Int      @id @default(autoincrement())
+  school     School   @relation(fields: [schoolId], references: [id])
+  schoolId   Int
+  classLevel String
+  /// When it was declared free. A timestamp rather than a bare flag so the
+  /// answer to "when did they decide this?" survives.
+  markedAt   DateTime @default(now())
+
+  @@unique([schoolId, classLevel])
+  @@index([schoolId])
 }
 
 /// One fee in a single student's PERSONAL fee structure, used when they have been

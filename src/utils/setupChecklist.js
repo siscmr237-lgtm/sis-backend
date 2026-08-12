@@ -1,4 +1,5 @@
-const { classLevelOf, listSchoolClassLevels } = require('./classLevels');
+const { classLevelOf } = require('./classLevels');
+const { levelFeeSetupStatus } = require('./levelFees');
 
 /**
  * "Get your school ready" — the setup steps, answered from live data.
@@ -31,7 +32,7 @@ async function buildSetupChecklist(prisma, schoolId) {
   const [
     school,
     classes,
-    feeLevels,
+    feeStatus,
     subjectLevels,
     examClasses,
     staffCount,
@@ -42,14 +43,14 @@ async function buildSetupChecklist(prisma, schoolId) {
       select: { name: true, logo: true, motto: true, schoolType: true },
     }),
     prisma.class.findMany({ where: { schoolId }, select: { name: true } }),
-    // Which levels have at least one fee / subject. `distinct` rather than a
-    // count per level: the number of levels is small but a query per level is
-    // still a query per level.
-    prisma.classLevelFee.findMany({
-      where: { schoolId },
-      select: { classLevel: true },
-      distinct: ['classLevel'],
-    }),
+    // The fees step is NOT decided here. It is the one step the fee dialog also
+    // has to reason about — it needs to know which level to walk to next — so
+    // the rule lives in utils/levelFees.js and both call it. Two copies would
+    // eventually disagree, and a disagreement here is a walk that never ends.
+    levelFeeSetupStatus(prisma, schoolId),
+    // Which levels have at least one subject. `distinct` rather than a count per
+    // level: the number of levels is small but a query per level is still a
+    // query per level.
     prisma.classLevelSubject.findMany({
       where: { schoolId },
       select: { classLevel: true },
@@ -66,9 +67,9 @@ async function buildSetupChecklist(prisma, schoolId) {
     prisma.student.count({ where: { schoolId } }),
   ]);
 
-  const levels = await listSchoolClassLevels(prisma, schoolId);
+  // Reused rather than re-queried: levelFeeSetupStatus already listed them.
+  const levels = feeStatus.levels;
   const has = (rows, field = 'classLevel') => new Set(rows.map((r) => r[field]));
-  const levelsWithFees = has(feeLevels);
   const levelsWithSubjects = has(subjectLevels);
   const levelsWithTotals = new Set(examClasses.map((t) => classLevelOf(t.class?.name)));
 
@@ -76,9 +77,13 @@ async function buildSetupChecklist(prisma, schoolId) {
    * A level-scoped step is done when EVERY level has the thing.
    *
    * With no classes yet there are no levels, and "every one of zero levels has
-   * fees" is vacuously true — which would tick three steps for a school that
+   * subjects" is vacuously true — which would tick the steps for a school that
    * has set up nothing. So no classes means not done, and the step says to
    * start with classes rather than showing an empty list of what is missing.
+   *
+   * Subjects and assessment totals only. Fees follow the same rule but are
+   * computed by utils/levelFees.js, because the fee dialog needs the same answer
+   * and one of them has to be the copy that does not exist.
    */
   const everyLevel = (present) => {
     if (!levels.length) return { done: false, missingLevels: [], blockedOnClasses: true };
@@ -98,7 +103,15 @@ async function buildSetupChecklist(prisma, schoolId) {
   ];
   const missingDetails = detailFields.filter((f) => !f.present).map((f) => f.label);
 
-  const fees = everyLevel(levelsWithFees);
+  // Same every-level shape as the two below, but computed by the shared fee
+  // module — which additionally honours "this level charges nothing", something
+  // only fees have. freeLevels rides along so the card can say so.
+  const fees = {
+    done: feeStatus.done,
+    missingLevels: feeStatus.missingLevels,
+    blockedOnClasses: feeStatus.blockedOnClasses,
+    freeLevels: feeStatus.freeLevels,
+  };
   const subjects = everyLevel(levelsWithSubjects);
   const totals = everyLevel(levelsWithTotals);
 
