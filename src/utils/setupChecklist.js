@@ -178,4 +178,58 @@ async function buildSetupChecklist(prisma, schoolId) {
   };
 }
 
-module.exports = { buildSetupChecklist };
+/**
+ * The steps the post-KYC WIZARD walks through, in the order it walks them.
+ *
+ * A subset of the checklist above, not a second list. KYC has already collected
+ * school details and created the classes, so the wizard starts at the first
+ * thing it did not do — and because these are the checklist's own step ids, the
+ * wizard and the checklist cannot drift apart: there is one set of conditions,
+ * evaluated by one function, and this only chooses which of them to walk.
+ */
+const WIZARD_STEP_IDS = ['fees', 'subjects', 'assessment-totals', 'staff', 'students'];
+
+/**
+ * The wizard's view: the same live-data steps, filtered and ordered, plus
+ * whether it should be shown at all.
+ *
+ * Shown only when all three hold:
+ *   - KYC is finished          — the wizard picks up where KYC left off, so it
+ *                                has nothing to say to a school still in it
+ *   - it has never been left   — setupWizardCompletedAt is NULL. An admin who
+ *                                skipped out once is not dragged back in every
+ *                                login; the dashboard checklist takes over
+ *   - something is outstanding — no point walking someone through five steps
+ *                                they have already completed
+ *
+ * Note what is NOT here: any record of which steps were skipped. A skipped step
+ * has no data, so it reads as not-done from the tables, which is the whole
+ * mechanism by which the checklist catches it later.
+ */
+async function buildSetupWizard(prisma, schoolId) {
+  const [school, checklist] = await Promise.all([
+    prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { onboardingCompleted: true, setupWizardCompletedAt: true },
+    }),
+    buildSetupChecklist(prisma, schoolId),
+  ]);
+
+  const steps = WIZARD_STEP_IDS
+    .map((id) => checklist.steps.find((s) => s.id === id))
+    .filter(Boolean);
+  const completedCount = steps.filter((s) => s.done).length;
+  const outstanding = completedCount < steps.length;
+
+  return {
+    show: Boolean(school?.onboardingCompleted) && school?.setupWizardCompletedAt == null && outstanding,
+    kycCompleted: Boolean(school?.onboardingCompleted),
+    seenAt: school?.setupWizardCompletedAt ?? null,
+    completedCount,
+    totalCount: steps.length,
+    levels: checklist.levels,
+    steps,
+  };
+}
+
+module.exports = { buildSetupChecklist, buildSetupWizard, WIZARD_STEP_IDS };

@@ -1,6 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
-const { buildSetupChecklist } = require('../utils/setupChecklist');
+const { buildSetupChecklist, buildSetupWizard } = require('../utils/setupChecklist');
 
 const router = express.Router();
 
@@ -15,6 +15,50 @@ const router = express.Router();
 router.get('/setup-checklist', async (req, res) => {
   try {
     res.json(await buildSetupChecklist(prisma, req.user.schoolId));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /dashboard/setup-wizard — the post-KYC wizard's five steps, and whether
+// to show it at all. Same live data as the checklist, filtered to the steps KYC
+// did not already cover.
+router.get('/setup-wizard', async (req, res) => {
+  try {
+    res.json(await buildSetupWizard(prisma, req.user.schoolId));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /dashboard/setup-wizard/dismiss — the admin has left the wizard, by
+// finishing it or by skipping out.
+//
+// Stamps the SEEN flag and nothing else. It records no progress: what was
+// actually set up stays a live question about the tables, so dismissing does
+// not mark anything complete and the dashboard checklist still lists whatever
+// was skipped.
+//
+// Idempotent by first-write-wins — a second dismiss keeps the original moment
+// rather than moving it, so "when did they first leave the wizard?" stays
+// answerable.
+router.post('/setup-wizard/dismiss', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const school = await prisma.school.findUnique({
+      where: { id: schoolId },
+      select: { setupWizardCompletedAt: true },
+    });
+    if (!school) return res.status(404).json({ error: 'School not found' });
+
+    const seenAt = school.setupWizardCompletedAt
+      ?? (await prisma.school.update({
+        where: { id: schoolId },
+        data: { setupWizardCompletedAt: new Date() },
+        select: { setupWizardCompletedAt: true },
+      })).setupWizardCompletedAt;
+
+    res.json({ dismissed: true, seenAt });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

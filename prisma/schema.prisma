@@ -425,6 +425,21 @@ model School {
   schoolType                SchoolType?
   uniformColors             Json                 @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
   onboardingCompleted       Boolean              @default(true)
+  /// When the admin last left the post-KYC setup wizard, by finishing it or by
+  /// skipping out of it. NULL means they have never been through it, which is
+  /// the only thing that makes the wizard appear.
+  ///
+  /// This is NOT progress tracking. It records that the wizard was SEEN and
+  /// nothing about what was set up: every step's done/not-done is still read
+  /// live from the tables, by the same code the dashboard checklist uses.
+  /// Skipping a step leaves no trace anywhere — it simply has no data, so the
+  /// checklist lists it as outstanding. The two are one system: the wizard
+  /// guides once, the checklist catches whatever was skipped, and they cannot
+  /// disagree because neither stores an opinion about completeness.
+  ///
+  /// A timestamp rather than a boolean so it is possible to tell WHEN a school
+  /// dismissed it; a bare `true` says nothing useful a month later.
+  setupWizardCompletedAt    DateTime?
   subjectsPerClass          Json
   adminUser                 AdminUser            @relation(fields: [adminUserId], references: [id])
   adminUserId               Int
