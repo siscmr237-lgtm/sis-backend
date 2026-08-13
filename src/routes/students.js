@@ -13,9 +13,22 @@ const {
 const { findStudentsWithZeroMarks, findZeroMarkSubjects } = require('../utils/zeroMarks');
 const { applyTermEndZerosQuietly } = require('../utils/termEndZeros');
 const { requireAdmin, getTeacherClassNames } = require('../roleGuards');
+const { hideStudentFinancialsFromTeachers } = require('../utils/feeVisibility');
 const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
 const router = express.Router();
+
+// Fee data leaves this router for ADMINS ONLY.
+//
+// The two reads below deliberately have no requireAdmin — a teacher needs the
+// roster for attendance and marks — but "may see the student" is not "may see
+// what the family owes". This drops totalCharged/totalPaid/balance and the
+// payment-state fields from a teacher's copy of every response this router
+// sends; see src/utils/feeVisibility.js for the field list and the reasoning.
+//
+// Applied here at the router rather than at each res.json so a route added later
+// inherits it. An admin request is not touched at all.
+router.use(hideStudentFinancialsFromTeachers);
 
 /**
  * The extra `where` clause that confines a teacher to their own students, or
