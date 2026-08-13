@@ -23,6 +23,23 @@ const { ACTOR_TEACHER } = require('./sessionToken');
  * present and future, the same way app.js gates whole routers rather than
  * trusting each new route to remember.
  *
+ * WHAT THIS DOES AND DOES NOT COVER — the limits of that promise.
+ *
+ * It covers every res.json from a router this is mounted on, at any nesting
+ * depth. It does NOT cover:
+ *
+ *   - res.send / res.end / res.download / a piped stream. Only res.json is
+ *     wrapped. Nothing in this API responds any other way today (checked across
+ *     every router; the only PDFs are built in the browser), so a future CSV or
+ *     PDF export of student data is the one thing that would walk past this. It
+ *     would need its own handling, and this note is here so that is a decision
+ *     rather than a surprise.
+ *   - a DIFFERENT router mounted elsewhere in the /students URL space. This is
+ *     middleware on the students router object, not on the path: app.js:153
+ *     mounts pickupContactsRouter at /students/:studentId/pickup-contacts as a
+ *     separate router, and it does not inherit this. It is requireAdmin, so no
+ *     teacher reaches it — but the reason it is safe is that guard, not this.
+ *
  * WHY THE FIELDS ARE OMITTED AND NOT ZEROED.
  *
  * A returned `balance: 0` is a claim — that this family owes nothing. Hiding the
@@ -66,31 +83,58 @@ const STUDENT_FINANCIAL_FIELDS = [
 ];
 
 /**
- * The same object back when it holds none of these fields — errors, 404 bodies,
- * write acknowledgements — so this can sit in front of every response without
- * reshaping the ones it has nothing to say about.
+ * Only a plain object is descended into. A Date — createdAt, dateOfBirth — is an
+ * object too, and rebuilding one key by key would turn it into `{}` in the JSON.
+ * Anything that is not a bare object or an array is passed through by reference.
  */
-function stripOne(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  const drop = STUDENT_FINANCIAL_FIELDS.filter((f) => Object.prototype.hasOwnProperty.call(value, f));
-  if (!drop.length) return value;
-
-  const out = {};
-  for (const key of Object.keys(value)) {
-    if (!drop.includes(key)) out[key] = value[key];
-  }
-  return out;
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
-function withoutStudentFinancials(body) {
-  if (!Array.isArray(body)) return stripOne(body);
+/**
+ * Drops the fields above wherever they appear, at ANY depth.
+ *
+ * Depth matters because of what this is for. The two routes that leak today
+ * return a bare student and a bare array of students, and a two-shape stripper
+ * would cover both — but the whole reason this is a router-level wrapper rather
+ * than an edit to those two res.json calls is the route nobody has written yet.
+ * That route is as likely to return { data: { student } } or { page, items: [] }
+ * as it is a bare object, and a guard that silently stops working the moment
+ * somebody wraps a response is not a guard, it is a coincidence. Recursing is
+ * what makes "everything under this router" true rather than aspirational.
+ *
+ * Nothing is copied unless something is actually removed: an object with none of
+ * these fields anywhere inside it comes back as the SAME reference. That is what
+ * lets this sit in front of every response — 404 bodies, validation errors, write
+ * acknowledgements — without reshaping the ones it has nothing to say about.
+ */
+function withoutStudentFinancials(value) {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = value.map((item) => {
+      const next = withoutStudentFinancials(item);
+      if (next !== item) changed = true;
+      return next;
+    });
+    return changed ? out : value;
+  }
+
+  if (!isPlainObject(value)) return value;
+
   let changed = false;
-  const out = body.map((item) => {
-    const stripped = stripOne(item);
-    if (stripped !== item) changed = true;
-    return stripped;
-  });
-  return changed ? out : body;
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (STUDENT_FINANCIAL_FIELDS.includes(key)) {
+      changed = true;
+      continue;
+    }
+    const next = withoutStudentFinancials(value[key]);
+    if (next !== value[key]) changed = true;
+    out[key] = next;
+  }
+  return changed ? out : value;
 }
 
 /**
