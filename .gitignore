@@ -6,3 +6,8 @@
 .env.*.bak
 node_modules/
 logs/
+
+# A local one-off seeding script that writes fee data straight into the
+# database. It has no place in the repo and must never be committed — ignoring
+# it makes that structural instead of relying on nobody typing `git add -A`.
+_seed_fees.js
