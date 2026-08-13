@@ -179,13 +179,36 @@ router.get('/transactions', requireAdmin, async (req, res) => {
             WHEN cc.name = 'Salary' THEN 'payroll'
             ELSE 'others'
           END AS bucket,
-          le.type::text AS type,
+          -- The kind of event, not merely the ledger's two-way CHARGE/PAYMENT
+          -- split. Payroll is a staff PAYMENT carrying a payrollMonth — the same
+          -- discriminator /dashboard/recent-activity uses — and the staff side
+          -- is named separately because a staff CHARGE and a student CHARGE are
+          -- opposite directions of money.
+          CASE
+            WHEN le.type = 'PAYMENT' AND le."staffId" IS NOT NULL AND le."payrollMonth" IS NOT NULL THEN 'PAYROLL'
+            WHEN le.type = 'PAYMENT' AND le."staffId" IS NOT NULL THEN 'STAFF_PAYMENT'
+            WHEN le.type = 'CHARGE' AND le."staffId" IS NOT NULL THEN 'STAFF_CHARGE'
+            ELSE le.type::text
+          END AS type,
           cc.name AS category,
           le.description AS description,
           COALESCE(st."firstName" || ' ' || st."lastName", sf."firstName" || ' ' || sf."lastName") AS "partyName",
+          CASE WHEN le."studentId" IS NOT NULL THEN 'student'
+               WHEN le."staffId" IS NOT NULL THEN 'staff' END AS "partyType",
+          COALESCE(st.code, sf.code) AS "partyCode",
+          st.class AS "partyClass",
           le.amount AS amount,
           le."entryDate" AS "entryDate",
           le."paymentMethod" AS "paymentMethod",
+          le.note AS note,
+          le."payrollMonth" AS "payrollMonth",
+          le."payrollBonus" AS "payrollBonus",
+          le."academicYear" AS "academicYear",
+          le.term AS term,
+          -- The charge this payment settled, by code, so Details can link
+          -- through to the other side of the transaction.
+          settled.code AS "settlesCode",
+          settled.description AS "settlesDescription",
           -- Carried so the page can warn before deleting one: these rows are
           -- owned by syncLevelFeeCharges and come back the next time that class
           -- level's fees are saved.
@@ -194,7 +217,26 @@ router.get('/transactions', requireAdmin, async (req, res) => {
         LEFT JOIN "ChargeCategory" cc ON cc.id = le."categoryId"
         LEFT JOIN "Student" st ON st.id = le."studentId"
         LEFT JOIN "Staff" sf ON sf.id = le."staffId"
+        LEFT JOIN "LedgerEntry" settled ON settled.id = le."settlesEntryId"
         WHERE le."schoolId" = ${schoolId}
+          -- CLASS-WIDE FEE BILLING IS NOT A TRANSACTION HERE.
+          --
+          -- A row that is BOTH isFeeStructureCharge AND tied to a ClassLevelFee
+          -- is the automatic per-student billing of a class-wide fee category:
+          -- nobody recorded it, syncLevelFeeCharges wrote it, and it is rewritten
+          -- in place whenever that level's amount changes. Listing one line per
+          -- student per fee category drowned everything an admin actually did.
+          --
+          -- Both halves of the condition are needed, and neither alone would do:
+          --   * isFeeStructureCharge alone would also exclude a DETACHED
+          --     student's own override charges, which are unique to that one
+          --     student and belong here.
+          --   * classLevelFeeId alone would also exclude an admin's EXTRA charge
+          --     against a fee category (a second Tuition), which carries the
+          --     same FK but is a deliberate, hand-recorded entry.
+          -- Anything hand-recorded therefore survives, which is the safe way for
+          -- this filter to be wrong.
+          AND NOT (le."isFeeStructureCharge" = TRUE AND le."classLevelFeeId" IS NOT NULL)
 
         UNION ALL
 
@@ -205,9 +247,19 @@ router.get('/transactions', requireAdmin, async (req, res) => {
           ex.category AS category,
           ex.description AS description,
           ex.payee AS "partyName",
+          'vendor' AS "partyType",
+          NULL AS "partyCode",
+          NULL AS "partyClass",
           ex.amount AS amount,
           ex.date AS "entryDate",
           ex."paymentMethod" AS "paymentMethod",
+          ex."invoiceNumber" AS note,
+          NULL AS "payrollMonth",
+          NULL AS "payrollBonus",
+          NULL AS "academicYear",
+          NULL AS term,
+          NULL AS "settlesCode",
+          NULL AS "settlesDescription",
           FALSE AS "isFeeStructureCharge"
         FROM "Expense" ex
         WHERE ex."schoolId" = ${schoolId}
