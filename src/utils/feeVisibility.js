@@ -79,6 +79,9 @@ const STUDENT_FINANCIAL_FIELDS = [
   'balance',
   'paymentStatus',
   'firstInstallmentMet',
+  // Names a category and an amount owed on it — the same disclosure as a
+  // balance, itemised. It travels with the flag it explains.
+  'firstInstallmentShortfalls',
   'feesOverridden',
 ];
 

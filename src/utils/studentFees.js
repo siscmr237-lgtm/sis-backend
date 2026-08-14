@@ -49,6 +49,7 @@ async function getStudentFeeStructure(prisma, schoolId, student) {
         name: r.name,
         amount: r.amount,
         firstInstallmentPercent: r.firstInstallmentPercent,
+      group: r.group,
       })),
     };
   }
@@ -68,6 +69,7 @@ async function getStudentFeeStructure(prisma, schoolId, student) {
       name: r.name,
       amount: r.amount,
       firstInstallmentPercent: r.firstInstallmentPercent,
+      group: r.group,
     })),
   };
 }
@@ -96,6 +98,7 @@ async function getFeeStructuresForStudents(prisma, schoolId, students) {
       name: r.name,
       amount: r.amount,
       firstInstallmentPercent: r.firstInstallmentPercent,
+      group: r.group,
     });
   }
   const byLevel = new Map();
@@ -108,6 +111,7 @@ async function getFeeStructuresForStudents(prisma, schoolId, students) {
       name: r.name,
       amount: r.amount,
       firstInstallmentPercent: r.firstInstallmentPercent,
+      group: r.group,
     });
   }
 

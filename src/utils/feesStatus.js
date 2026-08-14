@@ -156,7 +156,7 @@ function computeStudentFeesStatus(entries, config = []) {
 
   // --- (b) first installment ----------------------------------------------
   const rule = (config || []).filter((c) => c && c.feeKey != null && c.percent != null);
-  if (!rule.length) return { ...base, firstInstallmentMet: null };
+  if (!rule.length) return { ...base, firstInstallmentMet: null, firstInstallmentShortfalls: [] };
 
   // Allocation runs over FEE-LINKED charges only. A one-off charge (a fine, a
   // trip, a replaced book) is outside the fee structure and must not affect this
@@ -174,18 +174,78 @@ function computeStudentFeesStatus(entries, config = []) {
     paidByFee.set(c.feeId, (paidByFee.get(c.feeId) ?? 0) + (c.amount - c.remaining));
   }
 
-  const firstInstallmentMet = rule.every(({ feeKey, percent }) => {
+  /**
+   * WHICH fee is short, and by how much — not merely that something is.
+   *
+   * Without this the screen says "first installment not met" and stops, and the
+   * commonest way to get there is genuinely baffling: a parent hands over a lump
+   * sum, it is recorded untagged, allocation fills the oldest fee-linked charge
+   * first — usually Registration — and Tuition's requirement quietly fails. The
+   * money is all present and the allocation is correct; what was missing was any
+   * way to see where it went. So the shortfall is computed here, beside the
+   * decision, rather than re-derived by whatever is drawing the screen.
+   */
+  const shortfalls = [];
+  for (const { feeKey, percent, name } of rule) {
     const charged = chargedByFee.get(feeKey) ?? 0;
     // Nothing charged for a required fee means nothing to pay for it, so it
     // cannot hold the student back.
-    if (charged <= 0) return true;
+    if (charged <= 0) continue;
     // Rounded up, so a 50% requirement is not satisfied by being half a unit
     // short.
     const required = Math.ceil((charged * Number(percent)) / 100);
-    return (paidByFee.get(feeKey) ?? 0) >= required;
-  });
+    const paid = paidByFee.get(feeKey) ?? 0;
+    if (paid >= required) continue;
+    shortfalls.push({
+      feeKey,
+      name: name ?? null,
+      percent: Number(percent),
+      charged,
+      required,
+      paid,
+      shortBy: required - paid,
+    });
+  }
 
-  return { ...base, firstInstallmentMet };
+  return {
+    ...base,
+    firstInstallmentMet: shortfalls.length === 0,
+    // Empty when met, so a caller can render it unconditionally.
+    firstInstallmentShortfalls: shortfalls,
+  };
+}
+
+/**
+ * The fees that take part in the first-installment rule.
+ *
+ * REGISTRATION IS OUT, STRUCTURALLY. Not "out because somebody left its
+ * percentage null" — out because of what it is. A registration fee is charged
+ * once at enrolment and is not part of the instalment somebody is being asked
+ * to have paid by a deadline, so it must not be able to hold a student back.
+ *
+ * The group is checked rather than the percentage precisely because NULL is a
+ * setting, and settings get set wrong. A school that types 100 into
+ * firstInstallmentPercent on their Registration fee — by habit, or by copying
+ * the row above — would otherwise make it a hard requirement, and this is the
+ * one place that cannot be left to depend on that not happening. Whatever is
+ * stored on a Registration fee is ignored here.
+ *
+ * This is a FILTER on the rule, and deliberately nothing else. Allocation is
+ * untouched: an untagged payment still fills the oldest fee-linked charge
+ * first, Registration included, because that is where the money genuinely went.
+ * What changes is only whether Registration can make firstInstallmentMet false.
+ *
+ * Returning an empty rule keeps the null-vs-false distinction intact. A level
+ * whose only opted-in fee was a Registration one now produces no rule at all, so
+ * computeStudentFeesStatus reports null — "no first-installment rule
+ * configured" — rather than false, which would say the student had failed a
+ * requirement that no longer exists.
+ */
+function buildFirstInstallmentRule(fees) {
+  return (fees ?? [])
+    .filter((f) => f.group !== 'REGISTRATION')
+    .filter((f) => f.firstInstallmentPercent != null)
+    .map((f) => ({ feeKey: f.key, percent: f.firstInstallmentPercent, name: f.name }));
 }
 
 /**
@@ -223,9 +283,7 @@ async function computeFeesStatusForStudents(prisma, schoolId, students) {
 
   for (const s of students) {
     const structure = structures.get(s.id);
-    const rule = (structure?.fees ?? [])
-      .filter((f) => f.firstInstallmentPercent != null)
-      .map((f) => ({ feeKey: f.key, percent: f.firstInstallmentPercent }));
+    const rule = buildFirstInstallmentRule(structure?.fees);
     const status = computeStudentFeesStatus(entriesByStudent.get(s.id) ?? [], rule);
     out.set(s.id, { ...status, feesOverridden: Boolean(structure?.overridden) });
   }
@@ -298,6 +356,10 @@ function computeOwingByCategory(entries, fees = []) {
     return {
       key: f.key,
       name: f.name,
+      // Which fixed group this fee sits in, so every consumer of the owing list
+      // can group without re-deriving it — the Balance Owed dialog, the payment
+      // category picker, and settling a whole group all read this one field.
+      group: f.group ?? 'OTHER_FEES',
       classLevelFeeId: f.classLevelFeeId ?? null,
       studentFeeOverrideId: f.overrideId ?? null,
       charged,

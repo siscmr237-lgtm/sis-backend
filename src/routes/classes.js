@@ -2,7 +2,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { CLASS_CATALOG } = require('../utils/classCatalog');
 const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
-const { ensureLevelFeeDefaults } = require('../utils/feeCategories');
+const { ensureLevelFeeDefaults, FEE_GROUPS } = require('../utils/feeCategories');
 const { feeSetupPayload, clearNoFeesDeclaration } = require('../utils/levelFees');
 const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
 const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
@@ -99,7 +99,7 @@ router.get('/levels/:level/fees', async (req, res) => {
 });
 
 // PUT /classes/levels/:level/fees
-// Body: { fees: [{ id?, name, amount, firstInstallmentPercent }] }
+// Body: { fees: [{ id?, name, amount, firstInstallmentPercent, group }] }
 //
 // Replaces the level's whole fee structure in one request: a fee present without
 // an id is created, one with an id is updated, and any existing fee the caller
@@ -125,7 +125,7 @@ router.put('/levels/:level/fees', async (req, res) => {
 
     const existing = await prisma.classLevelFee.findMany({
       where: { schoolId, classLevel: level },
-      select: { id: true, name: true, amount: true, firstInstallmentPercent: true },
+      select: { id: true, name: true, amount: true, firstInstallmentPercent: true, group: true },
     });
     const existingIds = new Set(existing.map((f) => f.id));
     const existingById = new Map(existing.map((f) => [f.id, f]));
@@ -163,7 +163,18 @@ router.put('/levels/:level/fees', async (req, res) => {
           return res.status(400).json({ error: `Fee ${raw.id} does not belong to this class level.` });
         }
       }
-      parsed.push({ id, name, amount: Math.round(amount), firstInstallmentPercent: percent });
+            // Closed set, checked here rather than trusted: the column is an enum, so
+      // an unknown value would fail at the database with an opaque error instead
+      // of a sentence naming the field.
+      const rawGroup = raw?.group;
+      const group = FEE_GROUPS.includes(rawGroup) ? rawGroup : 'OTHER_FEES';
+      // Registration takes no first-installment percentage. The rule ignores it
+      // anyway (see buildFirstInstallmentRule), so storing one would only leave a
+      // number on screen that does nothing.
+      parsed.push({
+        id, name, amount: Math.round(amount), group,
+        firstInstallmentPercent: group === 'REGISTRATION' ? null : percent,
+      });
     }
 
     const keptIds = new Set(parsed.filter((p) => p.id != null).map((p) => p.id));
@@ -178,7 +189,7 @@ router.put('/levels/:level/fees', async (req, res) => {
       if (p.id != null) {
         await prisma.classLevelFee.update({
           where: { id: p.id },
-          data: { name: p.name, amount: p.amount, firstInstallmentPercent: p.firstInstallmentPercent },
+          data: { name: p.name, amount: p.amount, firstInstallmentPercent: p.firstInstallmentPercent, group: p.group },
         });
       } else {
         await prisma.classLevelFee.create({
@@ -188,6 +199,7 @@ router.put('/levels/:level/fees', async (req, res) => {
             name: p.name,
             amount: p.amount,
             firstInstallmentPercent: p.firstInstallmentPercent,
+            group: p.group,
           },
         });
       }

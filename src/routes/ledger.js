@@ -5,6 +5,7 @@ const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
+const { FEE_GROUPS } = require('../utils/feeCategories');
 const { computeOwingByCategory } = require('../utils/feesStatus');
 const { getStudentFeeStructure } = require('../utils/studentFees');
 const {
@@ -572,6 +573,130 @@ async function sendStaffLedger(res, schoolId, staff) {
     charges: mapWithIdAsCode(outstandingStaffCharges(entries)),
   });
 }
+
+// GET  /ledger/student/:studentId/group-settlement?group=REGISTRATION
+// POST /ledger/student/:studentId/group-settlement  { group, entryDate, paymentMethod, confirm }
+//
+// Settle every outstanding category in one fee group without typing each one.
+//
+// THIS WRITES REAL PAYMENTS — one per category, each for that category's own
+// outstanding amount, each tagged to its own fee. It sets no "paid" flag, zeroes
+// no balance, and never writes a single lump entry: a lump would land untagged
+// and then be allocated oldest-first, which is precisely the bug that made
+// paying Tuition clear something else. Afterwards these are ordinary payments —
+// each appears in School Transactions on its own line and each deletes on its
+// own, exactly like one typed by hand.
+//
+// The GET is the confirmation step's source of truth. It reports exactly what
+// the POST would write, computed by the same computeOwingByCategory the
+// single-payment path caps against, so the figure somebody agrees to is the
+// figure that gets recorded.
+const groupSettlementPlan = async (schoolId, student, group) => {
+  const [structure, entries] = await Promise.all([
+    getStudentFeeStructure(prisma, schoolId, student),
+    prisma.ledgerEntry.findMany({
+      where: { schoolId, studentId: student.id },
+      select: {
+        id: true, code: true, type: true, amount: true, entryDate: true, description: true,
+        classLevelFeeId: true, studentFeeOverrideId: true, settlesEntryId: true, note: true,
+      },
+    }),
+  ]);
+  const categories = computeOwingByCategory(entries, structure.fees);
+  const inGroup = categories.filter((c) => (c.group ?? 'OTHER_FEES') === group);
+  // Only what is genuinely outstanding AND payable. A category already settled
+  // contributes nothing, which is what makes a fully-paid group produce an empty
+  // plan rather than a pile of zero-amount entries.
+  const items = inGroup.filter((c) => c.payable && c.owing > 0);
+  return {
+    group,
+    categories: items.map((c) => ({ key: c.key, name: c.name, owing: c.owing })),
+    // Named so the confirmation can say what is NOT being covered rather than
+    // quietly leaving it behind.
+    alreadySettled: inGroup.filter((c) => c.owing <= 0).map((c) => c.name),
+    notPayable: inGroup.filter((c) => !c.payable && c.owing > 0).map((c) => c.name),
+    total: items.reduce((s, c) => s + c.owing, 0),
+    count: items.length,
+  };
+};
+
+const findStudentByParam = (schoolId, param) => prisma.student.findFirst({
+  where: { schoolId, OR: [{ code: String(param) }, { id: parseInt(param) || 0 }] },
+});
+
+router.get('/student/:studentId/group-settlement', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const group = FEE_GROUPS.includes(req.query.group) ? req.query.group : null;
+    if (!group) return res.status(400).json({ error: `group must be one of: ${FEE_GROUPS.join(', ')}` });
+    const student = await findStudentByParam(schoolId, req.params.studentId);
+    if (!student) return res.status(404).json({ error: 'Not found' });
+    res.json(await groupSettlementPlan(schoolId, student, group));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/student/:studentId/group-settlement', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { group: rawGroup, entryDate, paymentMethod, confirm } = req.body || {};
+    const group = FEE_GROUPS.includes(rawGroup) ? rawGroup : null;
+    if (!group) return res.status(400).json({ error: `group must be one of: ${FEE_GROUPS.join(', ')}` });
+    if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
+    // Explicit, and separate from merely calling the endpoint. Writing several
+    // payments at once is not something to do on a caller's say-so alone.
+    if (confirm !== true) {
+      return res.status(400).json({ code: 'CONFIRMATION_REQUIRED', error: 'This action must be confirmed.' });
+    }
+
+    const student = await findStudentByParam(schoolId, req.params.studentId);
+    if (!student) return res.status(404).json({ error: 'Not found' });
+
+    // Recomputed HERE rather than trusted from the request. Between the
+    // confirmation being shown and accepted, somebody else may have recorded a
+    // payment; writing the figures the client remembers would overpay.
+    const plan = await groupSettlementPlan(schoolId, student, group);
+    if (plan.count === 0) {
+      return res.status(409).json({
+        code: 'NOTHING_OUTSTANDING',
+        error: `Nothing is outstanding in ${group === 'REGISTRATION' ? 'Registration' : 'Other Fees'}.`,
+      });
+    }
+
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
+    const created = [];
+    for (const c of plan.categories) {
+      // One row per category, each tagged to its own fee, each at that
+      // category's own amount — the same shape POST /ledger/payment writes, so
+      // allocation and every downstream reading of it behave identically.
+      // feeKeyOf() reads these three columns back out; exactly one is ever set.
+      const entry = await prisma.ledgerEntry.create({
+        data: {
+          code: genCode('PMT'),
+          type: 'PAYMENT',
+          schoolId,
+          studentId: student.id,
+          categoryId: null,
+          classLevelFeeId: c.key.startsWith('c') ? Number(c.key.slice(1)) : null,
+          studentFeeOverrideId: c.key.startsWith('o') ? Number(c.key.slice(1)) : null,
+          settlesEntryId: c.key.startsWith('x') ? Number(c.key.slice(1)) : null,
+          description: c.name,
+          amount: c.owing,
+          entryDate: new Date(entryDate),
+          paymentMethod: paymentMethod || null,
+          academicYear,
+          term,
+        },
+      });
+      created.push(withIdAsCode(entry));
+    }
+
+    res.status(201).json({ group, recorded: created.length, total: plan.total, entries: created });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
 
 // GET /ledger/staff/me — the signed-in teacher's own salary ledger.
 //

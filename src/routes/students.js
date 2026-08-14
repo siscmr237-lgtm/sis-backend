@@ -6,6 +6,7 @@ const { computeFeesStatusForStudents } = require('../utils/feesStatus');
 const { classLevelOf } = require('../utils/classLevels');
 const { syncStudentFeeCharges } = require('../utils/levelFeeCharges');
 const { getStudentFeeStructure } = require('../utils/studentFees');
+const { FEE_GROUPS } = require('../utils/feeCategories');
 const {
   setStudentFeeOverride,
   removeStudentFeeOverride,
@@ -118,6 +119,9 @@ router.get('/', async (req, res) => {
         feesOverridden: Boolean(rows[i].feesOverridden),
         paymentStatus: st?.paymentStatus ?? null,
         firstInstallmentMet: st?.firstInstallmentMet ?? null,
+        // WHICH fee is short and by how much — see computeStudentFeesStatus.
+        // Without it the UI can only say "not met" and leave somebody guessing.
+        firstInstallmentShortfalls: st?.firstInstallmentShortfalls ?? [],
         // Drives the red "has a zero" dot — see src/utils/zeroMarks.js.
         hasZeroMark: zeroMarkIds.has(rows[i].id),
         // The totals the status was derived from — the later Fees column needs
@@ -163,6 +167,9 @@ router.get('/:id', async (req, res) => {
     feesOverridden: Boolean(s.feesOverridden),
     paymentStatus: st?.paymentStatus ?? null,
     firstInstallmentMet: st?.firstInstallmentMet ?? null,
+        // WHICH fee is short and by how much — see computeStudentFeesStatus.
+        // Without it the UI can only say "not met" and leave somebody guessing.
+        firstInstallmentShortfalls: st?.firstInstallmentShortfalls ?? [],
     hasZeroMark: zeroMarkIds.has(s.id),
     // Drives the detail page's combined "Has a zero in: …" banner.
     zeroMarkSubjects,
@@ -271,6 +278,7 @@ router.get('/:id/fee-override', requireAdmin, async (req, res) => {
         name: f.name,
         amount: f.amount,
         firstInstallmentPercent: f.firstInstallmentPercent,
+        group: f.group,
       })),
     });
   } catch (e) {
@@ -279,7 +287,7 @@ router.get('/:id/fee-override', requireAdmin, async (req, res) => {
 });
 
 // PUT /students/:id/fee-override
-// Body: { fees: [{ name, amount, firstInstallmentPercent }] }
+// Body: { fees: [{ name, amount, firstInstallmentPercent, group }] }
 // Detaches the student (if not already) and replaces their snapshot with this
 // COMPLETE set — an omitted fee is removed for them. Then reconciles their
 // existing charges to the new amounts.
@@ -314,7 +322,13 @@ router.put('/:id/fee-override', requireAdmin, async (req, res) => {
         }
         percent = Math.round(percent);
       }
-      parsed.push({ name, amount: Math.round(amount), firstInstallmentPercent: percent });
+            const rawGroup = raw?.group;
+      const group = FEE_GROUPS.includes(rawGroup) ? rawGroup : 'OTHER_FEES';
+      // Same rule as the class-level save: Registration carries no percentage.
+      parsed.push({
+        name, amount: Math.round(amount), group,
+        firstInstallmentPercent: group === 'REGISTRATION' ? null : percent,
+      });
     }
 
     const rebill = await setStudentFeeOverride(prisma, schoolId, student.id, parsed);

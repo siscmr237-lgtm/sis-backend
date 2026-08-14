@@ -518,6 +518,11 @@ model ClassLevelFee {
   /// the level's whole first-installment rule is "every fee where this is
   /// non-null".
   firstInstallmentPercent Int?
+  /// Which fixed group this fee belongs to. REGISTRATION is structurally
+  /// outside the first-installment rule — see computeStudentFeesStatus, which
+  /// drops these fees from the rule whatever firstInstallmentPercent says on
+  /// them. OTHER_FEES is the default and covers everything else.
+  group                   FeeGroup      @default(OTHER_FEES)
   charges                 LedgerEntry[]
   createdAt               DateTime      @default(now())
   updatedAt               DateTime      @updatedAt
@@ -575,12 +580,33 @@ model StudentFeeOverride {
   /// Same meaning as on ClassLevelFee: NULL means this fee is not part of the
   /// student's first installment.
   firstInstallmentPercent Int?
+  /// Which fixed group this fee belongs to. REGISTRATION is structurally
+  /// outside the first-installment rule — see computeStudentFeesStatus, which
+  /// drops these fees from the rule whatever firstInstallmentPercent says on
+  /// them. OTHER_FEES is the default and covers everything else.
+  group                   FeeGroup      @default(OTHER_FEES)
   charges                 LedgerEntry[]
   createdAt               DateTime      @default(now())
   updatedAt               DateTime      @updatedAt
 
   @@unique([studentId, name])
   @@index([schoolId])
+}
+
+/// Which of the two fixed groups a fee category belongs to.
+///
+/// Exactly two, deliberately closed. A school cannot add a third, rename these,
+/// or configure them: the whole point is that REGISTRATION means the same thing
+/// in every school, because the first-installment rule is defined in terms of
+/// it. A school-nameable group would make that rule mean whatever each school
+/// happened to type.
+///
+/// An enum rather than a string so the database refuses anything else — a typo
+/// in a group name would silently move a fee out of Registration and quietly
+/// change who has met their first installment.
+enum FeeGroup {
+  REGISTRATION
+  OTHER_FEES
 }
 
 enum LedgerEntryType {
