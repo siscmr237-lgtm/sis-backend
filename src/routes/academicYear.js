@@ -3,6 +3,7 @@ const { prisma } = require('../db/prisma');
 const {
   advanceYearIfDue,
   academicYearRange,
+  selectableAcademicYears,
   nextAcademicYear,
   deriveFirstAcademicYear,
 } = require('../utils/academicYear');
@@ -39,11 +40,18 @@ router.get('/status', async (req, res) => {
       activeYear: result.activeYear,
       firstYear: result.firstAcademicYear,
       targetYear: result.targetYear,
+      // Years the school HAS: first through active. What the data filters offer.
       years: academicYearRange(result.firstAcademicYear, result.activeYear),
-      // Persistent, non-dismissible: true only while the school is behind and
-      // still inside the August window.
+      // The same list plus the next one. What School Settings offers, so the
+      // year can be moved forward by choosing it.
+      selectableYears: selectableAcademicYears(result.firstAcademicYear, result.activeYear),
+      // Persistent, non-dismissible: true only during August, and only for a
+      // school that has not already moved itself to the coming year.
       nudgeDue: result.nudgeDue,
-      nudgeYear: result.nudgeDue ? result.targetYear : null,
+      // Comes from the rollover itself now. It used to be `targetYear`, which
+      // since the Sep–Aug fix means "the year they are currently in" — in
+      // August that is the OLD year, i.e. the one they are already on.
+      nudgeYear: result.nudgeYear,
       // One-time and dismissible: set by an automatic advance, cleared on ack.
       autoAdvancedYear: result.autoAdvancedYear,
     });
