@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { findAdminByPhone } = require('../utils/phone');
 const bcrypt = require('bcryptjs');
 const { authMiddleware } = require('../auth');
 const { validatePassword } = require('../utils/validatePassword');
@@ -120,10 +121,13 @@ router.post('/login', async (req, res) => {
     // principle match one row by phone and a different row by email, and
     // "whichever came back first" is not an access-control decision worth
     // leaving to chance.
-    let admin = await prisma.adminUser.findUnique({
-      where: { phoneNumber: identifier },
-      include: { School: true },
-    });
+    // Matched on DIGITS, not on the exact string. The phone field now composes
+    // E.164 ("+237679379134") while every row created before it holds bare
+    // national digits ("679379134"), so an exact comparison could only ever
+    // find one of the two. findAdminByPhone compares a bounded set of the forms
+    // the same number can take, and refuses rather than guessing if two rows
+    // somehow match - on a login path, picking one is the worst outcome.
+    let admin = await findAdminByPhone(prisma, identifier);
     if (!admin) {
       // Case-insensitive: someone typing Maxateh6@Gmail.com has not got their
       // password wrong. AdminUser.email is nullable, so a null column simply

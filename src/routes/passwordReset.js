@@ -1,5 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+const { findAdminByPhone } = require('../utils/phone');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { validatePassword } = require('../utils/validatePassword');
@@ -30,7 +31,10 @@ router.post('/request', async (req, res) => {
       return res.json(RESET_REQUESTED_RESPONSE);
     }
 
-    const user = await prisma.adminUser.findUnique({ where: { phoneNumber } });
+    // Same digit-based match as login. A number typed with its country code
+    // has to find an account stored without one, or the phone field's new
+    // format would lock existing users out of their own reset.
+    const user = await findAdminByPhone(prisma, phoneNumber);
 
     // Silently do nothing if account missing or has no email
     if (!user || !user.email) {
