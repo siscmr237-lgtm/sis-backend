@@ -76,11 +76,21 @@ async function issueSignupOtp(user) {
 // ---------------------------------------------------------------------------
 // POST /auth/login  { identifier, password }
 //
-// One form, two kinds of account. `identifier` is tried as an AdminUser phone
-// number first and then as a teacher's Staff email — admin first because that
-// is the pre-existing behaviour and the two namespaces do not overlap (a phone
-// number is not an email), so the order costs nothing but keeps admin login on
-// exactly the path it was already on.
+// One form, two kinds of account, and EITHER identifier for each.
+//
+// `identifier` is matched against an AdminUser phone, then an AdminUser email,
+// then a login-capable teacher's Staff email or phone. It used to be admin
+// phone then teacher email only, on the reasoning that "a phone number is not
+// an email" so the namespaces could not overlap — true, but it left half of
+// each account unreachable: an admin typing their own email, or a teacher
+// typing their own phone, was told no account was linked to details that were
+// sitting in the database.
+//
+// ADMIN WINS when one identifier matches both. That happens for real — a
+// school owner who is also on their own staff list has one email on two rows —
+// and the admin is the account that owns the school, so it is the one a
+// deliberate sign-in almost certainly means. The teacher record stays reachable
+// by its own phone number, which is the identifier the two rows do not share.
 //
 // `phoneNumber` is still accepted as an alias. The deployed frontend posts that
 // field, and this endpoint is the one thing standing between it and a total
@@ -90,25 +100,48 @@ async function issueSignupOtp(user) {
 router.post('/login', async (req, res) => {
   try {
     const body = req.body || {};
-    const identifier = body.identifier ?? body.phoneNumber;
+    // Trimmed once here so every lookup below compares the same value; a
+    // trailing space pasted from a contacts app is not a wrong password.
+    const identifier = String(body.identifier ?? body.phoneNumber ?? '').trim();
     const { password } = body;
     if (!identifier || !password) {
       return res.status(400).json({ code: 'MISSING_FIELDS', error: 'Phone number or email and password are required.' });
     }
 
-    const admin = await prisma.adminUser.findUnique({
-      where: { phoneNumber: String(identifier) },
+    // The field says "Phone Number or Email", so both have to be tried —
+    // for BOTH actor types. Only the phone was ever matched for an admin and
+    // only the email for a teacher, which meant an admin typing their email,
+    // or a teacher typing their phone, got "no account linked" for an account
+    // that plainly existed.
+    //
+    // Phone is tried first and email second, as two statements rather than one
+    // OR, so the precedence is fixed rather than left to the query planner:
+    // both columns are unique individually, but a single string could in
+    // principle match one row by phone and a different row by email, and
+    // "whichever came back first" is not an access-control decision worth
+    // leaving to chance.
+    let admin = await prisma.adminUser.findUnique({
+      where: { phoneNumber: identifier },
       include: { School: true },
     });
+    if (!admin) {
+      // Case-insensitive: someone typing Maxateh6@Gmail.com has not got their
+      // password wrong. AdminUser.email is nullable, so a null column simply
+      // never equals the non-empty string guarded above.
+      admin = await prisma.adminUser.findFirst({
+        where: { email: { equals: identifier, mode: 'insensitive' } },
+        include: { School: true },
+      });
+    }
 
     if (admin) {
       const ok = await bcrypt.compare(String(password), admin.passwordHash);
-      if (!ok) return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
+      if (!ok) return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Those details are incorrect.' });
       if (admin.isActive === false) {
         return res.status(401).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
       }
       if (!admin.School.length) {
-        return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Invalid phone number or password.' });
+        return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Those details are incorrect.' });
       }
       return res.json({ token: signToken(admin, ACTOR_ADMIN), user: publicUser(admin), actorType: ACTOR_ADMIN });
     }
@@ -122,15 +155,21 @@ router.post('/login', async (req, res) => {
     // (schoolId, email) constraint is byte-exact so it does not settle this.
     const teachers = await prisma.staff.findMany({
       where: {
-        email: { equals: String(identifier), mode: 'insensitive' },
         isTeacher: true,
         passwordHash: { not: null },
+        // Either identifier. Staff.phone is unique per SCHOOL rather than
+        // globally, exactly like the email, so matching on it inherits the
+        // same more-than-one-school ambiguity handled below.
+        OR: [
+          { email: { equals: identifier, mode: 'insensitive' } },
+          { phone: identifier },
+        ],
       },
       include: { school: true },
     });
 
     if (!teachers.length) {
-      return res.status(401).json({ code: 'PHONE_NOT_FOUND', error: 'No account linked to this number.' });
+      return res.status(401).json({ code: 'PHONE_NOT_FOUND', error: 'No account linked to those details.' });
     }
 
     // Staff.email is unique per SCHOOL, not globally, so two schools can each
@@ -141,7 +180,7 @@ router.post('/login', async (req, res) => {
     if (teachers.length > 1) {
       return res.status(409).json({
         code: 'EMAIL_NOT_UNIQUE',
-        error: 'This email is registered at more than one school. Please contact your school administrator.',
+        error: 'Those details are registered at more than one school. Please contact your school administrator.',
       });
     }
 
