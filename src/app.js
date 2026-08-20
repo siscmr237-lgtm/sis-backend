@@ -31,7 +31,19 @@ const platformRouter = require('./routes/platform');
 const app = express();
 
 const ALLOWED_ORIGINS = [
+  // The live frontend. Both the apex and the www host are listed because a
+  // browser treats them as DIFFERENT origins — matching here is exact, on
+  // scheme, host and port, with no subdomain or suffix logic anywhere in this
+  // list — so whichever one a visitor lands on has to appear by name or its
+  // requests are refused.
+  "https://lewa.app",
+  "https://www.lewa.app",
+  // The previous Vercel domain, kept on purpose rather than replaced: the
+  // deployment still answers on it, so anything still pointed there — an open
+  // tab, a bookmark, a preview link — keeps working instead of failing as an
+  // unreadable CORS error.
   "https://sis-snowy.vercel.app",
+  // Local development, or whatever ORIGIN is set to in this environment.
   process.env.ORIGIN || "http://localhost:3000"
 ];
 
