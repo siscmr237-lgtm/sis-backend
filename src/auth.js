@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { prisma } = require('./db/prisma');
-const { signSessionToken, ACTOR_ADMIN, ACTOR_TEACHER } = require('./utils/sessionToken');
+const { signSessionToken, ACTOR_ADMIN, ACTOR_TEACHER, ACTOR_PLATFORM } = require('./utils/sessionToken');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -20,6 +20,7 @@ function resolveActorType(payload) {
   const claim = payload.actorType;
   if (claim === undefined || claim === null || claim === ACTOR_ADMIN) return ACTOR_ADMIN;
   if (claim === ACTOR_TEACHER) return ACTOR_TEACHER;
+  if (claim === ACTOR_PLATFORM) return ACTOR_PLATFORM;
   return null;
 }
 
@@ -54,9 +55,9 @@ async function authMiddleware(req, res, next) {
   // masquerade as "your session expired."
   let actor;
   try {
-    actor = actorType === ACTOR_TEACHER
-      ? await loadTeacherActor(payload.sub)
-      : await loadAdminActor(payload.sub);
+    if (actorType === ACTOR_TEACHER) actor = await loadTeacherActor(payload.sub);
+    else if (actorType === ACTOR_PLATFORM) actor = await loadPlatformActor(payload.sub);
+    else actor = await loadAdminActor(payload.sub);
   } catch (e) {
     console.error('authMiddleware: user lookup failed', e);
     return res.status(503).json(SERVER_UNAVAILABLE);
@@ -132,6 +133,37 @@ async function loadTeacherActor(id) {
     schoolId: staff.schoolId,
     name: `${staff.firstName} ${staff.lastName}`.trim(),
     School: school ? [school] : [],
+  };
+}
+
+/**
+ * An internal team session.
+ *
+ * Note what is deliberately ABSENT from the returned object: schoolId. Not null,
+ * not 0 — absent. Every school-scoped query in this codebase filters by
+ * req.user.schoolId, and Prisma treats `where: { schoolId: undefined }` as "no
+ * such filter", which would return every school's rows rather than erroring. A
+ * placeholder value would be worse still: schoolId 0 would quietly match
+ * nothing and look like it worked, while any truthy value would match somebody.
+ *
+ * The protection therefore cannot live here. It lives at the choke point in
+ * src/app.js, which refuses this actor type before any school route is reached.
+ * This function's job is only to prove the account is real and still enabled.
+ *
+ * `role` is the PlatformRole enum, NOT AdminUser.role. requireAdmin compares
+ * actorType, never role, so a platform FOUNDER can never satisfy it.
+ */
+async function loadPlatformActor(id) {
+  const user = await prisma.platformUser.findUnique({ where: { id } });
+  if (!user || user.isActive === false) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    phoneNumber: user.phoneNumber,
+    role: user.role,
+    passwordHash: user.passwordHash,
+    actorType: ACTOR_PLATFORM,
   };
 }
 

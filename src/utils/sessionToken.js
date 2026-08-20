@@ -14,6 +14,17 @@ const SESSION_IDLE_MINUTES = Number(process.env.SESSION_IDLE_MINUTES) || 60;
 // bearing for access control, not a hint.
 const ACTOR_ADMIN = 'admin';
 const ACTOR_TEACHER = 'teacher';
+/**
+ * An internal team account (PlatformUser). It has NO schoolId, and that is the
+ * whole hazard: every school-scoped query in this codebase filters by
+ * req.user.schoolId, and `where: { schoolId: undefined }` is not an error in
+ * Prisma — it silently drops the filter and returns every school's rows.
+ *
+ * So this actor type is never merely "not an admin". It is refused outright by
+ * the school half of the API at a single choke point in src/app.js, before any
+ * route can be reached. See requireSchoolActor in src/roleGuards.js.
+ */
+const ACTOR_PLATFORM = 'platform';
 
 /**
  * Signs a session token for either kind of actor.
@@ -38,4 +49,10 @@ function signSessionToken(user, actorType = ACTOR_ADMIN) {
   );
 }
 
-module.exports = { signSessionToken, SESSION_IDLE_MINUTES, ACTOR_ADMIN, ACTOR_TEACHER };
+module.exports = {
+  signSessionToken,
+  SESSION_IDLE_MINUTES,
+  ACTOR_ADMIN,
+  ACTOR_TEACHER,
+  ACTOR_PLATFORM,
+};

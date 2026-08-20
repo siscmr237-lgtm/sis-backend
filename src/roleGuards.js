@@ -1,5 +1,5 @@
 const { prisma } = require('./db/prisma');
-const { ACTOR_ADMIN, ACTOR_TEACHER } = require('./utils/sessionToken');
+const { ACTOR_ADMIN, ACTOR_TEACHER, ACTOR_PLATFORM } = require('./utils/sessionToken');
 const { classLevelOf } = require('./utils/classLevels');
 
 // 403, not 401: the session is perfectly valid, it just belongs to the wrong
@@ -19,6 +19,67 @@ function requireAdmin(req, res, next) {
 function requireTeacher(req, res, next) {
   if (req.user?.actorType !== ACTOR_TEACHER) {
     return forbid(res, 'Only a teacher can do this.');
+  }
+  next();
+}
+
+/**
+ * DIRECTION ONE: keep platform tokens OUT of the school API.
+ *
+ * Mounted once in src/app.js, above every school router and below the /platform
+ * mount, so it is not a check each route has to remember — a school route added
+ * later inherits it by position. That matters more than it sounds: the failure
+ * this prevents is not "a platform user sees a page they shouldn't", it is a
+ * platform token reaching a query that filters by req.user.schoolId when there
+ * is no schoolId, which in Prisma means no filter at all — every school's rows.
+ *
+ * Two conditions, both required. The actorType check is the rule; the schoolId
+ * check is the backstop that would catch a future actor type, or a bug in
+ * whichever loader built req.user, before it could reach a query. Neither alone
+ * is trusted to be the only thing standing there.
+ */
+function requireSchoolActor(req, res, next) {
+  const actorType = req.user?.actorType;
+  if (actorType === ACTOR_PLATFORM) {
+    return forbid(res, 'A team account cannot access school data.');
+  }
+  if (actorType !== ACTOR_ADMIN && actorType !== ACTOR_TEACHER) {
+    return forbid(res, 'This session cannot access school data.');
+  }
+  if (!Number.isInteger(req.user?.schoolId)) {
+    // Never reachable through the loaders as written, which is the point of
+    // asserting it: if it ever becomes reachable, it fails closed here rather
+    // than silently widening a query downstream.
+    return forbid(res, 'This session is not scoped to a school.');
+  }
+  next();
+}
+
+/**
+ * DIRECTION TWO: keep school tokens OUT of the platform API.
+ *
+ * Also mounted once, at the /platform mount. An admin or teacher token is a
+ * perfectly valid session, so authMiddleware alone would let it through —
+ * exactly the same reasoning that put requireAdmin at the school mounts.
+ */
+function requirePlatformActor(req, res, next) {
+  if (req.user?.actorType !== ACTOR_PLATFORM) {
+    return forbid(res, 'This area is for internal team accounts only.');
+  }
+  next();
+}
+
+/**
+ * Founder-only areas. Checked on the server for every request, not by hiding a
+ * menu item: a Member who learns the URL, or calls the API directly, must be
+ * refused by the API itself.
+ */
+function requirePlatformFounder(req, res, next) {
+  if (req.user?.actorType !== ACTOR_PLATFORM) {
+    return forbid(res, 'This area is for internal team accounts only.');
+  }
+  if (req.user?.role !== 'FOUNDER') {
+    return forbid(res, 'Only a Founder can manage team accounts.');
   }
   next();
 }
@@ -208,6 +269,9 @@ async function getTeacherTeachingMap(staffId, schoolId) {
 module.exports = {
   requireAdmin,
   requireTeacher,
+  requireSchoolActor,
+  requirePlatformActor,
+  requirePlatformFounder,
   getTeacherClasses,
   getTeacherClassNames,
   getTeacherSubjectAssignments,

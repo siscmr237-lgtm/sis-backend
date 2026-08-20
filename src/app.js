@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { authMiddleware } = require('./auth');
-const { requireAdmin } = require('./roleGuards');
+const { requireAdmin, requireSchoolActor, requirePlatformActor } = require('./roleGuards');
 
 const studentsRouter = require('./routes/students');
 const staffRouter = require('./routes/staff');
@@ -25,6 +25,8 @@ const testExamsRouter = require('./routes/testExams');
 const parentsRouter = require('./routes/parents');
 const academicYearRouter = require('./routes/academicYear');
 const cronRouter = require('./routes/cron');
+const platformAuthRouter = require('./routes/platformAuth');
+const platformRouter = require('./routes/platform');
 
 const app = express();
 
@@ -124,12 +126,34 @@ app.get('/health', (_req, res) => {
 // Public routes
 app.use('/auth', authRouter);
 app.use('/password-reset', passwordResetRouter);
+// The platform door. Login ONLY — there is no signup route and no
+// forgot-password route on it. See src/routes/platformAuth.js.
+app.use('/platform/auth', platformAuthRouter);
 // Scheduled jobs authenticate with CRON_SECRET, not a session, so they mount
 // above authMiddleware. See src/routes/cron.js.
 app.use('/cron', cronRouter);
 
 // All routes below this line are protected
 app.use(authMiddleware);
+
+// ── THE INTERNAL CONSOLE ────────────────────────────────────────────────────
+// Mounted BEFORE requireSchoolActor below, so platform traffic never reaches
+// it. requirePlatformActor is the second of the two directions: an admin or
+// teacher token is a perfectly valid session and would otherwise pass straight
+// through authMiddleware into this router.
+app.use('/platform', requirePlatformActor, platformRouter);
+
+// ── THE SCHOOL API ──────────────────────────────────────────────────────────
+// THE CHOKE POINT. Every route below refuses a platform token, once, here —
+// rather than each route remembering to check.
+//
+// The danger is specific and quiet. Every school-scoped query filters by
+// req.user.schoolId, a platform session has no schoolId, and Prisma reads
+// `where: { schoolId: undefined }` as "no filter" rather than as an error. So a
+// platform token reaching any of these routers would not be denied; it would be
+// served EVERY school's rows. Refusing by position means a school router added
+// later inherits the refusal instead of depending on whoever adds it.
+app.use(requireSchoolActor);
 
 // Mixed routers: these serve BOTH actor types, so the admin/teacher split is
 // made per route inside them (requireAdmin / requireTeacher) and, for the reads

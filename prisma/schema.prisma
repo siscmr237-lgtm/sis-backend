@@ -735,6 +735,71 @@ model AdminUser {
   School        School[]
 }
 
+/// Who a platform account is on the INTERNAL team. Nothing to do with
+/// AdminUser.role, which is a role inside one school — these two role systems
+/// must never be compared or substituted for one another.
+enum PlatformRole {
+  /// May manage team accounts. The last remaining Founder cannot be deleted or
+  /// demoted; that is enforced in src/routes/platform.js, not by hiding a button.
+  FOUNDER
+  /// Uses the console. Cannot see or reach the Administrators section at all.
+  MEMBER
+}
+
+/// An internal team account. Deliberately a SEPARATE TABLE from AdminUser, not a
+/// role on it: a platform session must never be loadable by the school session
+/// path, and keeping the subjects in different tables means a token naming id 3
+/// cannot resolve to a school admin just because the actorType claim was wrong.
+///
+/// There is no signup route for this table anywhere. Rows are created by the
+/// untracked founder seed script, and thereafter by a Founder from the console.
+model PlatformUser {
+  id           Int          @id @default(autoincrement())
+  name         String
+  phoneNumber  String       @unique
+  email        String       @unique
+  passwordHash String
+  role         PlatformRole @default(MEMBER)
+  /// Disabling is preferred over deleting so the audit trail keeps pointing at a
+  /// real row. A disabled account cannot authenticate.
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  /// Failed-login throttling, kept on the row rather than in memory: the API runs
+  /// as serverless functions, so a per-process counter would reset on every cold
+  /// start and protect nothing.
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+
+  auditEntries PlatformAuditLog[]
+}
+
+/// Every consequential thing a platform user does, written from the start rather
+/// than added after something goes wrong. This table is append-only by
+/// convention: no route updates or deletes a row.
+model PlatformAuditLog {
+  id        Int      @id @default(autoincrement())
+  /// Null only for a failed login, where there may be no identifiable account.
+  actorId   Int?
+  actor     PlatformUser? @relation(fields: [actorId], references: [id])
+  /// The email that was used, kept verbatim so a failed login against a
+  /// non-existent account is still attributable to an attempt.
+  actorEmail String?
+  action    String
+  /// What was acted on: "platform_user:4", "school:2", or null for a plain read.
+  target    String?
+  /// Small JSON blob of extra context. Never contains a password or a hash.
+  detail    Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
+
 enum OtpPurpose {
   SIGNUP_VERIFICATION
   PASSWORD_RESET

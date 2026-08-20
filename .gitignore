@@ -11,3 +11,14 @@ logs/
 # database. It has no place in the repo and must never be committed — ignoring
 # it makes that structural instead of relying on nobody typing `git add -A`.
 _seed_fees.js
+
+# The one-off that creates the first platform Founder. Untracked because it is
+# the ONLY way a Founder can be created — there is no signup route anywhere —
+# and because the command used to run it carries a password on the command line.
+_seed_founder.js
+
+# Local database maintenance one-offs. Same reasoning: they talk straight to the
+# production database and have no business in the repo.
+_db_*.js
+_storage_*.js
+_db_backup/
