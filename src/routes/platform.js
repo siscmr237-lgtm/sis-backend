@@ -14,6 +14,10 @@ const bcrypt = require('bcryptjs');
 const { prisma } = require('../db/prisma');
 const { requirePlatformFounder } = require('../roleGuards');
 const { validatePlatformPassword } = require('../utils/platformPassword');
+// The SCHOOL rule, for school credentials this console sets on a school's
+// behalf. Distinct from validatePlatformPassword, which guards team accounts.
+const { validatePassword } = require('../utils/validatePassword');
+const { supabase, BUCKET } = require('../utils/storage');
 const { recordAudit, ACTIONS } = require('../utils/platformAudit');
 
 const router = express.Router();
@@ -85,7 +89,7 @@ router.get('/schools', async (req, res) => {
         id: true,
         name: true,
         adminUser: { select: { createdAt: true } },
-        _count: { select: { Student: true } },
+        _count: { select: { Student: true, Staff: true } },
       },
       orderBy: { id: 'asc' },
     });
@@ -97,11 +101,234 @@ router.get('/schools', async (req, res) => {
       name: s.name,
       signedUpAt: s.adminUser?.createdAt ?? null,
       studentCount: s._count.Student,
+      staffCount: s._count.Staff,
     })));
   } catch (e) {
     console.error('platform /schools failed', e.code || e.message);
     res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not load schools.' });
   }
+});
+
+// ── One school ──────────────────────────────────────────────────────────────
+// Identity and headcounts, plus its admin accounts. Still no student names, no
+// fee figures, no salaries — `select` is explicit everywhere so a column added
+// to School later cannot start appearing here on its own.
+router.get('/schools/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  try {
+    const school = await prisma.school.findUnique({
+      where: { id },
+      select: {
+        id: true, name: true, abbreviation: true, logo: true, motto: true,
+        address: true, schoolType: true, uniformColors: true,
+        academicYear: true, currentTerm: true,
+        adminUser: {
+          select: {
+            id: true, name: true, email: true, phoneNumber: true,
+            role: true, isActive: true, emailVerified: true, createdAt: true,
+          },
+        },
+        _count: { select: { Student: true, Staff: true } },
+      },
+    });
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    await recordAudit(req, ACTIONS.SCHOOL_VIEWED, { target: `school:${id}` });
+
+    // A list, because that is the shape the console renders — but note the
+    // schema gives a school exactly ONE admin (School.adminUserId is a single
+    // required relation; it is AdminUser.School that is the array). So this is
+    // always one entry until that becomes many-to-many.
+    const admins = school.adminUser ? [school.adminUser] : [];
+
+    res.json({
+      id: school.id,
+      name: school.name,
+      abbreviation: school.abbreviation,
+      logo: school.logo,
+      motto: school.motto,
+      address: school.address,
+      schoolType: school.schoolType,
+      // A single Json column shaped { shirt, trouser, gown }, holding colour
+      // LABELS such as "Navy". There is no uniform description field on School;
+      // the console renders the three garments and says so.
+      uniformColors: school.uniformColors,
+      academicYear: school.academicYear,
+      currentTerm: school.currentTerm,
+      studentCount: school._count.Student,
+      staffCount: school._count.Staff,
+      admins,
+    });
+  } catch (e) {
+    console.error('platform /schools/:id failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not load the school.' });
+  }
+});
+
+/**
+ * A signed URL for a school's logo.
+ *
+ * The school API already has /upload/signed-url, but it is mounted under
+ * requireAdmin and BELOW the platform choke point, so the console cannot call
+ * it — and widening that route to admit platform tokens would put a hole in the
+ * wall for the sake of an image. This is a separate, read-only, single-purpose
+ * route that will only ever sign the one path stored on the school row it was
+ * asked about, so a caller cannot name an arbitrary object in the bucket.
+ */
+router.get('/schools/:id/logo-url', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  const school = await prisma.school.findUnique({ where: { id }, select: { logo: true } });
+  if (!school) return res.status(404).json({ error: 'School not found.' });
+  if (!school.logo) return res.json({ url: null });
+  // Already a URL — nothing to sign.
+  if (!String(school.logo).startsWith('schools/')) return res.json({ url: school.logo });
+
+  if (!supabase) return res.json({ url: null, reason: 'storage_not_configured' });
+  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(school.logo, 3600);
+  if (error) return res.json({ url: null, reason: 'sign_failed' });
+  res.json({ url: data.signedUrl });
+});
+
+// ── A school's staff ────────────────────────────────────────────────────────
+// passwordHash is never selected, let alone returned. `hasLogin` is the only
+// thing said about it — the same contract serializeStaff uses in
+// src/routes/staff.js, so the two cannot drift into disagreeing.
+router.get('/schools/:id/staff', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  try {
+    const school = await prisma.school.findUnique({ where: { id }, select: { id: true, name: true } });
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    const staff = await prisma.staff.findMany({
+      where: { schoolId: id },
+      select: {
+        id: true, code: true, firstName: true, lastName: true,
+        email: true, phone: true, role: true,
+        isTeacher: true, isActive: true, passwordHash: true,
+      },
+      orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
+    });
+
+    await recordAudit(req, ACTIONS.SCHOOL_STAFF_VIEWED, {
+      target: `school:${id}`, detail: { count: staff.length },
+    });
+
+    res.json({
+      school: { id: school.id, name: school.name },
+      staff: staff.map(({ passwordHash, firstName, lastName, ...rest }) => ({
+        ...rest,
+        firstName,
+        lastName,
+        name: `${firstName} ${lastName}`.trim(),
+        hasLogin: Boolean(passwordHash),
+      })),
+    });
+  } catch (e) {
+    console.error('platform /schools/:id/staff failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not load staff.' });
+  }
+});
+
+/**
+ * Set a staff member's password.
+ *
+ * Two distinct actions behind one route, told apart by what was already there:
+ *
+ *   passwordHash present -> a reset. Logged as staff.password_reset.
+ *   passwordHash null    -> "cannot log in yet" becomes "can". That is a
+ *                           privilege grant the school's own admin never made,
+ *                           so it is logged as staff.login_created and the
+ *                           console words its button differently.
+ *
+ * The response says which one happened, so the UI cannot describe it wrongly.
+ *
+ * The SCHOOL password rule is applied here, not the stricter platform one:
+ * these are school credentials, and the holder must be able to re-set the same
+ * password themselves through /staff/me/change-password, which uses this rule.
+ */
+router.put('/staff/:id/password', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  const newPassword = req.body?.newPassword;
+  if (!newPassword) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', error: 'A new password is required.' });
+  }
+  const check = validatePassword(newPassword);
+  if (!check.valid) {
+    return res.status(400).json({ code: 'WEAK_PASSWORD', error: check.message });
+  }
+
+  const staff = await prisma.staff.findUnique({
+    where: { id },
+    select: { id: true, schoolId: true, firstName: true, lastName: true, passwordHash: true, isTeacher: true },
+  });
+  if (!staff) return res.status(404).json({ error: 'Staff member not found.' });
+
+  const creatingLogin = !staff.passwordHash;
+
+  await prisma.staff.update({
+    where: { id },
+    data: { passwordHash: await bcrypt.hash(String(newPassword), 10) },
+  });
+
+  await recordAudit(req, creatingLogin ? ACTIONS.STAFF_LOGIN_CREATED : ACTIONS.STAFF_PASSWORD_RESET, {
+    target: `staff:${id}`,
+    detail: {
+      schoolId: staff.schoolId,
+      staffName: `${staff.firstName} ${staff.lastName}`.trim(),
+      // Recorded because a login on a non-teacher is inert today:
+      // loadTeacherActor also requires isTeacher, so the grant only takes
+      // effect if that is true. Worth knowing when reading this back.
+      isTeacher: staff.isTeacher,
+    },
+  });
+
+  res.json({ ok: true, action: creatingLogin ? 'login_created' : 'password_reset' });
+});
+
+/**
+ * Set a SCHOOL ADMIN's password. Separate route and separate audit action from
+ * the team-account one above — /platform/admins/:id/password is an internal
+ * team member, this is a customer's admin. Confusing the two in a log would be
+ * the worst kind of quiet mistake.
+ */
+router.put('/school-admins/:id/password', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  const newPassword = req.body?.newPassword;
+  if (!newPassword) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', error: 'A new password is required.' });
+  }
+  const check = validatePassword(newPassword);
+  if (!check.valid) {
+    return res.status(400).json({ code: 'WEAK_PASSWORD', error: check.message });
+  }
+
+  const admin = await prisma.adminUser.findUnique({
+    where: { id },
+    select: { id: true, name: true, email: true, School: { select: { id: true } } },
+  });
+  if (!admin) return res.status(404).json({ error: 'Administrator not found.' });
+
+  await prisma.adminUser.update({
+    where: { id },
+    data: { passwordHash: await bcrypt.hash(String(newPassword), 10) },
+  });
+
+  await recordAudit(req, ACTIONS.SCHOOL_ADMIN_PASSWORD_RESET, {
+    target: `admin_user:${id}`,
+    detail: { adminName: admin.name, schoolIds: admin.School.map((s) => s.id) },
+  });
+
+  res.json({ ok: true });
 });
 
 // ── Team accounts — Founder only ────────────────────────────────────────────

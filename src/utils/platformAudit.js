@@ -31,8 +31,26 @@ const ACTIONS = {
   PASSWORD_CHANGED_SELF: 'password.changed.self',
   PASSWORD_CHANGED_OTHER: 'password.changed.other',
   SCHOOLS_VIEWED: 'schools.viewed',
+  SCHOOL_VIEWED: 'school.viewed',
+  SCHOOL_STAFF_VIEWED: 'school.staff.viewed',
   ADMINS_VIEWED: 'platform_users.viewed',
   AUDIT_VIEWED: 'audit.viewed',
+
+  /**
+   * Setting a password on a school account. Two DIFFERENT actions, deliberately
+   * not one:
+   *
+   *   staff.password_reset  — the row already had a login; this replaces it.
+   *   staff.login_created   — the row had NO passwordHash, which means "cannot
+   *                           log in yet". Setting one GRANTS access that the
+   *                           school's own admin never issued. That is a
+   *                           privilege change, and it must not read as a
+   *                           routine reset a month later when somebody is
+   *                           working out how an account came to exist.
+   */
+  STAFF_PASSWORD_RESET: 'staff.password_reset',
+  STAFF_LOGIN_CREATED: 'staff.login_created',
+  SCHOOL_ADMIN_PASSWORD_RESET: 'school_admin.password_reset',
 };
 
 /** The client's address, honouring the proxy header Vercel actually sets. */
