@@ -397,6 +397,27 @@ enum SchoolType {
   DAYCARE_NURSERY_PRIMARY
 }
 
+/// Where a school stands in signing up, as ONE column rather than a set of
+/// booleans that can disagree with each other. The four values are a strict
+/// progression and a school occupies exactly one of them at a time:
+///
+///   FAILED     — signed up, email not verified. The account exists but has
+///                proved nothing about itself yet.
+///   INCOMPLETE — email verified, KYC not submitted.
+///   PENDING    — KYC submitted, awaiting a decision from the platform team.
+///   APPROVED   — approved. This is the ONLY value that opens the dashboard.
+///
+/// There is deliberately no REJECTED value. A school the team is not happy with
+/// is left PENDING and sends itself back with "Not Done", which returns it to
+/// INCOMPLETE to re-submit — so a refusal is never a dead end the school cannot
+/// act on, and there is no state the product has no screen for.
+enum RegistrationStatus {
+  FAILED
+  INCOMPLETE
+  PENDING
+  APPROVED
+}
+
 model School {
   id                        Int                  @id @default(autoincrement())
   name                      String
@@ -425,6 +446,17 @@ model School {
   schoolType                SchoolType?
   uniformColors             Json                 @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
   onboardingCompleted       Boolean              @default(true)
+  /// The approval gate. Read LIVE from this column on every authenticated
+  /// request (loadAdminActor includes School), never from a claim inside the
+  /// session token — approval is granted while a token is still valid, so a
+  /// cached copy would leave an approved school locked out, and an unapproved
+  /// one let in, for the rest of its idle window.
+  ///
+  /// Kept alongside onboardingCompleted rather than replacing it: that flag
+  /// still answers "has KYC been submitted?", which the setup wizard and the
+  /// dashboard checklist both depend on. PENDING and APPROVED both imply
+  /// onboardingCompleted = true; this column adds what happened after.
+  registrationStatus        RegistrationStatus   @default(INCOMPLETE)
   /// When the admin last left the post-KYC setup wizard, by finishing it or by
   /// skipping out of it. NULL means they have never been through it, which is
   /// the only thing that makes the wizard appear.

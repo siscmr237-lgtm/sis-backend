@@ -51,6 +51,14 @@ const ACTIONS = {
   STAFF_PASSWORD_RESET: 'staff.password_reset',
   STAFF_LOGIN_CREATED: 'staff.login_created',
   SCHOOL_ADMIN_PASSWORD_RESET: 'school_admin.password_reset',
+
+  /**
+   * Approving a school's registration. Recorded because it is the single act
+   * that GRANTS a school access to the product — the console has no matching
+   * "unapprove", so this is a one-way door, and "who opened it, and when" has
+   * to be answerable afterwards.
+   */
+  SCHOOL_APPROVED: 'school.approved',
 };
 
 /** The client's address, honouring the proxy header Vercel actually sets. */

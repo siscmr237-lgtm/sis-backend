@@ -27,6 +27,7 @@ const academicYearRouter = require('./routes/academicYear');
 const cronRouter = require('./routes/cron');
 const platformAuthRouter = require('./routes/platformAuth');
 const platformRouter = require('./routes/platform');
+const schoolRouter = require('./routes/school');
 
 const app = express();
 
@@ -199,5 +200,11 @@ app.use('/subjects', requireAdmin, subjectsRouter);
 app.use('/upload', requireAdmin, uploadRouter);
 app.use('/charge-categories', requireAdmin, chargeCategoriesRouter);
 app.use('/onboarding', requireAdmin, onboardingRouter);
+
+// The school's own registration status: where it stands in signing up, and the
+// "Not Done" button that sends it back to re-submit. Admin-only like every
+// other router in this group — a teacher has no signup of their own, and the
+// waiting page they would be answering for is not a screen they can reach.
+app.use('/school', requireAdmin, schoolRouter);
 
 module.exports = app;

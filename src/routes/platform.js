@@ -88,6 +88,10 @@ router.get('/schools', async (req, res) => {
       select: {
         id: true,
         name: true,
+        // Where each school stands in signing up. A status, not any part of
+        // the school's own data, which is why it is allowed through a select
+        // this deliberately narrow.
+        registrationStatus: true,
         adminUser: { select: { createdAt: true } },
         _count: { select: { Student: true, Staff: true } },
       },
@@ -99,6 +103,7 @@ router.get('/schools', async (req, res) => {
     res.json(schools.map((s) => ({
       id: s.id,
       name: s.name,
+      registrationStatus: s.registrationStatus,
       signedUpAt: s.adminUser?.createdAt ?? null,
       studentCount: s._count.Student,
       staffCount: s._count.Staff,
@@ -123,7 +128,7 @@ router.get('/schools/:id', async (req, res) => {
       select: {
         id: true, name: true, abbreviation: true, logo: true, motto: true,
         address: true, schoolType: true, uniformColors: true,
-        academicYear: true, currentTerm: true,
+        academicYear: true, currentTerm: true, registrationStatus: true,
         adminUser: {
           select: {
             id: true, name: true, email: true, phoneNumber: true,
@@ -146,6 +151,8 @@ router.get('/schools/:id', async (req, res) => {
     res.json({
       id: school.id,
       name: school.name,
+      // Drives the badge and, when it reads PENDING, the Approve button.
+      registrationStatus: school.registrationStatus,
       abbreviation: school.abbreviation,
       logo: school.logo,
       motto: school.motto,
@@ -191,6 +198,66 @@ router.get('/schools/:id/logo-url', async (req, res) => {
   const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(school.logo, 3600);
   if (error) return res.json({ url: null, reason: 'sign_failed' });
   res.json({ url: data.signedUrl });
+});
+
+/**
+ * POST /platform/schools/:id/approve
+ *
+ * The decision that opens a school's dashboard. The only write in this file
+ * that touches a School row, and it touches exactly one column.
+ *
+ * PENDING -> APPROVED, expressed as an updateMany with the current status in
+ * the WHERE clause so the transition is evaluated by the database rather than
+ * by a read-then-write here. Two team members clicking Approve at the same
+ * moment therefore produce one approval and one honest "already approved"; a
+ * school that is still INCOMPLETE cannot be approved past a step it has not
+ * taken, which would leave it approved with no details on file.
+ *
+ * There is no matching reject or unapprove route, and that is a product
+ * decision rather than an oversight: a school the team is not happy with is
+ * left PENDING, and sends itself back with "Not Done" on the waiting page.
+ * Adding an unapprove here would create a way to revoke access to a product a
+ * school is already paying to use, with no screen anywhere that explains it.
+ */
+router.post('/schools/:id/approve', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  try {
+    const existing = await prisma.school.findUnique({
+      where: { id },
+      select: { id: true, name: true, registrationStatus: true },
+    });
+    if (!existing) return res.status(404).json({ error: 'School not found.' });
+
+    const { count } = await prisma.school.updateMany({
+      where: { id, registrationStatus: 'PENDING' },
+      data: { registrationStatus: 'APPROVED' },
+    });
+
+    if (count === 0) {
+      // Already APPROVED is success, not a failure — the console's badge just
+      // needs to catch up, and the caller gets the real status to render.
+      if (existing.registrationStatus === 'APPROVED') {
+        return res.json({ approved: false, registrationStatus: 'APPROVED', alreadyApproved: true });
+      }
+      return res.status(409).json({
+        code: 'NOT_PENDING',
+        error: 'This school has not submitted its details yet, so there is nothing to approve.',
+        registrationStatus: existing.registrationStatus,
+      });
+    }
+
+    await recordAudit(req, ACTIONS.SCHOOL_APPROVED, {
+      target: `school:${id}`,
+      detail: { name: existing.name, from: 'PENDING', to: 'APPROVED' },
+    });
+
+    res.json({ approved: true, registrationStatus: 'APPROVED' });
+  } catch (e) {
+    console.error('platform /schools/:id/approve failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not approve the school.' });
+  }
 });
 
 // ── A school's staff ────────────────────────────────────────────────────────

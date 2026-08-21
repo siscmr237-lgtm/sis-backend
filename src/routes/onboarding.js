@@ -26,6 +26,8 @@ router.get('/class-catalog', (req, res) => {
 // uniformColors, if present, is { shirt?, trouser?, gown? } with each value a color
 // label string or null — one independent color choice per garment.
 // Saves fields to the school, auto-creates class records, sets onboardingCompleted = true.
+// This is the KYC submission, so it also moves registrationStatus to PENDING —
+// see the note on the update below for the one case it must not.
 router.post('/', async (req, res) => {
   const schoolId = req.user.schoolId;
 
@@ -73,11 +75,24 @@ router.post('/', async (req, res) => {
     const school = await prisma.school.findUnique({ where: { id: schoolId } });
     if (!school) return res.status(404).json({ error: 'School not found' });
 
+    // PENDING for everyone EXCEPT a school that is already APPROVED.
+    //
+    // Approval is what opens the dashboard, so writing PENDING unconditionally
+    // would mean any re-submission of these details threw a paying school out
+    // of the product and back onto the waiting page until somebody noticed. An
+    // approved school editing its own particulars is not a new application.
+    //
+    // Everything else does become PENDING, including a school that used "Not
+    // Done" on the waiting page to come back and re-submit: that is exactly the
+    // INCOMPLETE -> PENDING round trip this status is for.
+    const nextStatus = school.registrationStatus === 'APPROVED' ? undefined : 'PENDING';
+
     await prisma.school.update({
       where: { id: schoolId },
       data: {
         schoolType,
         onboardingCompleted: true,
+        ...(nextStatus !== undefined && { registrationStatus: nextStatus }),
         ...(motto !== undefined && { motto }),
         ...(address !== undefined && { address }),
         ...(logo !== undefined && { logo }),
