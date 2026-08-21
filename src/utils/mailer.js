@@ -84,15 +84,34 @@ async function sendSignupOtp({ to, name, code }) {
   });
 }
 
-async function sendPasswordResetOtp({ to, name, code }) {
+// The one-time link that lets a school admin choose a new password.
+//
+// A sibling of sendTeacherInvite rather than a shared "send a link" helper: the
+// two differ in expiry, in copy and in who is being reassured about what, and
+// collapsing them would mean a parameter for each of those differences.
+//
+// `link` arrives already built, for the same reason it does there — the caller
+// is what knows the token's lifetime, and the footnote below has to agree with
+// it. schoolName is optional because an admin whose school row is not yet
+// created still has an account to get back into.
+async function sendPasswordResetLink({ to, name, schoolName, link }) {
   await transporter.sendMail({
     from: `"SIS Support" <${process.env.MAIL_USERNAME}>`,
     to,
-    subject: `${code} — Reset your SIS password`,
-    html: otpEmailHtml({
+    subject: 'Reset your SIS password',
+    html: actionEmailHtml({
       title: 'Reset your password',
-      intro: `Hi ${name}! Enter the code below to reset your SIS account password.`,
-      code,
+      intro:
+        `Hi ${name}! We received a request to reset the password for your ` +
+        `${schoolName ? `${schoolName} account on SIS` : 'SIS account'}. ` +
+        'Choose a new one below.',
+      buttonLabel: 'Reset your password',
+      link,
+      footnote:
+        'This link expires in <strong>1 hour</strong> and can only be used once. ' +
+        'Do not share it with anyone.<br>' +
+        'If you did not request this, you can safely ignore this email — your ' +
+        'password has not been changed.',
     }),
   });
 }
@@ -118,4 +137,4 @@ async function sendTeacherInvite({ to, name, schoolName, link }) {
   });
 }
 
-module.exports = { sendSignupOtp, sendPasswordResetOtp, sendTeacherInvite };
+module.exports = { sendSignupOtp, sendPasswordResetLink, sendTeacherInvite };

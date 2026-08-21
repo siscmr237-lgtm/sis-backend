@@ -733,6 +733,8 @@ model AdminUser {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   School        School[]
+
+  passwordResetTokens PasswordResetToken[]
 }
 
 /// Who a platform account is on the INTERNAL team. Nothing to do with
@@ -801,7 +803,14 @@ model PlatformAuditLog {
 }
 
 enum OtpPurpose {
+  /// The signup email check behind /school/verify-email. The only purpose any
+  /// live code path writes or reads.
   SIGNUP_VERIFICATION
+  /// Retained for the rows that already exist, NOT for new writes: password
+  /// reset moved to PasswordResetToken and nothing issues one of these any more.
+  /// Kept rather than dropped because a Postgres enum value cannot be removed
+  /// while historical rows still reference it, and deleting those rows to tidy
+  /// an enum is not a trade worth making.
   PASSWORD_RESET
 }
 
@@ -816,4 +825,35 @@ model OtpCode {
   createdAt         DateTime   @default(now())
 
   @@index([identifier, purpose])
+}
+
+/// A single-use password reset link for a school admin.
+///
+/// A separate table from OtpCode rather than another OtpPurpose, because the two
+/// are not the same kind of secret. An OTP is six digits a person retypes, so it
+/// needs an attempt counter and a slow hash. This is 256 bits of CSPRNG output
+/// that only ever travels inside a URL: nobody guesses it, so what it needs
+/// instead is to be findable by its hash on the way back in, and to be spendable
+/// exactly once.
+model PasswordResetToken {
+  id          Int       @id @default(autoincrement())
+  adminUserId Int
+  adminUser   AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 of the token, hex. The token itself is never stored — a leaked
+  /// backup of this table must not hand anyone a working reset link. Unique
+  /// because redemption looks a row up BY this value, and because two rows
+  /// sharing one hash would make "which token was spent?" unanswerable.
+  tokenHash String @unique
+
+  expiresAt DateTime
+  /// When the link was redeemed; null while it is still spendable. Set by a
+  /// conditional update in src/routes/passwordReset.js, so two simultaneous
+  /// redemptions of the same link race for one row and exactly one wins.
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  /// Requesting a reset supersedes that account's outstanding links, which is a
+  /// delete by adminUserId.
+  @@index([adminUserId])
 }
