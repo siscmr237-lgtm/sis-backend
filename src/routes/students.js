@@ -6,7 +6,7 @@ const { computeFeesStatusForStudents } = require('../utils/feesStatus');
 const { classLevelOf } = require('../utils/classLevels');
 const { syncStudentFeeCharges } = require('../utils/levelFeeCharges');
 const { getStudentFeeStructure } = require('../utils/studentFees');
-const { FEE_GROUPS } = require('../utils/feeCategories');
+const { FEE_GROUPS, parseFirstInstallmentAmount } = require('../utils/feeCategories');
 const {
   setStudentFeeOverride,
   removeStudentFeeOverride,
@@ -277,7 +277,7 @@ router.get('/:id/fee-override', requireAdmin, async (req, res) => {
       fees: structure.fees.map((f) => ({
         name: f.name,
         amount: f.amount,
-        firstInstallmentPercent: f.firstInstallmentPercent,
+        firstInstallmentAmount: f.firstInstallmentAmount,
         group: f.group,
       })),
     });
@@ -287,7 +287,7 @@ router.get('/:id/fee-override', requireAdmin, async (req, res) => {
 });
 
 // PUT /students/:id/fee-override
-// Body: { fees: [{ name, amount, firstInstallmentPercent, group }] }
+// Body: { fees: [{ name, amount, firstInstallmentAmount, group }] }
 // Detaches the student (if not already) and replaces their snapshot with this
 // COMPLETE set — an omitted fee is removed for them. Then reconciles their
 // existing charges to the new amounts.
@@ -313,21 +313,20 @@ router.put('/:id/fee-override', requireAdmin, async (req, res) => {
       if (!Number.isFinite(amount) || amount < 0) {
         return res.status(400).json({ error: `"${name}": amount must be 0 or more.` });
       }
-      let percent = null;
-      const p = raw?.firstInstallmentPercent;
-      if (p !== null && p !== undefined && p !== '') {
-        percent = Number(p);
-        if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-          return res.status(400).json({ error: `"${name}": first installment % must be 0–100.` });
-        }
-        percent = Math.round(percent);
-      }
+      // Same helper as the class-level save, so a waiver written here cannot end
+      // up with a first-installment amount the other screen would have refused.
+      const fi = parseFirstInstallmentAmount(
+        raw?.firstInstallmentAmount,
+        Math.round(amount),
+        name,
+      );
+      if (fi.error) return res.status(400).json({ error: fi.error });
             const rawGroup = raw?.group;
       const group = FEE_GROUPS.includes(rawGroup) ? rawGroup : 'OTHER_FEES';
-      // Same rule as the class-level save: Registration carries no percentage.
+      // Same rule as the class-level save: Registration carries no requirement.
       parsed.push({
         name, amount: Math.round(amount), group,
-        firstInstallmentPercent: group === 'REGISTRATION' ? null : percent,
+        firstInstallmentAmount: group === 'REGISTRATION' ? null : fi.value,
       });
     }
 

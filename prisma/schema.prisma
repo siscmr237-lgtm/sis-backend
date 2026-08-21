@@ -545,14 +545,20 @@ model ClassLevelFee {
   /// valid value: the defaults are seeded with no amount so a school fills in
   /// its own, and a guessed figure would look authoritative.
   amount                  Int           @default(0)
-  /// Share of `amount` that must be paid for this fee to count as part of the
-  /// first installment. NULL means the fee does not count toward it at all, so
-  /// the level's whole first-installment rule is "every fee where this is
-  /// non-null".
-  firstInstallmentPercent Int?
+  /// How much of `amount` must be paid for this fee to count as part of the
+  /// first installment — an absolute figure, not a share. NULL means the
+  /// category asks nothing upfront: it is met automatically and contributes
+  /// zero to the required total, so the level's whole first-installment rule
+  /// is "every fee where this is non-null and above 0".
+  ///
+  /// Never above `amount`. Enforced on every write rather than only in the
+  /// dialog, because a requirement larger than the bill is unmeetable — the
+  /// student could pay the fee in full and still read as short.
+  /// clampFirstInstallmentAmount is the one place that clamp lives.
+  firstInstallmentAmount  Float?
   /// Which fixed group this fee belongs to. REGISTRATION is structurally
   /// outside the first-installment rule — see computeStudentFeesStatus, which
-  /// drops these fees from the rule whatever firstInstallmentPercent says on
+  /// drops these fees from the rule whatever firstInstallmentAmount says on
   /// them. OTHER_FEES is the default and covers everything else.
   group                   FeeGroup      @default(OTHER_FEES)
   charges                 LedgerEntry[]
@@ -609,12 +615,13 @@ model StudentFeeOverride {
   studentId               Int
   name                    String
   amount                  Int           @default(0)
-  /// Same meaning as on ClassLevelFee: NULL means this fee is not part of the
-  /// student's first installment.
-  firstInstallmentPercent Int?
+  /// Same meaning as on ClassLevelFee: an absolute amount, NULL meaning this
+  /// category asks nothing upfront and is met automatically. Never above
+  /// `amount`.
+  firstInstallmentAmount  Float?
   /// Which fixed group this fee belongs to. REGISTRATION is structurally
   /// outside the first-installment rule — see computeStudentFeesStatus, which
-  /// drops these fees from the rule whatever firstInstallmentPercent says on
+  /// drops these fees from the rule whatever firstInstallmentAmount says on
   /// them. OTHER_FEES is the default and covers everything else.
   group                   FeeGroup      @default(OTHER_FEES)
   charges                 LedgerEntry[]

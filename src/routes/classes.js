@@ -2,7 +2,11 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { CLASS_CATALOG } = require('../utils/classCatalog');
 const { classLevelOf, listSchoolClassLevels } = require('../utils/classLevels');
-const { ensureLevelFeeDefaults, FEE_GROUPS } = require('../utils/feeCategories');
+const {
+  ensureLevelFeeDefaults,
+  FEE_GROUPS,
+  parseFirstInstallmentAmount,
+} = require('../utils/feeCategories');
 const { feeSetupPayload, clearNoFeesDeclaration } = require('../utils/levelFees');
 const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
 const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
@@ -99,7 +103,7 @@ router.get('/levels/:level/fees', async (req, res) => {
 });
 
 // PUT /classes/levels/:level/fees
-// Body: { fees: [{ id?, name, amount, firstInstallmentPercent, group }] }
+// Body: { fees: [{ id?, name, amount, firstInstallmentAmount, group }] }
 //
 // Replaces the level's whole fee structure in one request: a fee present without
 // an id is created, one with an id is updated, and any existing fee the caller
@@ -125,7 +129,7 @@ router.put('/levels/:level/fees', async (req, res) => {
 
     const existing = await prisma.classLevelFee.findMany({
       where: { schoolId, classLevel: level },
-      select: { id: true, name: true, amount: true, firstInstallmentPercent: true, group: true },
+      select: { id: true, name: true, amount: true, firstInstallmentAmount: true, group: true },
     });
     const existingIds = new Set(existing.map((f) => f.id));
     const existingById = new Map(existing.map((f) => [f.id, f]));
@@ -146,15 +150,16 @@ router.put('/levels/:level/fees', async (req, res) => {
         return res.status(400).json({ error: `"${name}": amount must be 0 or more.` });
       }
 
-      let percent = null;
-      const rawPct = raw?.firstInstallmentPercent;
-      if (rawPct !== null && rawPct !== undefined && rawPct !== '') {
-        percent = Number(rawPct);
-        if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-          return res.status(400).json({ error: `"${name}": first installment % must be between 0 and 100.` });
-        }
-        percent = Math.round(percent);
-      }
+      // Compared against the amount THIS SAVE sets, not the one in the database:
+      // the two arrive in the same request, and a save that lowers a fee below
+      // its own first-installment requirement has to be caught here rather than
+      // leaving the pair inconsistent until something reads it back.
+      const fi = parseFirstInstallmentAmount(
+        raw?.firstInstallmentAmount,
+        Math.round(amount),
+        name,
+      );
+      if (fi.error) return res.status(400).json({ error: fi.error });
 
       let id = null;
       if (raw?.id != null) {
@@ -168,12 +173,12 @@ router.put('/levels/:level/fees', async (req, res) => {
       // of a sentence naming the field.
       const rawGroup = raw?.group;
       const group = FEE_GROUPS.includes(rawGroup) ? rawGroup : 'OTHER_FEES';
-      // Registration takes no first-installment percentage. The rule ignores it
+      // Registration takes no first-installment amount. The rule ignores it
       // anyway (see buildFirstInstallmentRule), so storing one would only leave a
       // number on screen that does nothing.
       parsed.push({
         id, name, amount: Math.round(amount), group,
-        firstInstallmentPercent: group === 'REGISTRATION' ? null : percent,
+        firstInstallmentAmount: group === 'REGISTRATION' ? null : fi.value,
       });
     }
 
@@ -189,7 +194,7 @@ router.put('/levels/:level/fees', async (req, res) => {
       if (p.id != null) {
         await prisma.classLevelFee.update({
           where: { id: p.id },
-          data: { name: p.name, amount: p.amount, firstInstallmentPercent: p.firstInstallmentPercent, group: p.group },
+          data: { name: p.name, amount: p.amount, firstInstallmentAmount: p.firstInstallmentAmount, group: p.group },
         });
       } else {
         await prisma.classLevelFee.create({
@@ -198,7 +203,7 @@ router.put('/levels/:level/fees', async (req, res) => {
             classLevel: level,
             name: p.name,
             amount: p.amount,
-            firstInstallmentPercent: p.firstInstallmentPercent,
+            firstInstallmentAmount: p.firstInstallmentAmount,
             group: p.group,
           },
         });

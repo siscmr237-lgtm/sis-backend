@@ -8,9 +8,9 @@ const { feeKeyOf, standaloneChargeKey, getFeeStructuresForStudents } = require('
  *
  * They are independent on purpose:
  *   paymentStatus       — how the student's paid total compares to what they owe
- *   firstInstallmentMet — whether they have covered the required share of each
- *                         fee their CLASS LEVEL marks as part of the first
- *                         installment
+ *   firstInstallmentMet — whether they have paid the required AMOUNT toward
+ *                         each fee their CLASS LEVEL marks as part of the
+ *                         first installment
  * A student can be 'Owing' and still have met the first installment, which is
  * the case the two values exist to distinguish.
  *
@@ -22,10 +22,10 @@ const { feeKeyOf, standaloneChargeKey, getFeeStructuresForStudents } = require('
  * charges oldest first, by entryDate then id.
  *
  * Oldest-first beats splitting pro-rata: pro-rata would count a student who has
- * paid 60% overall as 60% of every fee, so a "Uniform 100%" rule could never be
- * met until the whole bill was, defeating the point of a first installment. It
- * does mean the result depends on the order fees were charged in; tagging
- * payments by fee later removes that dependence.
+ * paid 60% overall as having paid 60% of every fee, so a rule requiring the
+ * uniform in full could never be met until the whole bill was, defeating the
+ * point of a first installment. It does mean the result depends on the order
+ * fees were charged in; tagging payments by fee later removes that dependence.
  * ---------------------------------------------------------------------------
  */
 
@@ -102,7 +102,8 @@ function allocateToFeeCharges(charges, taggedPaid, untaggedPaid) {
 /**
  * @param entries  this student's LedgerEntry rows: { id, type, classLevelFeeId, amount, entryDate }
  * @param config   the student's LEVEL first-installment rule:
- *                 [{ classLevelFeeId, percent }] — only fees the level opted in
+ *                 [{ feeKey, required, name }] — only fees the level opted in,
+ *                 `required` already an absolute amount, see buildFirstInstallmentRule
  * @returns { paymentStatus, firstInstallmentMet, totalCharged, totalPaid, balance }
  *          firstInstallmentMet is null when the level has no rule configured, so
  *          a caller can tell "not configured" from "configured and not met"
@@ -155,7 +156,7 @@ function computeStudentFeesStatus(entries, config = []) {
   const base = { paymentStatus, totalCharged, totalPaid, balance: totalCharged - totalPaid };
 
   // --- (b) first installment ----------------------------------------------
-  const rule = (config || []).filter((c) => c && c.feeKey != null && c.percent != null);
+  const rule = (config || []).filter((c) => c && c.feeKey != null && c.required > 0);
   if (!rule.length) return { ...base, firstInstallmentMet: null, firstInstallmentShortfalls: [] };
 
   // Allocation runs over FEE-LINKED charges only. A one-off charge (a fine, a
@@ -186,20 +187,23 @@ function computeStudentFeesStatus(entries, config = []) {
    * decision, rather than re-derived by whatever is drawing the screen.
    */
   const shortfalls = [];
-  for (const { feeKey, percent, name } of rule) {
+  for (const { feeKey, required: configured, name } of rule) {
     const charged = chargedByFee.get(feeKey) ?? 0;
     // Nothing charged for a required fee means nothing to pay for it, so it
     // cannot hold the student back.
     if (charged <= 0) continue;
-    // Rounded up, so a 50% requirement is not satisfied by being half a unit
-    // short.
-    const required = Math.ceil((charged * Number(percent)) / 100);
+    // Clamped against what was ACTUALLY billed, not only against the fee's
+    // configured amount. The save routes already refuse a requirement above the
+    // amount, so the two normally agree — but a school can lower a fee AFTER
+    // configuring it, and this student's existing charge may predate that.
+    // Without the clamp their requirement would outlive the bill it was set
+    // against, and could not be met by paying the category in full.
+    const required = Math.min(Number(configured), charged);
     const paid = paidByFee.get(feeKey) ?? 0;
     if (paid >= required) continue;
     shortfalls.push({
       feeKey,
       name: name ?? null,
-      percent: Number(percent),
       charged,
       required,
       paid,
@@ -219,13 +223,13 @@ function computeStudentFeesStatus(entries, config = []) {
  * The fees that take part in the first-installment rule.
  *
  * REGISTRATION IS OUT, STRUCTURALLY. Not "out because somebody left its
- * percentage null" — out because of what it is. A registration fee is charged
+ * amount null" — out because of what it is. A registration fee is charged
  * once at enrolment and is not part of the instalment somebody is being asked
  * to have paid by a deadline, so it must not be able to hold a student back.
  *
- * The group is checked rather than the percentage precisely because NULL is a
- * setting, and settings get set wrong. A school that types 100 into
- * firstInstallmentPercent on their Registration fee — by habit, or by copying
+ * The group is checked rather than the amount precisely because NULL is a
+ * setting, and settings get set wrong. A school that types the whole fee into
+ * firstInstallmentAmount on their Registration fee — by habit, or by copying
  * the row above — would otherwise make it a hard requirement, and this is the
  * one place that cannot be left to depend on that not happening. Whatever is
  * stored on a Registration fee is ignored here.
@@ -240,12 +244,31 @@ function computeStudentFeesStatus(entries, config = []) {
  * computeStudentFeesStatus reports null — "no first-installment rule
  * configured" — rather than false, which would say the student had failed a
  * requirement that no longer exists.
+ *
+ * NULL AND 0 BOTH MEAN "ASKS NOTHING UPFRONT", and both drop the category from
+ * the rule entirely rather than entering it with a requirement of zero. The two
+ * are indistinguishable in outcome — a requirement of zero is met by paying
+ * nothing — but they are NOT indistinguishable in what an empty rule means. A
+ * level where every category is null or 0 has to report firstInstallmentMet as
+ * null, "nothing configured", and it only does that if those categories are
+ * absent from the rule rather than present and trivially satisfied. Keeping a
+ * zero would turn "no rule" into "a rule everybody passes", which reads on the
+ * screen as a requirement that has been met — a claim nobody made.
  */
 function buildFirstInstallmentRule(fees) {
   return (fees ?? [])
     .filter((f) => f.group !== 'REGISTRATION')
-    .filter((f) => f.firstInstallmentPercent != null)
-    .map((f) => ({ feeKey: f.key, percent: f.firstInstallmentPercent, name: f.name }));
+    .map((f) => ({
+      feeKey: f.key,
+      // Clamped here as well as on write: a fee amount LOWERED after the
+      // requirement was stored would otherwise leave a requirement standing
+      // above its own fee. computeStudentFeesStatus clamps once more against
+      // what was actually charged, which can differ from this amount for a
+      // charge raised before the fee moved.
+      required: Math.min(Number(f.firstInstallmentAmount) || 0, Number(f.amount) || 0),
+      name: f.name,
+    }))
+    .filter((f) => f.required > 0);
 }
 
 /**

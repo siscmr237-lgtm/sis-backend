@@ -8,7 +8,7 @@ const { classLevelOf } = require('./classLevels');
  * structure applies?" is answered in exactly one place. Each fee is returned in a
  * uniform shape with a `key` that identifies it across both kinds:
  *
- *   { key, name, amount, firstInstallmentPercent, classLevelFeeId, overrideId }
+ *   { key, name, amount, firstInstallmentAmount, group, classLevelFeeId, overrideId }
  *
  * The key exists because per-category maths has to group charges by fee, and a
  * charge points at either a ClassLevelFee or a StudentFeeOverride. Comparing raw
@@ -48,7 +48,7 @@ async function getStudentFeeStructure(prisma, schoolId, student) {
         classLevelFeeId: null,
         name: r.name,
         amount: r.amount,
-        firstInstallmentPercent: r.firstInstallmentPercent,
+        firstInstallmentAmount: r.firstInstallmentAmount,
       group: r.group,
       })),
     };
@@ -68,7 +68,7 @@ async function getStudentFeeStructure(prisma, schoolId, student) {
       classLevelFeeId: r.id,
       name: r.name,
       amount: r.amount,
-      firstInstallmentPercent: r.firstInstallmentPercent,
+      firstInstallmentAmount: r.firstInstallmentAmount,
       group: r.group,
     })),
   };
@@ -97,7 +97,7 @@ async function getFeeStructuresForStudents(prisma, schoolId, students) {
       classLevelFeeId: null,
       name: r.name,
       amount: r.amount,
-      firstInstallmentPercent: r.firstInstallmentPercent,
+      firstInstallmentAmount: r.firstInstallmentAmount,
       group: r.group,
     });
   }
@@ -110,7 +110,7 @@ async function getFeeStructuresForStudents(prisma, schoolId, students) {
       classLevelFeeId: r.id,
       name: r.name,
       amount: r.amount,
-      firstInstallmentPercent: r.firstInstallmentPercent,
+      firstInstallmentAmount: r.firstInstallmentAmount,
       group: r.group,
     });
   }

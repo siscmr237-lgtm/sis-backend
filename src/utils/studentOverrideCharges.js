@@ -121,13 +121,13 @@ async function setStudentFeeOverride(prisma, schoolId, studentId, fees) {
     if (row) {
       await prisma.studentFeeOverride.update({
         where: { id: row.id },
-        data: { amount: f.amount, firstInstallmentPercent: f.firstInstallmentPercent, group: f.group ?? 'OTHER_FEES' },
+        data: { amount: f.amount, firstInstallmentAmount: f.firstInstallmentAmount, group: f.group ?? 'OTHER_FEES' },
       });
     } else {
       await prisma.studentFeeOverride.create({
         data: {
           schoolId, studentId, name: f.name,
-          amount: f.amount, firstInstallmentPercent: f.firstInstallmentPercent, group: f.group ?? 'OTHER_FEES',
+          amount: f.amount, firstInstallmentAmount: f.firstInstallmentAmount, group: f.group ?? 'OTHER_FEES',
         },
       });
     }
@@ -188,13 +188,13 @@ async function applyLevelFeeToOverriddenStudents(prisma, schoolId, classLevel, f
     if (existing) {
       await prisma.studentFeeOverride.update({
         where: { id: existing.id },
-        data: { amount: fee.amount, firstInstallmentPercent: fee.firstInstallmentPercent, group: fee.group ?? 'OTHER_FEES' },
+        data: { amount: fee.amount, firstInstallmentAmount: fee.firstInstallmentAmount, group: fee.group ?? 'OTHER_FEES' },
       });
     } else {
       await prisma.studentFeeOverride.create({
         data: {
           schoolId, studentId: s.id, name: feeName,
-          amount: fee.amount, firstInstallmentPercent: fee.firstInstallmentPercent, group: fee.group ?? 'OTHER_FEES',
+          amount: fee.amount, firstInstallmentAmount: fee.firstInstallmentAmount, group: fee.group ?? 'OTHER_FEES',
         },
       });
     }
