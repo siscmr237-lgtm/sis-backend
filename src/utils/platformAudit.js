@@ -53,12 +53,19 @@ const ACTIONS = {
   SCHOOL_ADMIN_PASSWORD_RESET: 'school_admin.password_reset',
 
   /**
-   * Approving a school's registration. Recorded because it is the single act
-   * that GRANTS a school access to the product — the console has no matching
-   * "unapprove", so this is a one-way door, and "who opened it, and when" has
-   * to be answerable afterwards.
+   * The two directions of a school's access, recorded as two actions rather
+   * than one "status changed", because they are not the same event: one grants
+   * access to the product and the other takes it away. An audit trail that
+   * flattens them makes "was this school ever live?" unanswerable without
+   * reading the detail column of every row.
+   *
+   * SCHOOL_APPROVED was once documented here as a one-way door. It no longer
+   * is — the console can now send an approved school back to PENDING — so the
+   * question the log has to answer is no longer just "who opened it, and when"
+   * but "who closed it again, and why did they have to".
    */
   SCHOOL_APPROVED: 'school.approved',
+  SCHOOL_REVERTED_TO_PENDING: 'school.reverted_to_pending',
 };
 
 /** The client's address, honouring the proxy header Vercel actually sets. */

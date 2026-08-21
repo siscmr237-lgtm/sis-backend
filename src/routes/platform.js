@@ -213,11 +213,14 @@ router.get('/schools/:id/logo-url', async (req, res) => {
  * school that is still INCOMPLETE cannot be approved past a step it has not
  * taken, which would leave it approved with no details on file.
  *
- * There is no matching reject or unapprove route, and that is a product
- * decision rather than an oversight: a school the team is not happy with is
- * left PENDING, and sends itself back with "Not Done" on the waiting page.
- * Adding an unapprove here would create a way to revoke access to a product a
- * school is already paying to use, with no screen anywhere that explains it.
+ * The reverse now exists — see POST /schools/:id/revert-to-pending below. It
+ * did not, and the reason given here was that revoking access to a product a
+ * school is already paying to use would leave them with no screen explaining
+ * what happened. That premise no longer holds: a PENDING school lands on
+ * /school/pending-verification, which tells them their account is under review
+ * and offers them a way back. The remaining risk is a mis-click, which the
+ * console answers with a confirmation step rather than by withholding the
+ * action.
  */
 router.post('/schools/:id/approve', async (req, res) => {
   const id = Number(req.params.id);
@@ -257,6 +260,72 @@ router.post('/schools/:id/approve', async (req, res) => {
   } catch (e) {
     console.error('platform /schools/:id/approve failed', e.code || e.message);
     res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not approve the school.' });
+  }
+});
+
+/**
+ * POST /platform/schools/:id/revert-to-pending
+ *
+ * The mirror of approve: APPROVED -> PENDING. Sends a school back to the
+ * waiting page, either because it was approved by mistake or because its
+ * details need redoing.
+ *
+ * Same updateMany-with-the-status-in-the-WHERE as approve, for the same
+ * reason: the transition is decided by the database, so two team members
+ * clicking at once produce one change and one honest "already pending" rather
+ * than a read-then-write race. And as there, only the one legal transition is
+ * accepted — an INCOMPLETE or FAILED school is NOT dragged forward to PENDING
+ * by this route, which would fabricate a submission the school never made.
+ *
+ * NOT founder-only, matching approve. The most likely caller is whoever
+ * approved by accident thirty seconds ago, and making them find a founder to
+ * undo their own mis-click would mean the school stays wrongly live for
+ * longer. Both directions are audited, which is the control that actually
+ * answers for it afterwards.
+ *
+ * ONE COLUMN, exactly as approve touches one column. Nothing here deletes
+ * data, ends sessions, or unwinds onboarding: the school's students, staff and
+ * settings are all still there, and approving again returns it to precisely
+ * where it was. That is what makes this safe to expose at all.
+ */
+router.post('/schools/:id/revert-to-pending', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  try {
+    const existing = await prisma.school.findUnique({
+      where: { id },
+      select: { id: true, name: true, registrationStatus: true },
+    });
+    if (!existing) return res.status(404).json({ error: 'School not found.' });
+
+    const { count } = await prisma.school.updateMany({
+      where: { id, registrationStatus: 'APPROVED' },
+      data: { registrationStatus: 'PENDING' },
+    });
+
+    if (count === 0) {
+      // Already PENDING is success, not a failure — same shape as approve's
+      // alreadyApproved, so the console can render the true status either way.
+      if (existing.registrationStatus === 'PENDING') {
+        return res.json({ reverted: false, registrationStatus: 'PENDING', alreadyPending: true });
+      }
+      return res.status(409).json({
+        code: 'NOT_APPROVED',
+        error: 'Only an approved school can be sent back to pending.',
+        registrationStatus: existing.registrationStatus,
+      });
+    }
+
+    await recordAudit(req, ACTIONS.SCHOOL_REVERTED_TO_PENDING, {
+      target: `school:${id}`,
+      detail: { name: existing.name, from: 'APPROVED', to: 'PENDING' },
+    });
+
+    res.json({ reverted: true, registrationStatus: 'PENDING' });
+  } catch (e) {
+    console.error('platform /schools/:id/revert-to-pending failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not send the school back to pending.' });
   }
 });
 
