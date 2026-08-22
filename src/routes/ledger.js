@@ -7,7 +7,7 @@ const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/acad
 const { requireAdmin, requireTeacher } = require('../roleGuards');
 const { FEE_GROUPS } = require('../utils/feeCategories');
 const { computeOwingByCategory } = require('../utils/feesStatus');
-const { getStudentFeeStructure } = require('../utils/studentFees');
+const { getStudentFeeStructure, feeKeyOf, standaloneChargeKey } = require('../utils/studentFees');
 const {
   STAFF_DEBT_CATEGORIES,
   PAYROLL_METHODS,
@@ -507,6 +507,144 @@ router.post('/payment', requireAdmin, async (req, res) => {
   }
 });
 
+// POST /ledger/payments — several fees settled by one hand-over of money.
+//
+// WHY THIS EXISTS ALONGSIDE /payment. The Pay Fees dialog is a table: somebody
+// is handed 60,000 and told "30,000 for tuition, 20,000 for books, 10,000 for
+// PTA". That is three payments — each tagged to its own fee, because a single
+// lump would land untagged and then be allocated oldest-first, which is exactly
+// the bug that made paying Tuition clear something else. But it is ONE act, and
+// it has to succeed or fail as one.
+//
+// ALL-OR-NOTHING, and that is the point of the endpoint. Looping POST /payment
+// from the browser would write each row in its own request, so a cap rejection
+// or a dropped connection on the third fee leaves the first two recorded and the
+// operator with no way to know what landed. Money must not be half-written.
+// Every row is validated against freshly-computed owing BEFORE anything is
+// created, and the creates then run inside one transaction.
+//
+// The owing figures are recomputed here rather than trusted from the request,
+// for the same reason group-settlement recomputes them: between the dialog
+// loading and submit another admin may have recorded a payment, and writing the
+// figures this client remembers would overpay.
+router.post('/payments', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { studentId, entryDate, paymentMethod, entries: rawEntries } = req.body || {};
+
+    if (!entryDate) return res.status(400).json({ error: 'entryDate required' });
+    if (!Array.isArray(rawEntries) || rawEntries.length === 0) {
+      return res.status(400).json({ code: 'NO_ENTRIES', error: 'Enter an amount against at least one fee.' });
+    }
+
+    const student = await prisma.student.findFirst({
+      where: { schoolId, OR: [{ code: String(studentId) }, { id: parseInt(studentId) || 0 }] },
+    });
+    if (!student) return res.status(400).json({ error: 'Invalid studentId' });
+
+    // A fee named twice is rejected rather than summed: two amounts against one
+    // fee means the client built the payload wrongly, and quietly adding them
+    // together would hide that while still moving money.
+    const seen = new Set();
+    const wanted = [];
+    for (const raw of rawEntries) {
+      const feeKey = raw && raw.feeKey != null ? String(raw.feeKey) : '';
+      if (!feeKey) {
+        return res.status(400).json({ code: 'CATEGORY_REQUIRED', error: 'Every amount must name the fee it is for.' });
+      }
+      if (seen.has(feeKey)) {
+        return res.status(400).json({ code: 'DUPLICATE_CATEGORY', error: 'The same fee appears twice in one payment.' });
+      }
+      seen.add(feeKey);
+
+      const amount = Number(raw.amount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ code: 'INVALID_AMOUNT', error: 'Every amount must be greater than zero.' });
+      }
+      wanted.push({ feeKey, amount: Math.round(amount) });
+    }
+
+    const [structure, ledgerRows] = await Promise.all([
+      getStudentFeeStructure(prisma, schoolId, student),
+      prisma.ledgerEntry.findMany({
+        where: { schoolId, studentId: student.id },
+        select: {
+          id: true, code: true, type: true, amount: true, entryDate: true, description: true,
+          classLevelFeeId: true, studentFeeOverrideId: true, settlesEntryId: true, note: true,
+        },
+      }),
+    ]);
+    const categories = computeOwingByCategory(ledgerRows, structure.fees);
+
+    // EVERY row is checked before ANY row is written, so the response names the
+    // fee that failed instead of aborting partway through the write.
+    const planned = [];
+    for (const w of wanted) {
+      const target = categories.find((c) => c.key === w.feeKey);
+      if (!target) {
+        return res.status(400).json({ code: 'UNKNOWN_CATEGORY', error: 'That fee is not on this student\'s account.' });
+      }
+      if (!target.payable) {
+        return res.status(400).json({
+          code: 'CATEGORY_NOT_PAYABLE',
+          error: `"${target.name}" cannot be paid against directly yet.`,
+        });
+      }
+      // The same cap POST /payment enforces, for the same reason: a client can be
+      // edited, and an overpayment would make the category read as more than
+      // settled while the money is really unallocated.
+      if (w.amount > target.owing) {
+        return res.status(400).json({
+          code: 'EXCEEDS_OWING',
+          error: `That is more than the ${target.owing.toLocaleString()} still owed for ${target.name}.`,
+          feeKey: w.feeKey,
+          owing: target.owing,
+        });
+      }
+      planned.push({ target, amount: w.amount });
+    }
+
+    const { academicYear, term } = await getSchoolPeriod(schoolId);
+    const when = new Date(entryDate);
+
+    // One transaction. Either every fee on the table is recorded or none is.
+    const created = await prisma.$transaction(
+      planned.map(({ target, amount }) => prisma.ledgerEntry.create({
+        data: {
+          code: genCode('PMT'),
+          type: 'PAYMENT',
+          schoolId,
+          studentId: student.id,
+          categoryId: null,
+          // Exactly one of the three is ever set; feeKeyOf() reads whichever it
+          // is back out. The same shape POST /payment writes, so allocation and
+          // every downstream reading of it behave identically.
+          classLevelFeeId: target.classLevelFeeId ?? null,
+          studentFeeOverrideId: target.studentFeeOverrideId ?? null,
+          settlesEntryId: target.settlesEntryId ?? null,
+          // The dialog has no Notes field any more, so the fee being paid is the
+          // label. The column is NOT NULL and this is what every ledger table
+          // shows, so a blank would render as an empty row.
+          description: target.name,
+          amount,
+          entryDate: when,
+          paymentMethod: paymentMethod || null,
+          academicYear,
+          term,
+        },
+      })),
+    );
+
+    res.status(201).json({
+      recorded: created.length,
+      total: created.reduce((n, e) => n + e.amount, 0),
+      entries: mapWithIdAsCode(created),
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // GET /ledger/student/:studentId
 router.get('/student/:studentId', requireAdmin, async (req, res) => {
   try {
@@ -518,7 +656,7 @@ router.get('/student/:studentId', requireAdmin, async (req, res) => {
     });
     if (!student) return res.status(404).json({ error: 'Student not found' });
 
-    const [entries, agg] = await Promise.all([
+    const [entries, agg, structure] = await Promise.all([
       prisma.ledgerEntry.findMany({
         where: { studentId: student.id, schoolId },
         include: { category: true },
@@ -529,6 +667,7 @@ router.get('/student/:studentId', requireAdmin, async (req, res) => {
         where: { studentId: student.id, schoolId },
         _sum: { amount: true },
       }),
+      getStudentFeeStructure(prisma, schoolId, student),
     ]);
 
     let totalCharged = 0;
@@ -538,8 +677,36 @@ router.get('/student/:studentId', requireAdmin, async (req, res) => {
       if (row.type === 'PAYMENT') totalPaid = row._sum.amount ?? 0;
     }
 
+    // WHICH FEE EACH ROW IS FOR, resolved by name.
+    //
+    // `category` is the ChargeCategory relation and is NOT how a fee payment is
+    // tagged — POST /payment writes categoryId: null on purpose and records the
+    // fee in one of classLevelFeeId / studentFeeOverrideId / settlesEntryId
+    // instead. So anything reading entry.category.name for a payment got null
+    // and rendered a dash for every row; the financial-sheet PDF's Fee column
+    // was blank for exactly this reason.
+    //
+    // feeKeyOf() collapses those three columns into the one key the fee
+    // structure is already keyed by, so this is a lookup rather than a second
+    // implementation of the tagging convention.
+    const feeNameByKey = new Map(structure.fees.map((f) => [f.key, f.name]));
+    // A standalone charge is its own category, keyed by its own id, and its name
+    // is the description it was raised with — the same thing
+    // computeOwingByCategory calls it, so the PDF and the owing breakdown agree.
+    for (const e of entries) {
+      if (e.type === 'CHARGE' && feeKeyOf(e) == null) {
+        feeNameByKey.set(standaloneChargeKey(e.id), e.description);
+      }
+    }
+
     res.json({
-      entries: mapWithIdAsCode(entries),
+      entries: mapWithIdAsCode(entries).map((e) => ({
+        ...e,
+        // Null, never a dash: the placeholder is the reader's decision, and a
+        // genuinely untagged legacy row must stay distinguishable from a tagged
+        // one whose fee has since been deleted.
+        feeName: feeNameByKey.get(feeKeyOf(e)) ?? null,
+      })),
       totalCharged,
       totalPaid,
       balance: totalCharged - totalPaid,
