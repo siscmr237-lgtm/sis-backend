@@ -56,6 +56,103 @@ function requireSchoolActor(req, res, next) {
 }
 
 /**
+ * THE APPROVAL GATE: a school that is not APPROVED cannot use the product.
+ *
+ * The hole this closes: approval is REVOKED by somebody else — the platform
+ * team, in a different browser — while the school's own token stays perfectly
+ * valid. Nothing about that revert ends the session, and the client-side gate
+ * only ran when the app shell mounted, so a school already inside its dashboard
+ * carried on working: every read answered, every write committed, for as long
+ * as the tab stayed open. The frontend cannot be what stops it, because the
+ * frontend is the thing that has gone stale.
+ *
+ * So the refusal lives here, on every request, mounted once at the choke point
+ * in src/app.js — for exactly the reason requireSchoolActor is mounted there: a
+ * school router added later inherits it by position instead of depending on
+ * whoever adds it remembering.
+ *
+ * NO EXTRA QUERY. authMiddleware already re-loads the School row from the
+ * database on every request (see loadAdminActor / loadTeacherActor), so
+ * req.user.School[0].registrationStatus is not a claim out of the token and not
+ * a cache — it is this request's own live read. That is what makes checking it
+ * here as authoritative as checking the row directly, and free.
+ *
+ * Teachers are refused too, deliberately: a school whose account is under
+ * review is not open for business, and letting its staff carry on recording
+ * marks and attendance would leave the same hole with a different door open.
+ * They are sent to a page of their own, since the school's waiting page is an
+ * admin screen with nothing on it a teacher can act on.
+ *
+ * 403 with its own code, never 401: the session is alive and has to stay alive.
+ * A 401 makes the client tear down a working login, which would take away the
+ * very page that explains what happened. registrationStatus rides along so the
+ * client can pick the right screen — the waiting page for PENDING, the form for
+ * a school sent further back than that — without a second round trip to ask.
+ */
+const SCHOOL_NOT_APPROVED = 'SCHOOL_NOT_APPROVED';
+
+/**
+ * This request's live registration status, or null if it could not be read.
+ *
+ * Null is only reachable through a broken School relation, and it is treated as
+ * "not approved" rather than defaulted to anything: an unreadable status fails
+ * closed, the same way requireSchoolActor asserts on a missing schoolId.
+ */
+function registrationStatusOf(req) {
+  return req.user?.School?.[0]?.registrationStatus ?? null;
+}
+
+/**
+ * The message is chosen by status because the two cases are genuinely different
+ * things to be told: PENDING is "we are looking at it", and INCOMPLETE/FAILED is
+ * "you have not finished". A client that follows the redirect never displays
+ * either — but one that cannot, because it is already on the page it would be
+ * sent to, shows this string, and at that moment it needs to be true.
+ */
+function denySchoolNotApproved(res, registrationStatus) {
+  return res.status(403).json({
+    code: SCHOOL_NOT_APPROVED,
+    error:
+      registrationStatus === 'PENDING'
+        ? "This school's account is being reviewed, so it cannot be used right now."
+        : 'This school has not finished signing up, so its account cannot be used yet.',
+    registrationStatus,
+  });
+}
+
+function requireApprovedSchool(req, res, next) {
+  const status = registrationStatusOf(req);
+  if (status !== 'APPROVED') {
+    return denySchoolNotApproved(res, status);
+  }
+  next();
+}
+
+/**
+ * The narrower rule for the KYC form, which sits OUTSIDE the gate above.
+ *
+ * Three of the four statuses have a legitimate reason to be there. INCOMPLETE
+ * and FAILED are a school filling the form in for the first time, or coming
+ * back to redo it after "Not Done" — refusing those would lock every new signup
+ * out of signing up. APPROVED is a live school editing its own particulars,
+ * which POST /onboarding explicitly supports and which must not be thrown back
+ * onto the waiting page.
+ *
+ * PENDING is the one refused: those details are in front of the platform team
+ * right now, and re-submitting them from behind that review is precisely the
+ * kind of action that is supposed to have stopped. The legitimate way back to
+ * the form is POST /school/registration-status/reopen, which moves the row to
+ * INCOMPLETE first and so passes this check on the way through.
+ */
+function refuseWhilePending(req, res, next) {
+  const status = registrationStatusOf(req);
+  if (status === 'PENDING') {
+    return denySchoolNotApproved(res, status);
+  }
+  next();
+}
+
+/**
  * DIRECTION TWO: keep school tokens OUT of the platform API.
  *
  * Also mounted once, at the /platform mount. An admin or teacher token is a
@@ -270,6 +367,8 @@ module.exports = {
   requireAdmin,
   requireTeacher,
   requireSchoolActor,
+  requireApprovedSchool,
+  refuseWhilePending,
   requirePlatformActor,
   requirePlatformFounder,
   getTeacherClasses,

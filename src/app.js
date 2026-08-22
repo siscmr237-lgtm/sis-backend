@@ -1,7 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const { authMiddleware } = require('./auth');
-const { requireAdmin, requireSchoolActor, requirePlatformActor } = require('./roleGuards');
+const {
+  requireAdmin,
+  requireSchoolActor,
+  requireApprovedSchool,
+  refuseWhilePending,
+  requirePlatformActor,
+} = require('./roleGuards');
 
 const studentsRouter = require('./routes/students');
 const staffRouter = require('./routes/staff');
@@ -168,6 +174,38 @@ app.use('/platform', requirePlatformActor, platformRouter);
 // later inherits the refusal instead of depending on whoever adds it.
 app.use(requireSchoolActor);
 
+// ── WHAT AN UNAPPROVED SCHOOL STILL NEEDS ───────────────────────────────────
+// Mounted ABOVE requireApprovedSchool because this is how a school that is not
+// approved finds out where it stands and gets itself approved. Behind the gate
+// these would be unreachable and the waiting page would have nothing to read.
+//
+// /school is the status endpoint and the "Not Done" reopen — the only two calls
+// the waiting page makes, and the reason it can tell a school anything at all.
+//
+// /onboarding is the KYC form. Every status except PENDING has a reason to be
+// in it: INCOMPLETE and FAILED are a school signing up, APPROVED is a live
+// school editing its own particulars. refuseWhilePending states that one
+// exception rather than leaving the router open to all four.
+//
+// /upload is here for one reason — the onboarding form uploads the school's
+// logo through it (postImage in SIS/src/lib/uploadImage.ts) before the form is
+// submitted, so a school signing up has to be able to reach it or it cannot
+// finish signing up. It carries the same rule as the form it serves.
+app.use('/school', requireAdmin, schoolRouter);
+app.use('/onboarding', requireAdmin, refuseWhilePending, onboardingRouter);
+app.use('/upload', requireAdmin, refuseWhilePending, uploadRouter);
+
+// ── THE APPROVAL GATE ───────────────────────────────────────────────────────
+// Everything below here requires a school the platform team has APPROVED, and
+// re-checks that on every single request.
+//
+// Position is the whole design, same as requireSchoolActor above it: approval
+// can be withdrawn at any moment, from another browser, while this school's
+// token stays valid — so the check cannot be something a route remembers to do,
+// and it cannot be something the client is trusted to do. A router added below
+// this line inherits the refusal. See requireApprovedSchool in roleGuards.js.
+app.use(requireApprovedSchool);
+
 // Mixed routers: these serve BOTH actor types, so the admin/teacher split is
 // made per route inside them (requireAdmin / requireTeacher) and, for the reads
 // a teacher is allowed, narrowed to their own classes and subjects.
@@ -197,14 +235,13 @@ app.use('/academic-year', requireAdmin, academicYearRouter);
 app.use('/dashboard', requireAdmin, dashboardRouter);
 app.use('/classes', requireAdmin, classesRouter);
 app.use('/subjects', requireAdmin, subjectsRouter);
-app.use('/upload', requireAdmin, uploadRouter);
 app.use('/charge-categories', requireAdmin, chargeCategoriesRouter);
-app.use('/onboarding', requireAdmin, onboardingRouter);
 
-// The school's own registration status: where it stands in signing up, and the
-// "Not Done" button that sends it back to re-submit. Admin-only like every
-// other router in this group — a teacher has no signup of their own, and the
-// waiting page they would be answering for is not a screen they can reach.
-app.use('/school', requireAdmin, schoolRouter);
+// /school, /onboarding and /upload are mounted further up, above the approval
+// gate — they are the only school routers a school that is not APPROVED may
+// reach, and why is written out at that mount.
+// Both are admin-only there for the same reason as everything in this group: a
+// teacher has no signup of their own, and the waiting page they would be
+// answering for is not a screen they can reach.
 
 module.exports = app;

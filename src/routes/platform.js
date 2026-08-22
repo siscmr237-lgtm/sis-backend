@@ -287,6 +287,12 @@ router.post('/schools/:id/approve', async (req, res) => {
  * data, ends sessions, or unwinds onboarding: the school's students, staff and
  * settings are all still there, and approving again returns it to precisely
  * where it was. That is what makes this safe to expose at all.
+ *
+ * And one column is enough to stop the school, because the column is what the
+ * school API reads. requireApprovedSchool (src/roleGuards.js) checks it on
+ * every request from the row authMiddleware has just loaded, so this write
+ * lands on the school's next call — there is no session to end, and no window
+ * in which an already-signed-in school carries on working.
  */
 router.post('/schools/:id/revert-to-pending', async (req, res) => {
   const id = Number(req.params.id);
