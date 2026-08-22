@@ -18,6 +18,10 @@ const { validatePlatformPassword } = require('../utils/platformPassword');
 // behalf. Distinct from validatePlatformPassword, which guards team accounts.
 const { validatePassword } = require('../utils/validatePassword');
 const { supabase, BUCKET } = require('../utils/storage');
+// Phone comparison on DIGITS, shared with the login path. The console must ask
+// the same question login will ask, or it can save a number that resolves to
+// two accounts and locks both out — see PUT /school-admins/:id.
+const { digitsOnly, isCompletePhone, adminIdsByPhone } = require('../utils/phone');
 const { recordAudit, ACTIONS } = require('../utils/platformAudit');
 
 const router = express.Router();
@@ -471,6 +475,106 @@ router.put('/school-admins/:id/password', async (req, res) => {
   });
 
   res.json({ ok: true });
+});
+
+/**
+ * Change a SCHOOL ADMIN's phone number.
+ *
+ * Phone only, and a separate route from the password one above for the same
+ * reason that pair is split: a number change must not be able to carry a
+ * credential change with it, or the other way round.
+ *
+ * THIS MOVES A LOGIN, not a contact detail. AdminUser.phoneNumber is what
+ * /auth/login resolves an account by (findAdminByPhone in utils/phone.js), so
+ * the old number stops working the moment this returns and the new one starts.
+ * There is no notification and no confirmation step on the school's side; the
+ * console is trusted to be talking to the person whose number it is changing.
+ *
+ * TWO COLLISION CHECKS, not one, and the first is the one that matters:
+ *
+ *   The column's @unique index compares exact strings. Login compares DIGITS.
+ *   So the index would happily accept "+237679379134" next to an existing
+ *   "679379134" — the same number in two shapes — and the login lookup would
+ *   then see two matches and refuse BOTH accounts, including the one that was
+ *   working before this call. Locking a customer out of an account nobody
+ *   touched is the worst thing this route could do, so it asks adminIdsByPhone
+ *   against every stored form of the number rather than leaving it to Prisma.
+ *
+ *   P2002 is still caught underneath, because the check above and the write are
+ *   not one transaction and a concurrent signup could land between them.
+ */
+router.put('/school-admins/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  const raw = req.body?.phoneNumber;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', error: 'A phone number is required.' });
+  }
+  const phoneNumber = raw.trim();
+
+  // The same rule the phone field enforces in the browser, applied again here:
+  // a client is not a validator, and a half-typed number written onto this
+  // column is an account that can never sign in again.
+  if (!isCompletePhone(phoneNumber)) {
+    return res.status(400).json({
+      code: 'INVALID_PHONE',
+      error: 'That is not a complete phone number.',
+    });
+  }
+
+  const admin = await prisma.adminUser.findUnique({
+    where: { id },
+    select: { id: true, name: true, phoneNumber: true, School: { select: { id: true } } },
+  });
+  if (!admin) return res.status(404).json({ error: 'Administrator not found.' });
+
+  // Unchanged is not an error — the dialog opens pre-filled, so saving without
+  // editing is an ordinary thing to do. Answer as though it worked, and do not
+  // write an audit row for an event that did not happen.
+  if (digitsOnly(admin.phoneNumber) === digitsOnly(phoneNumber)) {
+    return res.json({ ok: true, phoneNumber: admin.phoneNumber, changed: false });
+  }
+
+  // Anything this number already reaches, other than this account. Asked as
+  // "which ids" rather than through findAdminByPhone, because that answers null
+  // for two matches — the very case that must be refused loudest.
+  const reaches = await adminIdsByPhone(prisma, phoneNumber, 3);
+  if (reaches.some((other) => other !== id)) {
+    return res.status(409).json({
+      code: 'DUPLICATE',
+      error: 'Another administrator already uses that phone number.',
+    });
+  }
+
+  try {
+    const updated = await prisma.adminUser.update({
+      where: { id },
+      data: { phoneNumber },
+      select: { id: true, phoneNumber: true },
+    });
+
+    await recordAudit(req, ACTIONS.SCHOOL_ADMIN_PHONE_CHANGED, {
+      target: `admin_user:${id}`,
+      detail: {
+        adminName: admin.name,
+        schoolIds: admin.School.map((s) => s.id),
+        from: admin.phoneNumber,
+        to: updated.phoneNumber,
+      },
+    });
+
+    res.json({ ok: true, phoneNumber: updated.phoneNumber, changed: true });
+  } catch (e) {
+    if (e.code === 'P2002') {
+      return res.status(409).json({
+        code: 'DUPLICATE',
+        error: 'Another administrator already uses that phone number.',
+      });
+    }
+    console.error('platform school admin phone update failed', e.code || e.message);
+    res.status(500).json({ error: 'Could not change the phone number.' });
+  }
 });
 
 // ── Team accounts — Founder only ────────────────────────────────────────────

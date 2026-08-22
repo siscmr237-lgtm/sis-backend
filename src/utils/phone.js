@@ -67,26 +67,63 @@ function phoneVariants(value) {
 }
 
 /**
- * An AdminUser by phone, in any of those forms.
+ * True when the value is a COMPLETE number for one of the three countries —
+ * the same question the browser's isValidPhone asks, asked again on the server.
+ *
+ * nationalDigits alone is not that question: it answers "12" with "12", which
+ * is truthy and unusable. Length is what separates a number from a fragment,
+ * and a fragment written onto AdminUser.phoneNumber is an account that cannot
+ * sign in again. Only used where the console WRITES a number; nothing reads
+ * existing rows through it, because older rows were never held to it.
+ */
+function isCompletePhone(value) {
+  const national = nationalDigits(value);
+  if (!national) return false;
+  return Object.values(NATIONAL_LENGTH).includes(national.length);
+}
+
+/**
+ * The ids of every AdminUser whose stored number means the value given.
  *
  * Compares on digits so a stored "+237 679 379 134" matches too — the column is
  * plain text and has never been constrained, so it may hold anything.
+ *
+ * Separated from findAdminByPhone below because the two callers ask different
+ * questions of the same comparison. Login asks "which ONE account is this",
+ * and treats anything else as no answer. The console, before it writes a new
+ * number onto an account, has to ask "does this number already reach ANY other
+ * account" — and for that, two matches is the most alarming answer there is,
+ * not a null. Reading it through findAdminByPhone would hide exactly the case
+ * it needs to see.
+ *
+ * @param {number} limit rows to stop at; 2 is enough to say "more than one".
  */
-async function findAdminByPhone(prisma, value) {
+async function adminIdsByPhone(prisma, value, limit = 2) {
   const national = nationalDigits(value);
-  if (!national) return null;
+  if (!national) return [];
   const candidates = phoneVariants(value).map(digitsOnly).filter(Boolean);
-  if (!candidates.length) return null;
+  if (!candidates.length) return [];
   const rows = await prisma.$queryRaw`
     SELECT id FROM "AdminUser"
     WHERE regexp_replace("phoneNumber", '\D', '', 'g') IN (${Prisma.join(candidates)})
-    LIMIT 2
+    LIMIT ${limit}
   `;
+  return rows.map((r) => Number(r.id));
+}
+
+/**
+ * An AdminUser by phone, in any of those forms. The login path's question.
+ */
+async function findAdminByPhone(prisma, value) {
+  const ids = await adminIdsByPhone(prisma, value, 2);
   // Two matches means the data is genuinely ambiguous. Refusing is the only safe
   // answer on a login path — picking one could sign somebody into the wrong
   // account, and that must never be a silent outcome.
-  if (rows.length !== 1) return null;
-  return prisma.adminUser.findUnique({ where: { id: rows[0].id }, include: { School: true } });
+  if (ids.length !== 1) return null;
+  return prisma.adminUser.findUnique({ where: { id: ids[0] }, include: { School: true } });
 }
 
-module.exports = { digitsOnly, nationalDigits, phoneVariants, findAdminByPhone };
+module.exports = {
+  digitsOnly, nationalDigits, isCompletePhone, phoneVariants,
+  adminIdsByPhone, findAdminByPhone,
+};

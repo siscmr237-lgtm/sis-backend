@@ -53,6 +53,21 @@ const ACTIONS = {
   SCHOOL_ADMIN_PASSWORD_RESET: 'school_admin.password_reset',
 
   /**
+   * A school admin's phone number changed from the console.
+   *
+   * Its own action rather than a general "admin updated", because the phone
+   * number is the thing that account SIGNS IN WITH — /auth/login resolves an
+   * admin through findAdminByPhone. Changing it moves the door, so the log has
+   * to answer "who moved it, and when" without anybody reading a detail column
+   * to work out whether a row was a rename or a credential change.
+   *
+   * The detail records both numbers. They are not secrets — the console already
+   * shows the current one on the school page — and without the old value a
+   * mistyped change cannot be undone from the log.
+   */
+  SCHOOL_ADMIN_PHONE_CHANGED: 'school_admin.phone_changed',
+
+  /**
    * The two directions of a school's access, recorded as two actions rather
    * than one "status changed", because they are not the same event: one grants
    * access to the product and the other takes it away. An audit trail that
