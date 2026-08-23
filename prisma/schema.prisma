@@ -17,11 +17,31 @@ model Student {
   schoolId           Int
   firstName          String
   lastName           String
-  dateOfBirth        DateTime
+  /// OPTIONAL. A school enrolling a child often does not have the birth
+  /// certificate to hand on the day, and requiring it meant the student could
+  /// not be entered at all until it turned up.
+  ///
+  /// NULL rather than a stand-in date: the create route used to fall back to
+  /// "today", which stored a birthday that was silently wrong and then showed
+  /// as fact on the profile. NULL reads as "not recorded", which is the truth,
+  /// and the profile already renders a missing date as an em dash.
+  dateOfBirth        DateTime?
   gender             String
   class              String
-  parent             Parent               @relation(fields: [parentId], references: [id])
-  parentId           Int
+  /// OPTIONAL, both sides. A guardian's name and phone are often not available
+  /// at the moment of enrolment, and a missing contact must not be what keeps a
+  /// child off the roster.
+  ///
+  /// No link at all rather than a blank Parent row: Parent is deduped by
+  /// @@unique([schoolId, name, phone]), so an empty name/phone pair would be one
+  /// shared "nobody" record that every contactless student pointed at — and
+  /// editing one child's guardian would then rewrite it for all of them. A NULL
+  /// parentId says "no guardian on file" without inventing anyone.
+  ///
+  /// withFlatParent() in src/utils/parents.js already flattens a missing parent
+  /// to empty parentName/parentPhone, so responses keep their existing shape.
+  parent             Parent?              @relation(fields: [parentId], references: [id])
+  parentId           Int?
   address            String
   enrollmentDate     DateTime
   allergies          String?

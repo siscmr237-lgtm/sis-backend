@@ -188,13 +188,18 @@ router.post('/', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const body = req.body || {};
   try {
+    // Both may come back empty: a guardian and a date of birth are optional at
+    // enrolment (see the Student model). resolveParentId returns null when the
+    // name and phone are both blank, and a missing dateOfBirth is stored as
+    // NULL rather than defaulting to today — that default used to record a
+    // birthday that was plainly wrong and then show it on the profile as fact.
     const parentId = await resolveParentId(schoolId, body);
     const created = await prisma.student.create({
       data: {
         code: body.id || genCode('STU'),
         firstName: body.firstName,
         lastName: body.lastName,
-        dateOfBirth: body.dateOfBirth ? new Date(body.dateOfBirth) : new Date(),
+        dateOfBirth: body.dateOfBirth ? new Date(body.dateOfBirth) : null,
         gender: body.gender,
         class: body.class,
         parentId,
