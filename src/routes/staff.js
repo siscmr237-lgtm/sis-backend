@@ -41,16 +41,53 @@ const UNIQUE_FIELD_LABELS = {
   idNumber: 'ID number',
 };
 
-function uniqueConflictMessage(e) {
+/**
+ * Returns { field, error } for a unique-constraint failure, or null if `e` is
+ * something else entirely.
+ *
+ * `field` is the machine-readable half and it is the point of this shape. The
+ * prose alone was not enough: the form has to put a red ring on the ONE box
+ * that is actually duplicated, and string-matching the sentence to work out
+ * which box that is would break the first time the wording is reworded. NULL
+ * `field` means the clash is real but not attributable to a single box, which
+ * only the fallback below produces.
+ *
+ * On this Postgres, Prisma reports meta.target for the compound indexes as an
+ * array of the column names — ['schoolId', 'idNumber'] and so on — which is
+ * what makes the `includes` below the right test. Verified against the live
+ * database rather than assumed; a constraint NAME arriving here instead would
+ * silently fall through to the unattributed fallback.
+ */
+function uniqueConflict(e) {
   if (e.code !== 'P2002') return null;
   const target = e.meta?.target;
   const fields = Array.isArray(target) ? target : [target].filter(Boolean);
   for (const [field, label] of Object.entries(UNIQUE_FIELD_LABELS)) {
     if (fields.includes(field)) {
-      return `A staff member with this ${label} already exists in this school.`;
+      return { field, error: `A staff member with this ${label} already exists in this school.` };
     }
   }
-  return 'A staff member with these details already exists in this school.';
+  return { field: null, error: 'A staff member with these details already exists in this school.' };
+}
+
+// The four boxes that must hold something. Checked here rather than left to
+// Prisma because a missing column surfaces from Prisma as a 500 carrying an
+// engine message, and a 500 gives the form nothing to point at — the whole
+// reason a save could fail without the user being told which box was at fault.
+const REQUIRED_FIELDS = [
+  ['firstName', 'first name'],
+  ['lastName', 'last name'],
+  ['role', 'role'],
+  ['phone', 'phone number'],
+];
+
+function missingFieldError(body) {
+  for (const [field, label] of REQUIRED_FIELDS) {
+    if (!String(body[field] ?? '').trim()) {
+      return { field, error: `Enter a ${label}.` };
+    }
+  }
+  return null;
 }
 
 /**
@@ -153,8 +190,10 @@ router.patch('/me', requireTeacher, async (req, res) => {
     });
     res.json(publicStaff(updated));
   } catch (e) {
-    const conflict = uniqueConflictMessage(e);
-    if (conflict) return res.status(409).json({ error: conflict });
+    const conflict = uniqueConflict(e);
+    if (conflict) {
+      return res.status(409).json({ code: 'DUPLICATE_FIELD', field: conflict.field, error: conflict.error });
+    }
     res.status(400).json({ error: e.message });
   }
 });
@@ -321,6 +360,14 @@ router.get('/:id', requireAdmin, async (req, res) => {
 router.post('/', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const body = req.body || {};
+
+  // Answered before Prisma is asked, so the form gets a field to point at
+  // rather than an engine message it can only print.
+  const missing = missingFieldError(body);
+  if (missing) {
+    return res.status(400).json({ code: 'MISSING_FIELDS', field: missing.field, error: missing.error });
+  }
+
   try {
     const created = await prisma.staff.create({
       data: {
@@ -343,8 +390,12 @@ router.post('/', requireAdmin, async (req, res) => {
     // constraint is (schoolId, email), so this can only ever fire on a clash
     // inside the caller's own school — hence "in this school": it must not
     // read as though it could be reporting another school's data.
-    const conflict = uniqueConflictMessage(e);
-    if (conflict) return res.status(409).json({ error: conflict });
+    const conflict = uniqueConflict(e);
+    if (conflict) {
+      // `field` rides along so the form can ring the offending box. See
+      // uniqueConflict above for why the sentence alone is not enough.
+      return res.status(409).json({ code: 'DUPLICATE_FIELD', field: conflict.field, error: conflict.error });
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -371,8 +422,10 @@ router.put('/:id', requireAdmin, async (req, res) => {
     });
     res.json(publicStaff(updated));
   } catch (e) {
-    const conflict = uniqueConflictMessage(e);
-    if (conflict) return res.status(409).json({ error: conflict });
+    const conflict = uniqueConflict(e);
+    if (conflict) {
+      return res.status(409).json({ code: 'DUPLICATE_FIELD', field: conflict.field, error: conflict.error });
+    }
     res.status(400).json({ error: e.message });
   }
 });
@@ -515,12 +568,84 @@ router.patch('/:id/access', requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * DELETE /staff/:id  (admin only) — removes the staff member and everything
+ * hanging off them.
+ *
+ * WHY THIS IS NOT ONE prisma.staff.delete. Two of the four relations pointing at
+ * Staff are ON DELETE RESTRICT in the database, not cascade:
+ *
+ *   WorkRecord.staffId          RESTRICT  -> must be deleted first
+ *   ClassSubjectTeacher.staffId RESTRICT  -> must be deleted first
+ *   Class.classTeacherId        SET NULL  -> the database handles it
+ *   LedgerEntry.staffId         CASCADE   -> the database handles it
+ *
+ * A bare delete therefore threw a foreign-key error for any teacher who had
+ * ever been given a subject or filed a lesson plan — which, on Express 4, is an
+ * unhandled rejection in an async handler: no response is ever sent and the
+ * request hangs until the client times out. Hence both the explicit deletes and
+ * the try/catch.
+ *
+ * ATTENDANCE HAS NO FOREIGN KEY AT ALL. AttendanceRecord points at a person
+ * through a plain `personId` string, so the database cannot clean it up and
+ * nothing would have complained — the rows would simply have stayed behind,
+ * counting toward every attendance percentage derived from them, attached to a
+ * person who no longer exists. It is matched on BOTH the numeric id and the
+ * code: the frontend writes String(staff.id) today, older rows hold the staff
+ * code (see migrate-staff-attendance.js), and a delete that guessed one
+ * convention would silently orphan the other.
+ *
+ * ONE TRANSACTION, so a failure part-way cannot leave a staff member stripped
+ * of their records but still listed.
+ *
+ * THE TEACHER LOGIN NEEDS NO SEPARATE HANDLING: a teacher account IS this row —
+ * passwordHash, isActive and isTeacher are columns on Staff, and teacher sign-in
+ * looks accounts up here. Deleting the row deletes the credentials with it.
+ * Nothing else stores them: PasswordResetToken belongs to AdminUser, and teacher
+ * invites are stateless signed tokens that resolve to a staffId which will no
+ * longer exist.
+ *
+ * TimetableEntry.teacher is deliberately left alone. It is a free-text name for
+ * display, not a reference — blanking it would gut published timetables to
+ * remove a string that harms nothing by remaining.
+ */
 router.delete('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
-  const found = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
+  const found = await prisma.staff.findFirst({
+    where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
+  });
   if (!found) return res.status(404).json({ error: 'Not found' });
-  await prisma.staff.delete({ where: { id: found.id } });
-  res.json(publicStaff(found));
+
+  try {
+    const removed = await prisma.$transaction(async (tx) => {
+      const attendance = await tx.attendanceRecord.deleteMany({
+        where: { schoolId, type: 'staff', personId: { in: [String(found.id), found.code] } },
+      });
+      const workRecords = await tx.workRecord.deleteMany({ where: { schoolId, staffId: found.id } });
+      const subjectAssignments = await tx.classSubjectTeacher.deleteMany({ where: { staffId: found.id } });
+
+      // Salary, bonuses, fines and every payroll run for this person. The FK
+      // would cascade these anyway; doing it inside the transaction keeps the
+      // count reportable and does not depend on the constraint staying CASCADE.
+      const ledgerEntries = await tx.ledgerEntry.deleteMany({ where: { schoolId, staffId: found.id } });
+
+      // Class.classTeacherId is ON DELETE SET NULL, so the classes this person
+      // was class teacher of survive with no class teacher rather than being
+      // deleted along with them.
+      await tx.staff.delete({ where: { id: found.id } });
+
+      return {
+        attendance: attendance.count,
+        workRecords: workRecords.count,
+        subjectAssignments: subjectAssignments.count,
+        ledgerEntries: ledgerEntries.count,
+      };
+    });
+
+    res.json({ ...publicStaff(found), removed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;
