@@ -13,6 +13,22 @@ const {
 } = require('../roleGuards');
 
 const router = express.Router();
+
+/**
+ * '' becomes NULL; undefined stays undefined.
+ *
+ * Staff.idNumber and Staff.email are optional and nullable, and the difference
+ * between the three states matters:
+ *   - undefined  the caller did not mention the field -> Prisma leaves it alone,
+ *                which is what keeps a PATCH-shaped PUT from wiping a value the
+ *                client never sent.
+ *   - '' or ' '  the caller cleared it -> NULL, never the empty string, because
+ *                both columns are under a per-school unique index and two ''s
+ *                collide there.
+ *   - a value    trimmed, so ' 12345 ' and '12345' cannot both be stored and
+ *                defeat that same index.
+ */
+const blankToNull = (v) => (v === undefined ? undefined : (String(v ?? '').trim() || null));
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 // Every uniqueness constraint on Staff is compound on (schoolId, field), so a
@@ -311,10 +327,10 @@ router.post('/', requireAdmin, async (req, res) => {
         code: body.code || genCode('STF'),
         firstName: body.firstName,
         lastName: body.lastName,
-        idNumber: body.idNumber,
+        idNumber: blankToNull(body.idNumber),
         role: body.role,
         phone: body.phone,
-        email: body.email,
+        email: blankToNull(body.email),
         hireDate: body.hireDate ? new Date(body.hireDate) : new Date(),
         salary: Number(body.salary ?? 0),
         isTeacher: body.isTeacher ?? false,
@@ -344,10 +360,10 @@ router.put('/:id', requireAdmin, async (req, res) => {
       data: {
         firstName: body.firstName,
         lastName: body.lastName,
-        idNumber: body.idNumber,
+        idNumber: blankToNull(body.idNumber),
         role: body.role,
         phone: body.phone,
-        email: body.email,
+        email: blankToNull(body.email),
         hireDate: body.hireDate ? new Date(body.hireDate) : undefined,
         salary: body.salary !== undefined ? Number(body.salary) || 0 : undefined,
         isTeacher: body.isTeacher,

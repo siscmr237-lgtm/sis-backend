@@ -84,14 +84,22 @@ model Staff {
   schoolId              Int
   firstName             String
   lastName              String
-  idNumber              String
+  /// OPTIONAL, and nullable rather than defaulting to '': it sits under
+  /// @@unique([schoolId, idNumber]) below, where two empty strings would collide
+  /// and the second staff member without an ID would be refused. NULLs are
+  /// distinct in a unique index, so any number of rows may have none.
+  idNumber              String?
   role                  String
   phone                 String
   // Scoped per school by the @@unique below, NOT globally: schools are separate
   // tenants, so one school having a staff member on an address must never stop
   // another school entering the same person — nor reveal, via a uniqueness
   // error, that the address exists somewhere else in the system.
-  email                 String
+  /// OPTIONAL — see idNumber above for why this is nullable and not ''. A staff
+  /// member with no email simply has no way to be invited to log in:
+  /// POST /staff/:id/invite already refuses when it is missing, and teacher
+  /// sign-in looks accounts up BY email, so a NULL one matches nothing.
+  email                 String?
   hireDate              DateTime
   salary                Int
   isTeacher             Boolean               @default(false)

@@ -1,0 +1,26 @@
+-- ID number and email become OPTIONAL on a staff member.
+--
+-- A school taking on a cook or a cleaner often has neither to hand on the day,
+-- and requiring them meant the person could not be entered at all until it did.
+--
+-- NULLABLE RATHER THAN DEFAULT ''. Both columns sit under a per-school unique
+-- index (see @@unique([schoolId, email]) and @@unique([schoolId, idNumber])),
+-- and two rows holding the same empty string collide on that index. So '' would
+-- have worked for the FIRST staff member without an email and then failed for
+-- every one after with a uniqueness error naming a field the admin deliberately
+-- left blank. Postgres treats NULLs as distinct in a unique index, so any number
+-- of rows may have no email; the indexes still hold for rows that do have one,
+-- which is the constraint worth keeping.
+--
+-- The indexes are therefore left exactly as they are — this only drops the NOT
+-- NULL, which is why there is no index rebuild here.
+--
+-- Nothing is lost and nothing is rewritten: every existing row has a value and
+-- keeps it. Dropping NOT NULL cannot fail on existing data, so this needs no
+-- backfill and is safe to run against a populated table.
+--
+-- Reversing it means re-adding NOT NULL, which would first require filling any
+-- NULLs written in the meantime; there is no automatic way back once a staff
+-- member has been saved without an email.
+ALTER TABLE "Staff" ALTER COLUMN "idNumber" DROP NOT NULL;
+ALTER TABLE "Staff" ALTER COLUMN "email" DROP NOT NULL;
