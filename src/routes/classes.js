@@ -375,6 +375,149 @@ router.post('/levels/:level/fees/apply-to-overridden', async (req, res) => {
   }
 });
 
+// POST /classes/fees/copy
+// Body: { sourceClassLevelId, targetClassLevelIds: [] }
+//
+// Copies one level's WHOLE fee structure onto other levels, replacing whatever
+// each of them had. "Class 1 through Class 6 all charge the same" is the case
+// this exists for; setting it out six times by hand is where the amounts drift
+// apart by a typo.
+//
+// The field names carry class level NAMES — "Class 1" — not integers. There is
+// no ClassLevel table: a level is a string on ClassLevelFee, and the request
+// shape keeps the caller's vocabulary rather than inventing an id that has
+// nothing behind it.
+//
+// REPLACE, not merge. Every existing fee on a target is deleted, taking its
+// charges with it via the FK cascade, and the source's fees are recreated there
+// with fresh ids. A merge would leave a target's own extra category standing
+// after the admin asked for the levels to match, which is the one outcome the
+// button does not promise.
+//
+// Then the same re-bill a normal save runs — syncLevelFeeCharges — so students
+// already enrolled in a target are billed the new structure immediately, on the
+// same terms: nobody is grandfathered, and a student who had paid the old fee in
+// full moves back to Owing.
+//
+// ONE TRANSACTION PER TARGET, and per target only. Delete-then-copy without one
+// is the dangerous half: a failure between them leaves a level charging nothing
+// and its students' charges gone. Wrapping ALL targets together instead would
+// mean one bad level discards five good ones, so each stands alone and the
+// response reports which succeeded and which did not.
+//
+// The source is read ONCE, outside the transactions. It is not among the
+// targets (refused below), so nothing inside them can change it, and re-reading
+// it per target would only add round trips.
+router.post('/fees/copy', async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const { sourceClassLevelId, targetClassLevelIds } = req.body || {};
+
+    const source = String(sourceClassLevelId ?? '').trim();
+    if (!source) return res.status(400).json({ error: 'sourceClassLevelId required' });
+    if (!Array.isArray(targetClassLevelIds) || !targetClassLevelIds.length) {
+      return res.status(400).json({ error: 'targetClassLevelIds array required' });
+    }
+
+    const known = await listSchoolClassLevels(prisma, schoolId);
+    if (!known.includes(source)) {
+      return res.status(404).json({ error: `This school has no class level "${source}".` });
+    }
+
+    // Deduplicated: the same level named twice would run the copy twice, and the
+    // second pass would delete the fees the first had just written.
+    const targets = [...new Set(targetClassLevelIds.map((t) => String(t ?? '').trim()))].filter(Boolean);
+    if (!targets.length) return res.status(400).json({ error: 'targetClassLevelIds array required' });
+
+    // Copying a level onto itself would delete its fees and recreate them under
+    // new ids — losing every charge on the old ids to the cascade, for no
+    // change. Refused rather than skipped, because it means the caller has the
+    // wrong level somewhere.
+    if (targets.includes(source)) {
+      return res.status(400).json({ error: 'A class level cannot be copied onto itself.' });
+    }
+    const unknown = targets.filter((t) => !known.includes(t));
+    if (unknown.length) {
+      return res.status(404).json({ error: `This school has no class level "${unknown[0]}".` });
+    }
+
+    const sourceFees = await prisma.classLevelFee.findMany({
+      where: { schoolId, classLevel: source },
+      select: { name: true, amount: true, group: true, firstInstallmentAmount: true },
+      orderBy: { name: 'asc' },
+    });
+    if (!sourceFees.length) {
+      return res.status(400).json({ error: `${source} has no fees to copy.` });
+    }
+
+    const applied = [];
+    const failed = [];
+
+    for (const target of targets) {
+      try {
+        const rebill = await prisma.$transaction(
+          async (tx) => {
+            await tx.classLevelFee.deleteMany({ where: { schoolId, classLevel: target } });
+            await tx.classLevelFee.createMany({
+              data: sourceFees.map((f) => ({
+                schoolId,
+                classLevel: target,
+                name: f.name,
+                amount: f.amount,
+                group: f.group,
+                firstInstallmentAmount: f.firstInstallmentAmount,
+              })),
+            });
+            // Same rule as a normal save: a level that charges something is not
+            // a free level, so a stale declaration cannot outlive it.
+            if (sourceFees.some((f) => f.amount > 0)) {
+              await clearNoFeesDeclaration(tx, schoolId, target);
+            }
+            return syncLevelFeeCharges(tx, schoolId, target);
+          },
+          // Generous because this is Supabase over the pooler, where each round
+          // trip runs into hundreds of milliseconds and the re-bill makes
+          // several. The default 5s would abort a large level part-way — safely,
+          // since it rolls back, but the admin would see a failure that was only
+          // ever the clock.
+          { timeout: 30000, maxWait: 15000 },
+        );
+        applied.push({ classLevel: target, fees: sourceFees.length, rebill });
+      } catch (e) {
+        // This target rolled back whole; the rest still run. Reported per level
+        // rather than as one error, because "3 of 5 worked" is what the admin
+        // has to act on and a single message cannot say it.
+        failed.push({
+          classLevel: target,
+          error: e.code === 'P2002'
+            ? 'Two fees on this level cannot share a name.'
+            : (e.message || 'Could not copy fees to this level.'),
+        });
+      }
+    }
+
+    // Recomputed after the writes, the same way a save does it, so a caller
+    // driving the setup walk is told where it stands by the shared function
+    // rather than guessing from what it sent.
+    //
+    // BEST EFFORT, and deliberately outside the report. By this line the fees
+    // are already written; letting a failed status read turn that into a 500
+    // would tell the caller nothing happened when several levels have just been
+    // replaced and re-billed. The walk can be re-read at any time — which
+    // classes were changed cannot.
+    let feeSetup = null;
+    try {
+      feeSetup = await feeSetupPayload(prisma, schoolId, source);
+    } catch {
+      feeSetup = null;
+    }
+
+    res.json({ sourceClassLevelId: source, applied, failed, feeSetup });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.class.findFirst({

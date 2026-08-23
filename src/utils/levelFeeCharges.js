@@ -105,16 +105,29 @@ async function syncLevelFeeCharges(prisma, schoolId, classLevel) {
     await prisma.ledgerEntry.createMany({ data: toCreate, skipDuplicates: true });
   }
   if (toUpdate.length) {
-    // Batched rather than interactive: pgbouncer transaction mode does not
-    // support interactive transactions (see the note in onboarding.js).
-    await prisma.$transaction(
+    const updates = () =>
       toUpdate.map((u) =>
         prisma.ledgerEntry.update({
           where: { id: u.id },
           data: { amount: u.amount, description: u.description },
         }),
-      ),
-    );
+      );
+    // Batched rather than interactive: pgbouncer transaction mode does not
+    // support interactive transactions (see the note in onboarding.js).
+    //
+    // UNLESS we are already inside one. A Prisma transaction client has no
+    // $transaction of its own, so the batch would throw there — and it would buy
+    // nothing anyway, because the caller's transaction is already the atomic
+    // unit these updates need. Copying fees between levels is that caller: see
+    // POST /classes/fees/copy, which holds the delete, the copy and this re-bill
+    // in one transaction, so a target level can never be left stripped of its
+    // fees. Awaiting them in order on the open transaction is the same writes
+    // with the same all-or-nothing outcome.
+    if (typeof prisma.$transaction === 'function') {
+      await prisma.$transaction(updates());
+    } else {
+      for (const u of updates()) await u;
+    }
   }
 
   return {
