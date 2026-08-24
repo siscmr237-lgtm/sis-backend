@@ -4,6 +4,86 @@ const { classLevelOf } = require('./classLevels');
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
 /**
+ * Re-attributes a student's PAYMENT rows when their billing moves between the
+ * two fee namespaces, matching old category to new BY NAME.
+ *
+ * WHY THIS HAS TO EXIST. A fee-linked row is keyed `c<classLevelFeeId>` or
+ * `o<studentFeeOverrideId>` (see feeKeyOf), and computeOwingByCategory credits a
+ * payment to a charge only when those keys are EQUAL. Detaching a student
+ * re-keys their charges from `c*` to `o*`; re-attaching them does the reverse.
+ * Payments used to be left behind in the old namespace, so every category read
+ * `owing == charged` while the money still counted in totalPaid — the balance
+ * was right and the breakdown claimed nothing had been paid.
+ *
+ * Name is the only join available: the two namespaces share no ids, and name is
+ * already what setStudentFeeOverride reconciles a snapshot by. It is also what
+ * the operator sees, so "Tuition" following the student to their new "Tuition"
+ * is the result they expect.
+ *
+ * A payment whose category has NO counterpart under the new structure is
+ * untagged rather than left pointing at a dead one: feeKeyOf() then returns null
+ * and the oldest-first fallback spends it, which is already how money with no
+ * known category behaves. Keeping the stale key would strand it forever.
+ *
+ * Runs BEFORE the override rows are deleted in removeStudentFeeOverride, which
+ * matters for more than ordering: LedgerEntry.studentFeeOverride cascades on
+ * delete, so a payment still pointing at an override would be DELETED with it.
+ *
+ * @param to 'override' to move c* -> o*, 'classLevel' to move o* -> c*
+ * @param classLevel the level being re-attached to; only read when to === 'classLevel'
+ */
+async function retagPaymentsBetweenFeeStructures(prisma, schoolId, studentId, to, classLevel = null) {
+  const toOverride = to === 'override';
+
+  const payments = await prisma.ledgerEntry.findMany({
+    where: {
+      schoolId,
+      studentId,
+      type: 'PAYMENT',
+      ...(toOverride ? { classLevelFeeId: { not: null } } : { studentFeeOverrideId: { not: null } }),
+    },
+    select: { id: true, classLevelFeeId: true, studentFeeOverrideId: true },
+  });
+  if (!payments.length) return 0;
+
+  // The name each payment is attributed to today, read from the side it is
+  // leaving. Those rows still exist at this point: a class-level fee belongs to
+  // the class rather than the student, and the override rows are not deleted
+  // until after this runs.
+  const oldIds = [...new Set(payments.map((p) => (toOverride ? p.classLevelFeeId : p.studentFeeOverrideId)))];
+  const oldRows = toOverride
+    ? await prisma.classLevelFee.findMany({ where: { id: { in: oldIds } }, select: { id: true, name: true } })
+    : await prisma.studentFeeOverride.findMany({ where: { id: { in: oldIds } }, select: { id: true, name: true } });
+  const nameOf = new Map(oldRows.map((r) => [r.id, r.name]));
+
+  // What that same name is called on the side they are joining.
+  const newRows = toOverride
+    ? await prisma.studentFeeOverride.findMany({ where: { schoolId, studentId }, select: { id: true, name: true } })
+    : classLevel
+      ? await prisma.classLevelFee.findMany({ where: { schoolId, classLevel }, select: { id: true, name: true } })
+      : [];
+  const idByName = new Map(newRows.map((r) => [r.name, r.id]));
+
+  const updates = [];
+  for (const p of payments) {
+    const name = nameOf.get(toOverride ? p.classLevelFeeId : p.studentFeeOverrideId);
+    const newId = name != null ? idByName.get(name) : undefined;
+    updates.push(prisma.ledgerEntry.update({
+      where: { id: p.id },
+      data: {
+        classLevelFeeId: toOverride ? null : (newId ?? null),
+        studentFeeOverrideId: toOverride ? (newId ?? null) : null,
+      },
+    }));
+  }
+
+  // One transaction: a half-moved set would credit some categories and strand
+  // the rest, which is the state this function exists to prevent.
+  await prisma.$transaction(updates);
+  return updates.length;
+}
+
+/**
  * Billing for a DETACHED student, mirroring syncLevelFeeCharges but over their
  * personal override snapshot.
  *
@@ -31,8 +111,8 @@ async function syncStudentOverrideCharges(prisma, schoolId, studentId) {
 
   // Any structural charge still pointing at a CLASS-level fee belongs to the
   // arrangement the student has left. Removing these is what "detaches" the
-  // billing; payments and one-off charges are never touched, which is precisely
-  // why lowering fees can leave the student Overpaid.
+  // billing; one-off charges are never touched, which is precisely why lowering
+  // fees can leave the student Overpaid.
   await prisma.ledgerEntry.deleteMany({
     where: {
       schoolId,
@@ -42,6 +122,14 @@ async function syncStudentOverrideCharges(prisma, schoolId, studentId) {
       classLevelFeeId: { not: null },
     },
   });
+
+  // Payments FOLLOW their category across, by name. The charges above have just
+  // been re-keyed from c* to o*, and computeOwingByCategory credits a payment to
+  // a charge only when the two keys match — so a payment left on the class-level
+  // key is money that still counts in totalPaid but is credited to nothing, and
+  // every category then reads owing == charged. Detaching a student must not
+  // silently un-pay their fees.
+  await retagPaymentsBetweenFeeStructures(prisma, schoolId, studentId, 'override');
 
   const feeIds = fees.map((f) => f.id);
   const existing = feeIds.length
@@ -151,6 +239,15 @@ async function removeStudentFeeOverride(prisma, schoolId, studentId) {
   });
   if (!student) return null;
 
+  // BEFORE the delete, and not merely for tidiness: LedgerEntry.studentFeeOverride
+  // is onDelete: Cascade, so any PAYMENT still pointing at an override row would
+  // be DELETED along with it — re-attaching a student would erase the record of
+  // money they had handed over. Moving them onto the class-level key first both
+  // saves the rows and keeps each payment credited to the same named fee.
+  await retagPaymentsBetweenFeeStructures(
+    prisma, schoolId, studentId, 'classLevel', classLevelOf(student.class),
+  );
+
   await prisma.studentFeeOverride.deleteMany({ where: { schoolId, studentId } });
   await prisma.student.update({ where: { id: studentId }, data: { feesOverridden: false } });
 
@@ -205,6 +302,7 @@ async function applyLevelFeeToOverriddenStudents(prisma, schoolId, classLevel, f
 }
 
 module.exports = {
+  retagPaymentsBetweenFeeStructures,
   syncStudentOverrideCharges,
   setStudentFeeOverride,
   removeStudentFeeOverride,
