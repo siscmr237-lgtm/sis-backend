@@ -82,7 +82,7 @@ router.put('/me/password', async (req, res) => {
 });
 
 // ── The school list ─────────────────────────────────────────────────────────
-// READ-ONLY, and narrow on purpose: name, signup date, student count. No
+// READ-ONLY, and narrow on purpose: name, abbreviation, signup date, counts. No
 // student names, no fee figures, no staff pay. The count comes from a _count
 // aggregate rather than by loading students, so the rows never exist in memory
 // and cannot be widened by accident later.
@@ -92,6 +92,12 @@ router.get('/schools', async (req, res) => {
       select: {
         id: true,
         name: true,
+        // The list column shows this rather than the full name, which ran to
+        // two lines and pushed every other column off a narrow screen. The name
+        // stays selected: it is the row's hover title, and the detail page is
+        // reached from here, so the console must still be able to say which
+        // school an abbreviation belongs to without a second request.
+        abbreviation: true,
         // Where each school stands in signing up. A status, not any part of
         // the school's own data, which is why it is allowed through a select
         // this deliberately narrow.
@@ -107,6 +113,7 @@ router.get('/schools', async (req, res) => {
     res.json(schools.map((s) => ({
       id: s.id,
       name: s.name,
+      abbreviation: s.abbreviation,
       registrationStatus: s.registrationStatus,
       signedUpAt: s.adminUser?.createdAt ?? null,
       studentCount: s._count.Student,
