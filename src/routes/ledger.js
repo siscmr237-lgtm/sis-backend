@@ -6,7 +6,8 @@ const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
 const { FEE_GROUPS } = require('../utils/feeCategories');
-const { computeOwingByCategory } = require('../utils/feesStatus');
+const { computeOwingByCategory, computeFeesStatusForStudents } = require('../utils/feesStatus');
+const { feeDriveSignature } = require('../utils/proprietor');
 const { getStudentFeeStructure, feeKeyOf, standaloneChargeKey } = require('../utils/studentFees');
 const {
   STAFF_DEBT_CATEGORIES,
@@ -64,6 +65,227 @@ router.get('/academic-years', requireAdmin, async (req, res) => {
       orderBy: { academicYear: 'desc' },
     });
     res.json(rows.map(r => r.academicYear));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ledger/fee-drive — every student who still owes money, with the three
+// optional filters the Fee Drive page offers, plus everything a Fee Drive letter
+// prints. One request answers the whole page AND its PDF.
+//
+// WHY THE SCHOOL AND PROPRIETOR COME BACK FROM HERE. The letter names the
+// school, quotes its motto, states the academic year and term, and is signed
+// with the proprietor's honorific and initials. Every one of those has to be
+// live — a letter that reaches a parent with last term's label on it is wrong in
+// a way nobody notices until it has been sent. The frontend does keep a copy of
+// the school in localStorage, but it is written at login and at each settings
+// save, so a session left open across a term change holds a stale term; and the
+// proprietor's name is on AdminUser, which is not in that copy at all. So the
+// server sends what the letter needs, read on this request.
+//
+// THIS BALANCE IS NOT SCOPED TO THE ACADEMIC YEAR OR TERM, and that is a
+// decision rather than an omission.
+//
+// A structural fee charge is written ONCE per (student, fee) — the partial
+// unique index LedgerEntry_structural_fee_charge_key, which does not include
+// academicYear or term — and syncLevelFeeCharges stamps the period that was
+// current when the row was first created, updating only amount/description
+// afterwards. So a school that configured its fees in Term 1 has every
+// structural charge stamped 'Term 1' for as long as those fees exist. Filtering
+// this query by the CURRENT term would therefore drop the charges belonging to
+// exactly the students it is meant to find, compute a balance of zero, and
+// return an empty page — or, worse, letters quoting a wrong figure to a parent.
+//
+// Instead the balance is computed the way every other screen in this app
+// computes it: all-time, through computeFeesStatusForStudents, the same call
+// GET /students/ makes. So the amount on the letter equals the amount on the
+// student's own profile and the amount the bursar would take at the desk, and a
+// parent holding the letter cannot be told a different number from the one on
+// the screen. The school's live year and term are returned alongside and belong
+// to the letterhead — they are the letter's DATELINE, not a filter on the money.
+router.get('/fee-drive', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+
+    // Absent is not the same as present-and-false. A checkbox nobody has ticked
+    // must not narrow anything, so only the affirmative spellings turn a filter
+    // on — '', 'false' and '0' all read as off, which is what an empty query
+    // string from a cleared form sends.
+    const isOn = (v) => v === '1' || v === 'true' || v === 'yes';
+    // NaN, not 0, for anything unparseable: a blank amount box has to leave that
+    // bound open rather than pin it to zero, which would filter out every
+    // student below it. Commas and spaces are stripped because the field is a
+    // currency amount and "50,000" is how somebody writes one.
+    const amount = (v) => {
+      if (v === undefined || v === null || String(v).trim() === '') return NaN;
+      const n = Number(String(v).replace(/[\s,]/g, ''));
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    const onlyMissedFirstInstalment = isOn(req.query.firstInstalment);
+    const onlyNoPayment = isOn(req.query.noPayment);
+    const minOwing = amount(req.query.minOwing);
+    const maxOwing = amount(req.query.maxOwing);
+
+    // ONE STUDENT, for the single letter printed from their own Finance tab.
+    //
+    // The same endpoint rather than a second one, because a letter for one
+    // student has to say exactly what that student's letter in the batch would
+    // say — same balance, same period, same signature. A separate route would be
+    // a second chance to compute one of them differently.
+    //
+    // It narrows the QUERY rather than filtering the result: without it, printing
+    // one letter would compute every student in the school's balance and throw
+    // all but one away.
+    const oneStudent = String(req.query.student ?? '').trim();
+
+    const [school, students] = await Promise.all([
+      prisma.school.findUnique({
+        where: { id: schoolId },
+        select: {
+          name: true,
+          motto: true,
+          logo: true,
+          abbreviation: true,
+          academicYear: true,
+          currentTerm: true,
+          autoTermEnabled: true,
+          proprietorGender: true,
+          // The proprietor IS the account that owns the school — there is no
+          // separate name column, on purpose. See src/utils/proprietor.js.
+          adminUser: { select: { name: true } },
+        },
+      }),
+      // schoolId scopes this, and it is the only scope that applies: the Fee
+      // Drive is an admin-only view of the whole school, so there is no teacher
+      // narrowing to layer on top.
+      //
+      // The ?student= arm is ANDed with schoolId, never substituted for it, so a
+      // guessed code from another school's sequence matches nothing rather than
+      // returning that school's student. Matched on code or numeric id, the same
+      // pair every other student lookup in this file accepts.
+      prisma.student.findMany({
+        where: {
+          schoolId,
+          ...(oneStudent
+            ? { OR: [{ code: oneStudent }, { id: parseInt(oneStudent, 10) || 0 }] }
+            : {}),
+        },
+        select: { id: true, code: true, firstName: true, lastName: true, class: true, feesOverridden: true },
+      }),
+    ]);
+    if (!school) return res.status(404).json({ error: 'School not found' });
+
+    // Two queries for the whole school, not a pair per student — and the ONLY
+    // implementation of what a student owes and whether they have met their
+    // first instalment. A second one written here is how the letter and the
+    // profile would come to disagree.
+    const statuses = await computeFeesStatusForStudents(prisma, schoolId, students);
+
+    const rows = [];
+    for (const s of students) {
+      const st = statuses.get(s.id);
+      if (!st) continue;
+      const balance = st.balance ?? 0;
+
+      // The page is "who owes money", so this is the one non-optional
+      // condition. A settled or overpaid student is never a row here, whatever
+      // the filters say.
+      if (!(balance > 0)) continue;
+
+      // NULL IS NOT FALSE. firstInstallmentMet is null when the student's level
+      // has no first-instalment rule configured at all — see
+      // computeStudentFeesStatus, which returns null precisely so that "not
+      // configured" can be told apart from "configured and not met". Treating it
+      // as not-met would put a student on a list of people who failed a
+      // requirement their school never set, and then post their parent a letter
+      // about it.
+      if (onlyMissedFirstInstalment && st.firstInstallmentMet !== false) continue;
+
+      // Paid absolutely nothing. Read off the total rather than the status
+      // string so this cannot drift if those labels are ever reworded.
+      if (onlyNoPayment && (st.totalPaid ?? 0) > 0) continue;
+
+      // Inclusive at both ends: a From of 50,000 includes a student owing
+      // exactly 50,000, which is what somebody typing a round number means. The
+      // two bounds are independent, so either may be given on its own.
+      if (Number.isFinite(minOwing) && balance < minOwing) continue;
+      if (Number.isFinite(maxOwing) && balance > maxOwing) continue;
+
+      rows.push({
+        // withIdAsCode's convention, applied by hand because this row is not a
+        // bare student record: the frontend's `id` is the human code, and that
+        // is what a profile URL is built from.
+        id: s.code,
+        firstName: s.firstName,
+        lastName: s.lastName,
+        class: s.class,
+        classLevel: classLevelOf(s.class),
+        totalCharged: st.totalCharged ?? 0,
+        totalPaid: st.totalPaid ?? 0,
+        balance,
+        firstInstallmentMet: st.firstInstallmentMet ?? null,
+        paymentStatus: st.paymentStatus ?? null,
+      });
+    }
+
+    // Class then name — the order the PDF's pages come out in, decided here so
+    // that the table on screen and the stack of letters cannot end up sorted
+    // differently. localeCompare with numeric so "Form 10" sorts after "Form 9"
+    // rather than between "Form 1" and "Form 2".
+    rows.sort(
+      (a, b) =>
+        String(a.class ?? '').localeCompare(String(b.class ?? ''), undefined, { numeric: true, sensitivity: 'base' }) ||
+        String(a.firstName ?? '').localeCompare(String(b.firstName ?? ''), undefined, { sensitivity: 'base' }) ||
+        String(a.lastName ?? '').localeCompare(String(b.lastName ?? ''), undefined, { sensitivity: 'base' }),
+    );
+
+    // The same resolver every ledger write uses to stamp its period, so the
+    // letterhead names the period this school is actually operating in.
+    //
+    // NORMALISED PAST 'Holiday' HERE, and only here. That resolver promises a
+    // non-null term and delivers one, but null is not the only way a school can
+    // report no active term: a school with autoTermEnabled off can have the
+    // literal string 'Holiday' stored in currentTerm, which passes the null
+    // check and comes back as-is. The frontend's copy of the resolver already
+    // maps that case to Term 3; the backend's does not, so a letterhead reading
+    // "Term: Holiday" is reachable, and it is not a term a fee notice should
+    // claim to be about.
+    //
+    // Fixed at this call site rather than in the shared resolver on purpose:
+    // that function stamps academicYear/term onto every ledger entry the app
+    // writes, and changing what it returns would change how money is filed
+    // across the whole system — far beyond a letterhead. Term 3 is the same
+    // fallback the frontend uses and means the same thing: the term that has
+    // just finished, which is the one a fee drive in the holidays is chasing.
+    const resolvedPeriod = resolveEffectiveSchoolTerm(school);
+    const academicYear = resolvedPeriod.academicYear;
+    const term = resolvedPeriod.term === 'Holiday' ? 'Term 3' : resolvedPeriod.term;
+
+    res.json({
+      academicYear,
+      term,
+      school: {
+        name: school.name,
+        motto: school.motto,
+        logo: school.logo,
+        abbreviation: school.abbreviation,
+      },
+      proprietor: {
+        // Sent already assembled. The honorific rule (FEMALE goes to "Mme",
+        // MALE to "Sir", unset to no title at all) lives in one place on the
+        // server rather than being reimplemented by every caller that draws a
+        // letter.
+        signature: feeDriveSignature(school.adminUser?.name, school.proprietorGender),
+        gender: school.proprietorGender ?? null,
+      },
+      // Totals over the FILTERED set, so the page can say what this drive covers
+      // without re-adding the column client-side.
+      totalOwing: rows.reduce((n, r) => n + r.balance, 0),
+      count: rows.length,
+      students: rows,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

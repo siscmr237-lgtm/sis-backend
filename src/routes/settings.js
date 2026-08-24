@@ -69,6 +69,27 @@ router.put('/', async (req, res) => {
       });
     }
 
+    // The proprietor's gender is a Postgres enum, so an unrecognised string is
+    // rejected by the database itself — as a 500 with a driver message in it,
+    // which tells the person at the screen nothing. Checked here so the answer
+    // is a 400 that names the problem.
+    //
+    // NULL AND '' ARE BOTH ALLOWED, and both mean "not set": the field starts
+    // unset for every existing school, so clearing it again has to be possible.
+    // The empty string is normalised to null rather than passed through, because
+    // '' is not a member of the enum and would be refused as invalid — a select
+    // reset to its placeholder sends exactly that.
+    if (Object.prototype.hasOwnProperty.call(data, 'proprietorGender')) {
+      if (data.proprietorGender === '' || data.proprietorGender === null) {
+        data.proprietorGender = null;
+      } else if (data.proprietorGender !== 'MALE' && data.proprietorGender !== 'FEMALE') {
+        return res.status(400).json({
+          code: 'INVALID_PROPRIETOR_GENDER',
+          error: "Proprietor's gender must be either Male or Female.",
+        });
+      }
+    }
+
     const updated = await prisma.school.update({
       where: { id: schoolId },
       data,

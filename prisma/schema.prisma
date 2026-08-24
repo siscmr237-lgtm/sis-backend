@@ -446,6 +446,19 @@ enum RegistrationStatus {
   APPROVED
 }
 
+/// The proprietor's gender, and the only thing it decides: the honorific in
+/// front of their initials on generated correspondence — "Mme" for FEMALE,
+/// "Sir" for MALE. See feeDriveSignature in src/utils/proprietor.js.
+///
+/// NULL (the column is optional) means nobody has said yet, and that is a
+/// third state rather than a missing one: the signature drops the honorific and
+/// prints the bare initials instead of putting a title on a letter that no one
+/// chose, over a named person's initials.
+enum ProprietorGender {
+  MALE
+  FEMALE
+}
+
 model School {
   id                        Int                  @id @default(autoincrement())
   name                      String
@@ -470,6 +483,12 @@ model School {
   currentTerm               String
   autoTermEnabled           Boolean              @default(true)
   motto                     String?
+  /// Only ever read to build the honorific on a Fee Drive letter — see the
+  /// ProprietorGender enum above. The proprietor's NAME is deliberately not
+  /// duplicated here: it is adminUser.name, the account that owns this school,
+  /// and a copy would be a second answer to "who is the proprietor?" that
+  /// nothing keeps in step with the first.
+  proprietorGender          ProprietorGender?
   address                   String?
   schoolType                SchoolType?
   uniformColors             Json                 @default("{\"shirt\":null,\"trouser\":null,\"gown\":null}")
