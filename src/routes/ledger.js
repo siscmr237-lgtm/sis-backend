@@ -151,6 +151,154 @@ router.get('/student-summary', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /ledger/student-transactions — paginated, filterable, newest-first list of
+// INDIVIDUAL student ledger entries, for the Finance page's "Student
+// Transactions" table.
+//
+// WHY THIS EXISTS ALONGSIDE /student-summary. That endpoint answers "what does
+// each student owe?" — one row per student, with their charged/paid/balance
+// rolled up. This one answers "what happened, most recently first?" — one row
+// per transaction, across every student. The filter panel above the table is
+// shared, so the query parameters are deliberately identical to
+// /student-summary's; only the unit of a row differs.
+//
+// FEE-STRUCTURE BILLING IS NOT A TRANSACTION HERE.
+//
+// isFeeStructureCharge marks the one CHARGE row that bills a fee STRUCTURE, and
+// it is always machine-written: syncLevelFeeCharges writes it for a student who
+// follows their class level, syncStudentOverrideCharges for a detached student
+// who has their own. Nobody records one, and — the part that matters for a table
+// ordered by date — both writers stamp entryDate with the moment the sync ran,
+// not a date anyone chose. So every one of them lands at the top of this list
+// together, on whatever day the fees were last saved, pushing the payments an
+// admin actually took below them.
+//
+// This is deliberately STRICTER than the 'fees' bucket of /transactions, which
+// excludes only the class-level half (isFeeStructureCharge AND classLevelFeeId).
+// That condition was written to keep a detached student's override charges
+// visible on the grounds that they are unique to that one student — but they are
+// written by a sync on the same terms as the class-level ones, sync-stamped date
+// included, so on a date-ordered list they behave identically. The two tables
+// therefore disagree about detached students' structural charges, and this one
+// is the side that answers the question it is asked.
+//
+// A HAND-RECORDED charge is untouched by this and belongs here: a fine, a trip,
+// a replaced book, or an extra charge against a fee category all carry
+// isFeeStructureCharge = false, whichever fee they point at.
+router.get('/student-transactions', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 25));
+    const { q, class: cls, dateFrom, dateTo, academicYear, term } = req.query;
+
+    // The search box matches a student, not a transaction: an admin types a
+    // name or a class, and wants that person's activity. Left off the relation
+    // filter entirely when empty so the query never carries a vacuous EXISTS.
+    const studentFilter = {
+      ...(cls && cls !== 'all' ? { class: String(cls) } : {}),
+      ...(q
+        ? {
+            OR: [
+              { firstName: { contains: String(q), mode: 'insensitive' } },
+              { lastName: { contains: String(q), mode: 'insensitive' } },
+              { code: { contains: String(q), mode: 'insensitive' } },
+              { class: { contains: String(q), mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+    const where = {
+      schoolId,
+      studentId: { not: null },
+      isFeeStructureCharge: false,
+      ...(Object.keys(studentFilter).length ? { student: studentFilter } : {}),
+      ...(dateFrom || dateTo
+        ? {
+            entryDate: {
+              ...(dateFrom ? { gte: new Date(String(dateFrom)) } : {}),
+              ...(dateTo ? { lte: new Date(String(dateTo)) } : {}),
+            },
+          }
+        : {}),
+      ...(academicYear && academicYear !== 'all' ? { academicYear: String(academicYear) } : {}),
+      ...(term && term !== 'all' ? { term: String(term) } : {}),
+    };
+
+    const [total, entries] = await Promise.all([
+      prisma.ledgerEntry.count({ where }),
+      prisma.ledgerEntry.findMany({
+        where,
+        // Newest transaction by any student first. The id tie-break keeps rows
+        // sharing a date in most-recently-recorded order instead of an
+        // arbitrary one, and makes the pages stable — the same tie-break
+        // /transactions uses.
+        orderBy: [{ entryDate: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: {
+          // The whole student record, because the Student cell links through to
+          // the profile and that screen reads the passed-in student rather than
+          // refetching it. Rows repeat a student, so this repeats too; a page is
+          // 25 rows, which is not worth a second round trip to normalise.
+          student: true,
+          category: { select: { name: true } },
+          classLevelFee: { select: { name: true } },
+          studentFeeOverride: { select: { name: true } },
+          settles: { select: { description: true } },
+        },
+      }),
+    ]);
+
+    // WHICH FEE EACH ROW IS FOR, resolved from the row's own relations.
+    //
+    // `category` (ChargeCategory) is NOT how a student fee payment is tagged —
+    // POST /payment writes categoryId: null on purpose and records the fee in
+    // one of classLevelFeeId / studentFeeOverrideId / settlesEntryId instead
+    // (see feeKeyOf). So reading category.name alone gives null for every
+    // payment, which is the bug that left the financial-sheet PDF's Fee column
+    // blank.
+    //
+    // GET /ledger/student/:id resolves this by name through the student's
+    // current fee structure. Here the joins are followed directly instead, for
+    // two reasons: a page spans many students, so there is no one structure to
+    // look up; and a fee the student no longer follows — they changed class, or
+    // were detached since — still names itself correctly, where a lookup
+    // against their current structure would come back empty.
+    const rows = entries.map((e) => {
+      const category =
+        e.classLevelFee?.name ??
+        e.studentFeeOverride?.name ??
+        // A standalone charge is its own category, named by the description it
+        // was raised with — what computeOwingByCategory calls it too. A payment
+        // against one reaches that name through settlesEntryId.
+        e.settles?.description ??
+        e.category?.name ??
+        (e.type === 'CHARGE' ? e.description : null);
+
+      return {
+        id: e.code,
+        type: e.type,
+        student: withIdAsCode(e.student),
+        // Denormalised off the student so the Class column does not depend on
+        // the caller digging into the nested record.
+        studentClass: e.student?.class ?? null,
+        category,
+        description: e.description,
+        amount: e.amount,
+        entryDate: e.entryDate,
+        // Null, never a dash: the placeholder is the reader's decision, and a
+        // charge legitimately has no payment method.
+        paymentMethod: e.paymentMethod ?? null,
+      };
+    });
+
+    res.json({ rows, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /ledger/transactions — paginated, bucketed transaction-level list for
 // the school-wide Finance page's "School Transactions" table. Merges
 // LedgerEntry rows (student + staff) with the standalone Expense table into
