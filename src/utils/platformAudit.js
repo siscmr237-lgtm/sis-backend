@@ -30,6 +30,17 @@ const ACTIONS = {
   ADMIN_ENABLED: 'platform_user.enabled',
   PASSWORD_CHANGED_SELF: 'password.changed.self',
   PASSWORD_CHANGED_OTHER: 'password.changed.other',
+  /**
+   * The console's home page was loaded — the platform-wide totals and the
+   * twelve-month collection line.
+   *
+   * Its own action rather than folding into SCHOOLS_VIEWED, because it is not
+   * the same read: that one names every school, this one returns aggregates
+   * over all of them and can name nobody. Keeping them apart is what lets
+   * "who looked at the schools?" stay answerable without every landing on the
+   * console counting as one.
+   */
+  ANALYTICS_VIEWED: 'analytics.viewed',
   SCHOOLS_VIEWED: 'schools.viewed',
   SCHOOL_VIEWED: 'school.viewed',
   SCHOOL_STAFF_VIEWED: 'school.staff.viewed',
