@@ -1,6 +1,6 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
-const { findAdminByPhone } = require('../utils/phone');
+const { findAdminByPhone, phoneVariants } = require('../utils/phone');
 const bcrypt = require('bcryptjs');
 const { authMiddleware } = require('../auth');
 const { validatePassword } = require('../utils/validatePassword');
@@ -166,7 +166,15 @@ router.post('/login', async (req, res) => {
         // same more-than-one-school ambiguity handled below.
         OR: [
           { email: { equals: identifier, mode: 'insensitive' } },
-          { phone: identifier },
+          // Every shape this same number can be stored in, rather than the one
+          // string that was typed. Staff.phone is written by the same E.164
+          // phone field as the admin's, so an exact comparison found a teacher
+          // only if they typed the "+237" back — which is exactly what the
+          // login form does not ask for. phoneVariants returns an EMPTY list
+          // for anything not WRITTEN like a phone number - an email, whatever
+          // stray digits it contains - and an empty `in` matches nothing, so
+          // the clause above is left to answer for those.
+          { phone: { in: phoneVariants(identifier) } },
         ],
       },
       include: { school: true },

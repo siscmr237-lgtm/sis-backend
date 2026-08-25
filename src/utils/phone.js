@@ -31,10 +31,46 @@ const NATIONAL_LENGTH = { 237: 9, 234: 10, 1: 10 };
 const digitsOnly = (value) => String(value ?? '').replace(/\D/g, '');
 
 /**
+ * The shortest national number these lookups will answer for.
+ *
+ * A floor, not a length rule. The real lengths are in NATIONAL_LENGTH, and this
+ * sits below the shortest of them on purpose, so no legitimate row is put out of
+ * reach: the one AdminUser holding a pre-2010 eight-digit Cameroon number still
+ * resolves. "6" does not.
+ *
+ * It is needed because the login field takes a phone number OR an email, so
+ * every email typed into it is also handed to these functions, and digits
+ * scattered through an address are not a phone number. With no floor,
+ * "maxateh6@gmail.com" offers "6" as something to match an account on.
+ */
+const MIN_NATIONAL_DIGITS = 7;
+
+/** Characters a phone number can be written with. Notably NOT letters or "@". */
+const PHONE_CHARS = /^[0-9+\-() .]+$/;
+
+/**
+ * Whether this string is being offered AS a phone number at all.
+ *
+ * The test is on the shape of the whole string, not on the digits inside it,
+ * because "contains digits" is not the question. An email address is a valid
+ * value on the login path and routinely carries digits; reducing one to those
+ * digits invents a phone number nobody typed, and an invented identifier is one
+ * that can resolve to somebody else's account.
+ */
+function looksLikePhone(value) {
+  const raw = String(value ?? '').trim();
+  return raw !== '' && PHONE_CHARS.test(raw);
+}
+
+/**
  * The national part of whatever was supplied — dial code and trunk zero removed.
  * Longest code first, so 234 is never read as 23 followed by a digit.
  */
 function nationalDigits(value) {
+  // Empty for anything not written like a phone number. This is what keeps an
+  // email out of every lookup below: each treats an empty national part as "no
+  // answer" and stops there.
+  if (!looksLikePhone(value)) return '';
   const digits = digitsOnly(value);
   if (!digits) return '';
   for (const code of [...DIAL_CODES].sort((a, b) => b.length - a.length)) {
@@ -51,7 +87,7 @@ function nationalDigits(value) {
  */
 function phoneVariants(value) {
   const national = nationalDigits(value);
-  if (!national) return [];
+  if (national.length < MIN_NATIONAL_DIGITS) return [];
   const out = new Set([national, `0${national}`]);
   for (const code of DIAL_CODES) {
     if (NATIONAL_LENGTH[code] === national.length) {
@@ -103,9 +139,19 @@ async function adminIdsByPhone(prisma, value, limit = 2) {
   if (!national) return [];
   const candidates = phoneVariants(value).map(digitsOnly).filter(Boolean);
   if (!candidates.length) return [];
+  // [^0-9] rather than \D, and that is not a style choice. This is a TAGGED
+  // TEMPLATE, so a backslash here is read by JavaScript before Postgres ever
+  // sees it: `\D` is a NonEscapeCharacter escape whose cooked value is the
+  // single letter D, and the query that shipped was therefore stripping literal
+  // "D" characters from the column instead of non-digits. Bare national rows
+  // survived that unchanged and matched anyway; every E.164 row the phone field
+  // now writes kept its leading "+" and could never equal a digits-only
+  // candidate — so signing in with the phone number reported no account, for an
+  // account that was sitting right there. A character class needs no escaping,
+  // so it cannot be silently eaten a second time.
   const rows = await prisma.$queryRaw`
     SELECT id FROM "AdminUser"
-    WHERE regexp_replace("phoneNumber", '\D', '', 'g') IN (${Prisma.join(candidates)})
+    WHERE regexp_replace("phoneNumber", '[^0-9]', '', 'g') IN (${Prisma.join(candidates)})
     LIMIT ${limit}
   `;
   return rows.map((r) => Number(r.id));
@@ -124,6 +170,6 @@ async function findAdminByPhone(prisma, value) {
 }
 
 module.exports = {
-  digitsOnly, nationalDigits, isCompletePhone, phoneVariants,
+  digitsOnly, nationalDigits, looksLikePhone, isCompletePhone, phoneVariants,
   adminIdsByPhone, findAdminByPhone,
 };
