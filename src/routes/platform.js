@@ -906,4 +906,40 @@ router.get('/audit', requirePlatformFounder, async (req, res) => {
   res.json(entries);
 });
 
+/**
+ * NOTHING BELOW THIS LINE — an unmatched /platform/* path stops here.
+ *
+ * Without this it did not stop. Express calls next() when a router matches no
+ * route, so the request left this file and carried on down src/app.js into
+ * `app.use(requireSchoolActor)` — the school API's choke point — which saw a
+ * platform token and answered:
+ *
+ *     403  A team account cannot access school data.
+ *
+ * Every word of which is true, and none of which is the answer. The caller
+ * asked for a PLATFORM path; the school guard is merely the next thing in the
+ * chain that had an opinion about a platform token. What actually happened is
+ * that the endpoint does not exist on this build.
+ *
+ * That distinction is not academic — it is how this was found. The console
+ * shipped a page calling GET /platform/analytics against a backend deployed
+ * before that route existed, and the screen reported a PERMISSIONS failure for
+ * what was really a version skew. Anybody reading that message goes looking at
+ * roles and guards, which is the one place the fault was not.
+ *
+ * So the router now answers for its own namespace: if the path is under
+ * /platform and this file does not define it, that is a 404 and it says so.
+ * The school guard keeps its message for the case it is actually about — a
+ * team token reaching for school data — which is now the only way to see it.
+ *
+ * router.use rather than router.all('*'): a terminal middleware needs no path
+ * pattern and so cannot be tripped up by one.
+ */
+router.use((req, res) => {
+  res.status(404).json({
+    code: 'NO_SUCH_ENDPOINT',
+    error: `This server has no ${req.method} /platform${req.path}. That usually means the console is a newer build than the API it is talking to.`,
+  });
+});
+
 module.exports = router;
