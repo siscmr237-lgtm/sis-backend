@@ -81,6 +81,161 @@ router.put('/me/password', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── The console's home page ─────────────────────────────────────────────────
+/**
+ * GET /platform/analytics — every headline figure on the platform, and the
+ * twelve-month collection line beneath them.
+ *
+ * AGGREGATES ONLY, AND PLATFORM-WIDE ONLY. Every number here is a COUNT or a
+ * SUM over all schools at once. There is no per-school breakdown, no student or
+ * staff name, no single amount anybody handed over, and no way to ask this route
+ * for one school — it takes no parameters at all. That is the same line
+ * GET /schools draws with its `_count` selects, held one level further out: a
+ * figure that describes the platform reveals nothing about any school in it, and
+ * a route that cannot be narrowed cannot be narrowed by accident later either.
+ *
+ * WHAT EACH FIGURE MEANS, since three of them have more than one defensible
+ * reading and the cards above them have room for only a word or two:
+ *
+ *   schools        Every School row, whatever its registration status, with the
+ *                  APPROVED and PENDING splits alongside. Counting only the
+ *                  approved ones would make the number disagree with the Schools
+ *                  list, which shows them all.
+ *
+ *   students /     Every row. Neither model has a withdrawn/left flag — see
+ *   staff          Student and Staff in schema.prisma — so "enrolled now" is not
+ *                  a question the schema can answer, and this does not pretend
+ *                  to. teachers is the isTeacher subset of staff.
+ *
+ *   feesPaid       Student PAYMENT rows only, summed. NOT all PAYMENT rows:
+ *                  payroll and other staff payments are money going OUT, and
+ *                  adding them to fees collected would report the wage bill as
+ *                  income. `studentId IS NOT NULL` is the same discriminator
+ *                  /dashboard/recent-activity uses for money in.
+ *
+ *   feesCharged    The other half of that figure, so the card can say what share
+ *                  of what was billed has actually come in. Student CHARGE rows,
+ *                  including the machine-written fee-structure ones — those ARE
+ *                  the billing, and excluding them would leave the collection
+ *                  rate measured against fines and trips alone.
+ *
+ *   transactions   What this codebase already means by a transaction, summed
+ *                  across the two tables the school-side Finance page shows:
+ *                  every ledger entry that is not a machine-written fee-
+ *                  structure charge, plus every expense. isFeeStructureCharge
+ *                  rows are excluded for the reason given at
+ *                  GET /ledger/student-transactions — nobody records one, they
+ *                  are written by the level-fee sync, and counting them would
+ *                  report a school saving its fee structure as thousands of
+ *                  transactions.
+ *
+ * THE LINE. Twelve buckets ending with the current month, each one the student
+ * fee payments whose entryDate falls in it. Bucketed by entryDate — when the
+ * money moved — and not createdAt, which is when somebody got round to typing it
+ * in; a payment taken in July and entered in August belongs to July. Empty
+ * months are filled in here rather than left out, so the chart draws a line that
+ * dips to zero instead of one that skips a month and slopes straight through it.
+ *
+ * date_trunc runs on a TIMESTAMP(3) column with no timezone, so the buckets are
+ * UTC month boundaries and the window start below is built in UTC to match.
+ */
+router.get('/analytics', async (req, res) => {
+  try {
+    const MONTHS = 12;
+
+    // First instant of the month MONTHS-1 back, so the window is that month
+    // through the current one inclusive. The month arithmetic is left to the
+    // Date constructor, which normalises a negative month into the year before.
+    const now = new Date();
+    const windowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (MONTHS - 1), 1));
+
+    const [
+      schoolsByStatus,
+      students,
+      staff,
+      teachers,
+      studentPayments,
+      studentCharges,
+      ledgerTransactions,
+      expenses,
+      monthlyRows,
+    ] = await Promise.all([
+      // One grouped count rather than three separate ones: the total is the sum
+      // of the groups, so the headline and the splits under it cannot disagree.
+      prisma.school.groupBy({ by: ['registrationStatus'], _count: { _all: true } }),
+      prisma.student.count(),
+      prisma.staff.count(),
+      prisma.staff.count({ where: { isTeacher: true } }),
+      prisma.ledgerEntry.aggregate({
+        where: { type: 'PAYMENT', studentId: { not: null } },
+        _sum: { amount: true },
+        _count: { _all: true },
+      }),
+      prisma.ledgerEntry.aggregate({
+        where: { type: 'CHARGE', studentId: { not: null } },
+        _sum: { amount: true },
+      }),
+      prisma.ledgerEntry.count({ where: { isFeeStructureCharge: false } }),
+      prisma.expense.count(),
+
+      // Raw SQL because Prisma's groupBy has no month bucket — it groups by a
+      // column, not by an expression over one. SUM() over an integer column is a
+      // bigint in Postgres and arrives as a JS BigInt, which JSON.stringify
+      // refuses outright, so it is cast down at the boundary below.
+      prisma.$queryRaw`
+        SELECT to_char(date_trunc('month', "entryDate"), 'YYYY-MM') AS month,
+               SUM(amount)::bigint AS amount,
+               COUNT(*)::int AS payments
+        FROM "LedgerEntry"
+        WHERE type = 'PAYMENT'
+          AND "studentId" IS NOT NULL
+          AND "entryDate" >= ${windowStart}
+        GROUP BY 1
+        ORDER BY 1
+      `,
+    ]);
+
+    const byStatus = (s) => schoolsByStatus.find((r) => r.registrationStatus === s)?._count?._all ?? 0;
+    const schools = schoolsByStatus.reduce((sum, r) => sum + (r._count?._all ?? 0), 0);
+
+    // Keyed by the same 'YYYY-MM' the SQL produced, so filling the gaps below is
+    // a lookup rather than a date comparison.
+    const found = new Map(monthlyRows.map((r) => [r.month, r]));
+    const feesByMonth = [];
+    for (let i = 0; i < MONTHS; i += 1) {
+      const d = new Date(Date.UTC(windowStart.getUTCFullYear(), windowStart.getUTCMonth() + i, 1));
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      const row = found.get(key);
+      feesByMonth.push({
+        month: key,
+        amount: row ? Number(row.amount) : 0,
+        payments: row ? row.payments : 0,
+      });
+    }
+
+    await recordAudit(req, ACTIONS.ANALYTICS_VIEWED, { detail: { schools } });
+
+    res.json({
+      totals: {
+        schools,
+        schoolsApproved: byStatus('APPROVED'),
+        schoolsPending: byStatus('PENDING'),
+        students,
+        staff,
+        teachers,
+        feesPaid: studentPayments._sum.amount ?? 0,
+        feePayments: studentPayments._count._all,
+        feesCharged: studentCharges._sum.amount ?? 0,
+        transactions: ledgerTransactions + expenses,
+      },
+      feesByMonth,
+    });
+  } catch (e) {
+    console.error('platform /analytics failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not load the dashboard.' });
+  }
+});
+
 // ── The school list ─────────────────────────────────────────────────────────
 // READ-ONLY, and narrow on purpose: name, abbreviation, signup date, counts. No
 // student names, no fee figures, no staff pay. The count comes from a _count
