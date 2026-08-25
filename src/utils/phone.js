@@ -169,7 +169,54 @@ async function findAdminByPhone(prisma, value) {
   return prisma.adminUser.findUnique({ where: { id: ids[0] }, include: { School: true } });
 }
 
+/**
+ * The country a bare national number is assumed to belong to.
+ *
+ * Cameroon, because that is where the schools are and because a number typed
+ * into the student form is overwhelmingly local. Only ever applied when the
+ * stored value carries NO dial code of its own.
+ */
+const DEFAULT_DIAL_CODE = '237';
+
+/**
+ * E.164 ("+237679379134") for anything that can be resolved to exactly one
+ * number, and null for anything that cannot.
+ *
+ * Needed because WhatsApp will only address a number in international form,
+ * while the Parent table holds whatever an admin typed — bare nationals, trunk
+ * zeros, spacing, and now E.164 too since the phone field started composing it.
+ *
+ * The dial-code branch comes FIRST, and that ordering is the whole function: a
+ * stored "+2348012345678" reduced to its national part is ten digits, which is
+ * not Cameroon's nine, and prefixing the default code would produce a
+ * valid-looking Cameroonian number belonging to somebody else entirely. A value
+ * that already says which country it is, is believed.
+ *
+ * Returns null rather than a best guess for the genuinely ambiguous case — a
+ * bare ten-digit national, which fits Nigeria and the US identically and cannot
+ * be told apart. That is a REFUSAL, deliberately, and the callers turn it into
+ * "store this number with its country code". The alternative is sending one
+ * family's fee balance to a stranger on another continent, which is not a
+ * failure a retry fixes.
+ */
+function toE164(value, defaultDialCode = DEFAULT_DIAL_CODE) {
+  if (!looksLikePhone(value)) return null;
+  const digits = digitsOnly(value);
+  if (!digits) return null;
+  // Longest code first, same reason as nationalDigits: 234 must never be read
+  // as 23 followed by a digit.
+  for (const code of [...DIAL_CODES].sort((a, b) => b.length - a.length)) {
+    if (digits.startsWith(code) && digits.length === code.length + NATIONAL_LENGTH[code]) {
+      return `+${digits}`;
+    }
+  }
+  const national = nationalDigits(value);
+  if (NATIONAL_LENGTH[defaultDialCode] !== national.length) return null;
+  return `+${defaultDialCode}${national}`;
+}
+
 module.exports = {
   digitsOnly, nationalDigits, looksLikePhone, isCompletePhone, phoneVariants,
+  toE164, DEFAULT_DIAL_CODE,
   adminIdsByPhone, findAdminByPhone,
 };

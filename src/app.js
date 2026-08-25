@@ -34,6 +34,7 @@ const cronRouter = require('./routes/cron');
 const platformAuthRouter = require('./routes/platformAuth');
 const platformRouter = require('./routes/platform');
 const schoolRouter = require('./routes/school');
+const whatsappRouter = require('./routes/whatsapp');
 
 const app = express();
 
@@ -236,6 +237,11 @@ app.use('/dashboard', requireAdmin, dashboardRouter);
 app.use('/classes', requireAdmin, classesRouter);
 app.use('/subjects', requireAdmin, subjectsRouter);
 app.use('/charge-categories', requireAdmin, chargeCategoriesRouter);
+// Outbound WhatsApp to guardians. requireAdmin for the same reason as school
+// finances above it, and it IS school finances: every route in this router puts
+// a balance from the ledger onto a parent's phone, and a WhatsApp cannot be
+// unsent. A teacher holds a valid session and would otherwise reach it.
+app.use('/whatsapp', requireAdmin, whatsappRouter);
 
 // /school, /onboarding and /upload are mounted further up, above the approval
 // gate — they are the only school routers a school that is not APPROVED may
