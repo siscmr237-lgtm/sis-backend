@@ -9,6 +9,7 @@ const { computeSchoolAbbreviation } = require('../utils/schoolAbbreviation');
 const { academicYearOfDate } = require('../utils/academicYear');
 const { signSessionToken: signToken, ACTOR_ADMIN, ACTOR_TEACHER } = require('../utils/sessionToken');
 const { verifyTeacherInviteToken } = require('../utils/teacherInviteToken');
+const { verifyAdminInviteToken } = require('../utils/adminInviteToken');
 
 const router = express.Router();
 
@@ -18,6 +19,30 @@ function publicUser(row) {
   if (!row) return row;
   const { passwordHash, ...rest } = row;
   return rest;
+}
+
+/**
+ * The AdminUser payload the client stores, with ONE school in `School` whichever
+ * way this account has one.
+ *
+ * An OWNER owns its school (School[0]); an ADMINISTRATOR was invited into one
+ * (memberOfSchool). The client reads user.School[0] all over the place — the
+ * sidebar's logo, the report-card header, the academic-year fallback — so an
+ * Administrator that arrived with an empty array would look like a school with
+ * no name. Mirrors loadAdminActor in src/auth.js; the two must stay in step.
+ *
+ * memberOfSchool is dropped rather than passed through, for the same reason it
+ * is dropped there: two answers to "which school is this" is how they drift.
+ */
+function publicAdmin(row) {
+  if (!row) return row;
+  const { memberOfSchool, ...rest } = row;
+  const school = rest.School?.[0] ?? memberOfSchool ?? null;
+  return {
+    ...publicUser(rest),
+    School: school ? [school] : [],
+    schoolId: school ? school.id : null,
+  };
 }
 
 // Shapes a Staff row like the AdminUser payload the frontend already receives,
@@ -134,20 +159,35 @@ router.post('/login', async (req, res) => {
       // never equals the non-empty string guarded above.
       admin = await prisma.adminUser.findFirst({
         where: { email: { equals: identifier, mode: 'insensitive' } },
-        include: { School: true },
+        // memberOfSchool for the same reason findAdminByPhone includes it: an
+        // ADMINISTRATOR owns no school and is scoped by that column.
+        include: { School: true, memberOfSchool: true },
       });
     }
 
     if (admin) {
+      // BEFORE bcrypt, not after. An invited Administrator has a NULL hash until
+      // they follow their emailed link, and bcryptjs throws on a null argument —
+      // which would surface as a 500 on the login path rather than as a refusal.
+      // Answered with the ordinary wrong-details message on purpose: which
+      // accounts exist and which have not accepted an invite is not something a
+      // sign-in form should tell a stranger. Mirrors how teacher login treats a
+      // Staff row with no hash as no account at all.
+      if (!admin.passwordHash) {
+        return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Those details are incorrect.' });
+      }
       const ok = await bcrypt.compare(String(password), admin.passwordHash);
       if (!ok) return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Those details are incorrect.' });
       if (admin.isActive === false) {
         return res.status(401).json({ code: 'ACCOUNT_CLOSED', error: 'This account has been closed.' });
       }
-      if (!admin.School.length) {
+      // Either kind of school link will do. An OWNER has School[0]; an
+      // ADMINISTRATOR has memberOfSchool. Neither is a session that can be
+      // scoped, so it is refused here rather than allowed to reach a query.
+      if (!admin.School.length && !admin.memberOfSchool) {
         return res.status(401).json({ code: 'INVALID_CREDENTIALS', error: 'Those details are incorrect.' });
       }
-      return res.json({ token: signToken(admin, ACTOR_ADMIN), user: publicUser(admin), actorType: ACTOR_ADMIN });
+      return res.json({ token: signToken(admin, ACTOR_ADMIN), user: publicAdmin(admin), actorType: ACTOR_ADMIN });
     }
 
     // No admin — try a teacher. Only rows that can actually log in are
@@ -327,6 +367,134 @@ router.post('/teacher/set-password', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /auth/admin/invite/verify  { token }   (public)
+//
+// Lets the "set your password" page greet an invited Administrator by name, and
+// name the school they are joining, before they type anything.
+//
+// Read-only: it does not consume the invite. An invite is spent by setting a
+// password, and by nothing else.
+// ---------------------------------------------------------------------------
+router.post('/admin/invite/verify', async (req, res) => {
+  try {
+    const { token } = req.body || {};
+    const result = verifyAdminInviteToken(token);
+    if (!result.valid) {
+      return res.status(400).json({ code: result.code, error: result.error });
+    }
+
+    const admin = await prisma.adminUser.findUnique({
+      where: { id: result.adminUserId },
+      select: {
+        id: true, name: true, email: true, role: true, isActive: true,
+        passwordHash: true,
+        memberOfSchool: { select: { name: true } },
+      },
+    });
+
+    // Everything below answers with the SAME message. The differences matter to
+    // us and not to the person holding the link: an account deleted, an invite
+    // revoked, a token that names an OWNER. Saying which would turn this public
+    // endpoint into a way to ask questions about accounts.
+    if (!admin || admin.isActive === false || admin.role !== 'ADMINISTRATOR') {
+      return res.status(400).json({ code: 'INVALID_INVITE_TOKEN', error: 'This invitation link is invalid.' });
+    }
+
+    // Already accepted. The invite is spent by the password existing, not by a
+    // column somewhere saying so, which makes replay naturally idempotent.
+    if (admin.passwordHash) {
+      return res.status(409).json({
+        code: 'ALREADY_ACCEPTED',
+        error: 'This invitation has already been used. Please sign in instead.',
+      });
+    }
+
+    return res.json({
+      name: admin.name,
+      email: admin.email,
+      schoolName: admin.memberOfSchool?.name ?? null,
+    });
+  } catch (e) {
+    console.error('admin/invite/verify error', e);
+    return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/admin/set-password  { token, password }   (public)
+//
+// Where an invited Administrator becomes able to log in. The token is the whole
+// authorisation — there is no session yet — which is why it is signed with its
+// own derived secret and carries its own purpose claim; see
+// src/utils/adminInviteToken.js.
+//
+// Hands back a real session, so somebody who has just proved ownership of the
+// invite is not asked to log in again with the password they typed a moment ago.
+// ---------------------------------------------------------------------------
+router.post('/admin/set-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    const result = verifyAdminInviteToken(token);
+    if (!result.valid) {
+      return res.status(400).json({ code: result.code, error: result.error });
+    }
+
+    const pwCheck = validatePassword(String(password || ''));
+    if (!pwCheck.valid) {
+      return res.status(400).json({ code: 'WEAK_PASSWORD', error: pwCheck.message });
+    }
+
+    const admin = await prisma.adminUser.findUnique({
+      where: { id: result.adminUserId },
+      select: { id: true, role: true, isActive: true, passwordHash: true, memberOfSchoolId: true },
+    });
+    if (!admin || admin.isActive === false || admin.role !== 'ADMINISTRATOR') {
+      return res.status(400).json({ code: 'INVALID_INVITE_TOKEN', error: 'This invitation link is invalid.' });
+    }
+    if (!admin.memberOfSchoolId) {
+      // Reachable only if the account were detached from its school after the
+      // invite went out. A session with no school is exactly what loadAdminActor
+      // refuses, so there is no point minting one.
+      return res.status(400).json({ code: 'INVALID_INVITE_TOKEN', error: 'This invitation link is invalid.' });
+    }
+    if (admin.passwordHash) {
+      return res.status(409).json({
+        code: 'ALREADY_ACCEPTED',
+        error: 'This invitation has already been used. Please sign in instead.',
+      });
+    }
+
+    // Conditioned on the hash still being null, so two submissions of the same
+    // form cannot both write — the second updates nothing and is told the invite
+    // is spent, rather than quietly overwriting the first person's password.
+    const claimed = await prisma.adminUser.updateMany({
+      where: { id: admin.id, passwordHash: null },
+      data: { passwordHash: await bcrypt.hash(String(password), 10) },
+    });
+    if (claimed.count !== 1) {
+      return res.status(409).json({
+        code: 'ALREADY_ACCEPTED',
+        error: 'This invitation has already been used. Please sign in instead.',
+      });
+    }
+
+    const user = await prisma.adminUser.findUnique({
+      where: { id: admin.id },
+      include: { School: true, memberOfSchool: true },
+    });
+
+    return res.json({
+      token: signToken(user, ACTOR_ADMIN),
+      user: publicAdmin(user),
+      actorType: ACTOR_ADMIN,
+    });
+  } catch (e) {
+    console.error('admin/set-password error', e);
+    return res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /auth/signup  { name, schoolName, phoneNumber, email, password }
 // Creates the real AdminUser + School immediately (emailVerified: false).
 // Resubmitting with the same still-unverified phone/email updates that account
@@ -393,7 +561,11 @@ router.post('/signup', async (req, res) => {
       user = await prisma.adminUser.findUnique({ where: { id: resumeTarget.id }, include: { School: true } });
     } else {
       const created = await prisma.adminUser.create({
-        data: { phoneNumber, email, passwordHash, name, role: 'admin', emailVerified: false },
+        // OWNER, explicitly: the signup account is the one that owns the school.
+        // It is also the column default, so this is a restatement rather than a
+        // decision — but leaving the old 'admin' string here would now fail the
+        // enum outright, which is exactly the sort of thing worth writing down.
+        data: { phoneNumber, email, passwordHash, name, role: 'OWNER', emailVerified: false },
       });
       await prisma.school.create({
         data: {
@@ -424,7 +596,7 @@ router.post('/signup', async (req, res) => {
 
     // actorType mirrors what /login now returns so the client can read it from
     // either entry point; signup is always an admin.
-    return res.status(201).json({ token: signToken(user), user: publicUser(user), actorType: ACTOR_ADMIN });
+    return res.status(201).json({ token: signToken(user), user: publicAdmin(user), actorType: ACTOR_ADMIN });
   } catch (e) {
     if (e.code === 'P2002') {
       return res.status(409).json({ code: 'EMAIL_TAKEN', error: 'An account with this email or phone number already exists.' });
@@ -575,6 +747,12 @@ router.get('/me', async (req, res) => {
       id: user.id,
       name: user.name,
       phoneNumber: user.phoneNumber,
+      // For an admin this is the AdminRole enum ('OWNER' | 'ADMINISTRATOR'),
+      // read live off the row by loadAdminActor rather than out of the token —
+      // so a client asking here gets the CURRENT role, not the one that was true
+      // when the session started. For a teacher it is still the free-text job
+      // title it has always been, which is why every guard pairs it with
+      // actorType instead of comparing it alone.
       role: user.role,
       schoolId: user.schoolId,
       actorType: user.actorType,

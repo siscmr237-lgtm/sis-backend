@@ -137,4 +137,28 @@ async function sendTeacherInvite({ to, name, schoolName, link }) {
   });
 }
 
-module.exports = { sendSignupOtp, sendPasswordResetLink, sendTeacherInvite };
+// The one-time link that lets an invited ADMINISTRATOR set their own password.
+// Its own function rather than a parameter on sendTeacherInvite: the two say
+// different things about what the person is being given, and an administrator
+// told they were "set up as a teacher" would reasonably think the link was a
+// mistake and ignore it. `link` already carries the invite token — the caller
+// builds it, because the caller is what knows the token's 72h lifetime and the
+// copy below has to agree with it.
+async function sendAdminInvite({ to, name, schoolName, link }) {
+  await transporter.sendMail({
+    from: `"SIS Support" <${process.env.MAIL_USERNAME}>`,
+    to,
+    subject: `You have been invited to administer ${schoolName || 'a school'} on SIS`,
+    html: actionEmailHtml({
+      title: 'Set up your administrator login',
+      intro: `Hi ${name}! ${schoolName || 'A school'} has invited you to help administer its SIS account. Choose a password to activate your login.`,
+      buttonLabel: 'Set your password',
+      link,
+      footnote:
+        'This invitation expires in <strong>72 hours</strong>. Do not share this link with anyone.<br>' +
+        'If you were not expecting this, you can safely ignore this email.',
+    }),
+  });
+}
+
+module.exports = { sendSignupOtp, sendPasswordResetLink, sendTeacherInvite, sendAdminInvite };

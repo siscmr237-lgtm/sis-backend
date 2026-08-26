@@ -2,6 +2,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 const { requireAdmin, getTeacherClassNames } = require('../roleGuards');
+const { attributionFor, stripAttribution, canEdit, canDelete } = require('../utils/attribution');
 const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
 const {
@@ -153,11 +154,14 @@ router.get('/sheet', async (req, res) => {
         personId: { in: students.map((s) => s.code) },
         date: { gte: days[0], lte: days[days.length - 1] },
       },
-      select: { personId: true, date: true, status: true },
+      select: { personId: true, date: true, status: true, createdByName: true },
     });
 
+    // The whole row per cell now, not just the status, because a student's own
+    // attendance panel shows who took each register. `status` is still what the
+    // grid reads; createdByName rides alongside it.
     const byStudentDay = new Map();
-    for (const r of records) byStudentDay.set(`${r.personId}|${toDayKey(r.date)}`, r.status);
+    for (const r of records) byStudentDay.set(`${r.personId}|${toDayKey(r.date)}`, r);
 
     res.json({
       classLevel: classLevel ? String(classLevel) : classLevelOf(chosen.name),
@@ -172,8 +176,14 @@ router.get('/sheet', async (req, res) => {
       days: days.map(toDayKey),
       students: students.map((s) => {
         const cells = days.map((d) => {
-          const status = byStudentDay.get(`${s.code}|${toDayKey(d)}`) ?? null;
-          return { date: toDayKey(d), status, present: status == null ? null : isPresent(status) };
+          const row = byStudentDay.get(`${s.code}|${toDayKey(d)}`) ?? null;
+          const status = row ? row.status : null;
+          return {
+            date: toDayKey(d),
+            status,
+            present: status == null ? null : isPresent(status),
+            doneBy: row ? (row.createdByName ?? null) : null,
+          };
         });
         const recorded = cells.filter((c) => c.status != null).length;
         const present = cells.filter((c) => c.present === true).length;
@@ -308,6 +318,20 @@ router.post('/mark', async (req, res) => {
       }
     }
 
+    // THE REGISTER IS NOT ANY ONE PERSON'S RECORD, and that is why the
+    // Administrator edit rule is deliberately NOT applied to this route.
+    //
+    // Attendance is one shared fact per person per day — the unique index says
+    // so — and correcting today's register is the ordinary work of whoever is on
+    // the door. Refusing an Administrator because a different admin, or a
+    // teacher, marked that day first would make the register unusable for
+    // exactly the people hired to take it. The single-record edit paths further
+    // down (PUT /:id, DELETE /:id) are where that rule belongs, and where it is.
+    //
+    // Attribution is therefore written on CREATE only. The update branch leaves
+    // both columns alone, so "Done by …" keeps naming whoever first recorded
+    // that day rather than whoever last touched it.
+    const attribution = attributionFor(req);
     const ops = records.map((r) => {
       const s = byCode.get(String(r.studentId));
       const status = r.present ? 'present' : 'absent';
@@ -326,6 +350,7 @@ router.post('/mark', async (req, res) => {
           personName: `${s.firstName} ${s.lastName}`.trim(),
           date: day,
           status,
+          ...attribution,
         },
       });
     });
@@ -383,6 +408,10 @@ router.post('/bulk', async (req, res) => {
       }
     }
 
+    // Same carve-out as /mark above, for the same reason: this is the register
+    // screen saving itself, not a record-by-record edit page. Attribution is
+    // written on create and left alone on update.
+    const attribution = attributionFor(req);
     const ops = records.map(r =>
       r.existingCode
         ? prisma.attendanceRecord.update({
@@ -399,6 +428,7 @@ router.post('/bulk', async (req, res) => {
               status: r.status,
               remarks: r.remarks ?? null,
               schoolId,
+              ...attribution,
             },
           })
     );
@@ -423,6 +453,7 @@ router.post('/', requireAdmin, async (req, res) => {
         status: body.status,
         remarks: body.remarks ?? null,
         schoolId,
+        ...attributionFor(req),
       },
     });
     res.status(201).json(withIdAsCode(created));
@@ -435,11 +466,17 @@ router.put('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.attendanceRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  // Editing ONE record on purpose, unlike the register routes above — so the
+  // ownership rule applies here.
+  if (!canEdit(req, res, found)) return;
   try {
     const updated = await prisma.attendanceRecord.update({
       where: { id: found.id },
       data: {
-        ...req.body,
+        // stripAttribution because the body is spread straight into data: a
+        // caller could otherwise post createdByAdminId and reassign the record
+        // to themselves, defeating the check immediately above.
+        ...stripAttribution(req.body),
         date: req.body?.date ? startOfDayUTC(req.body.date) : undefined,
       },
     });
@@ -450,6 +487,10 @@ router.put('/:id', requireAdmin, async (req, res) => {
 });
 
 router.delete('/:id', requireAdmin, async (req, res) => {
+  // Owner only. A deleted register day is not a corrected one: it drops out of
+  // the recorded-days denominator entirely, which silently moves every
+  // percentage derived from it, the term consistency figure included.
+  if (!canDelete(req, res)) return;
   const schoolId = req.user.schoolId;
   const found = await prisma.attendanceRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });

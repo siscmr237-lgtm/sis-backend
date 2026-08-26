@@ -1,6 +1,7 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
 const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
+const { attributionFor, stripAttribution, canEdit, canDelete } = require('../utils/attribution');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -17,7 +18,13 @@ router.get('/', async (req, res) => {
   const rows = await prisma.workRecord.findMany({
     where,
     orderBy: { date: 'desc' },
-    select: { id: true, code: true, staffId: true, staffName: true, date: true, subject: true, class: true, topic: true, schoolId: true },
+    select: {
+      id: true, code: true, staffId: true, staffName: true, date: true,
+      subject: true, class: true, topic: true, schoolId: true,
+      // Named explicitly because this select is a whitelist: a column added to
+      // the model does not appear here on its own.
+      createdByName: true, createdByAdminId: true,
+    },
   });
   res.json(mapWithIdAsCode(rows));
 });
@@ -49,6 +56,7 @@ router.post('/', async (req, res) => {
         evaluation: body.evaluation,
         remarks: body.remarks ?? null,
         schoolId,
+        ...attributionFor(req),
       },
     });
     res.status(201).json(withIdAsCode(created));
@@ -61,11 +69,14 @@ router.put('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.workRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  if (!canEdit(req, res, found)) return;
   try {
     const updated = await prisma.workRecord.update({
       where: { id: found.id },
       data: {
-        ...req.body,
+        // stripAttribution because the body is spread straight into data — see
+        // the note on the same pattern in src/routes/attendance.js.
+        ...stripAttribution(req.body),
         date: req.body.date ? new Date(req.body.date) : undefined,
       },
     });
@@ -76,6 +87,7 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
+  if (!canDelete(req, res)) return;
   const schoolId = req.user.schoolId;
   const found = await prisma.workRecord.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });

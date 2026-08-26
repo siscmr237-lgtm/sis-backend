@@ -2,6 +2,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 const { resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
+const { attributionFor, stripAttribution, canEdit, canDelete } = require('../utils/attribution');
 
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -171,6 +172,7 @@ router.post('/', async (req, res) => {
         amount: Number(body.amount ?? 0),
         payee: body.payee,
         paymentMethod: body.paymentMethod,
+        ...attributionFor(req),
       },
     });
     res.status(201).json(withIdAsCode(created));
@@ -185,11 +187,14 @@ router.put('/:id', async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.expense.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  if (!canEdit(req, res, found)) return;
   try {
     const updated = await prisma.expense.update({
       where: { id: found.id },
       data: {
-        ...req.body,
+        // stripAttribution because the body is spread straight into data — see
+        // the note on the same pattern in src/routes/attendance.js.
+        ...stripAttribution(req.body),
         date: req.body?.date ? new Date(req.body.date) : undefined,
         amount: req.body?.amount != null ? Number(req.body.amount) : undefined,
       },
@@ -203,6 +208,7 @@ router.put('/:id', async (req, res) => {
 });
 
 router.delete('/:id', async (req, res) => {
+  if (!canDelete(req, res)) return;
   const schoolId = req.user.schoolId;
   const found = await prisma.expense.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
@@ -255,6 +261,7 @@ router.post('/damage', async (req, res) => {
           ...(paymentMethod ? { paymentMethod } : {}),
           academicYear,
           term,
+          ...attributionFor(req),
         },
         include: { category: true, student: true },
       });
@@ -282,6 +289,7 @@ router.post('/damage', async (req, res) => {
         amount: Number(amount),
         payee,
         paymentMethod: paymentMethod || '',
+        ...attributionFor(req),
       },
     });
     return res.status(201).json({ type: 'expense', record: withIdAsCode(expense) });

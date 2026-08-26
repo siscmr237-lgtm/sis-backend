@@ -109,6 +109,15 @@ router.put('/password', async (req, res) => {
     return res.status(400).json({ code: 'PASSWORD_MISMATCH', error: 'Passwords do not match.' });
   }
 
+  // An account with no hash cannot have a current password to verify, and
+  // bcryptjs throws on a null argument rather than returning false — which would
+  // surface as a 500. Not reachable as things stand (a session requires a
+  // password, and loadAdminActor refuses an account without one being able to
+  // log in at all), but this is the one place a null hash would meet bcrypt, so
+  // it says no here rather than relying on that staying true.
+  if (!req.user.passwordHash) {
+    return res.status(400).json({ code: 'WRONG_PASSWORD', error: 'Current password is incorrect.' });
+  }
   const currentOk = await bcrypt.compare(String(currentPassword), req.user.passwordHash);
   if (!currentOk) {
     return res.status(400).json({ code: 'WRONG_PASSWORD', error: 'Current password is incorrect.' });

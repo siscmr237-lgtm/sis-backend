@@ -16,6 +16,27 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+/**
+ * OWNER-ONLY areas of the school API: the Administrators section, and the
+ * invite and removal routes behind it.
+ *
+ * Checked on the server for every request, not by hiding a menu item — an
+ * Administrator who learns the URL, or calls the API directly, must be refused
+ * by the API itself. Exactly the reasoning behind requirePlatformFounder below,
+ * and exactly the same two-part test: actorType FIRST, then the role. Staff.role
+ * is a free-text job title, so comparing the string alone would let a staff
+ * member titled "Owner" through.
+ */
+function requireOwner(req, res, next) {
+  if (req.user?.actorType !== ACTOR_ADMIN) {
+    return forbid(res, 'Only an administrator can do this.');
+  }
+  if (req.user?.role !== 'OWNER') {
+    return forbid(res, 'Only the school owner can do this.');
+  }
+  next();
+}
+
 function requireTeacher(req, res, next) {
   if (req.user?.actorType !== ACTOR_TEACHER) {
     return forbid(res, 'Only a teacher can do this.');
@@ -365,6 +386,7 @@ async function getTeacherTeachingMap(staffId, schoolId) {
 
 module.exports = {
   requireAdmin,
+  requireOwner,
   requireTeacher,
   requireSchoolActor,
   requireApprovedSchool,

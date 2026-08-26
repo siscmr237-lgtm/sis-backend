@@ -66,7 +66,7 @@ async function main() {
   //       phoneNumber: phone,
   //       passwordHash,
   //       name,
-  //       role: 'admin',
+  //       role: 'OWNER',
   //       school: {
   //         create: {
   //           name: 'Default Seed School',

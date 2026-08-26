@@ -85,19 +85,54 @@ async function authMiddleware(req, res, next) {
 }
 
 /**
- * An admin session. Returns null when the account is gone, closed, or has no
- * school — all of which mean the session can no longer be honoured.
+ * An admin session — an OWNER or an ADMINISTRATOR, which are one actor type
+ * with two roles, not two actor types. Returns null when the account is gone,
+ * closed, or has no school, all of which mean the session cannot be honoured.
+ *
+ * TWO WAYS TO HAVE A SCHOOL, and the session needs whichever applies:
+ *
+ *   School[0]        the school this account OWNS (School.adminUserId). The only
+ *                    case that existed before Administrators, and still the only
+ *                    one for every OWNER.
+ *   memberOfSchool   the school an ADMINISTRATOR was invited into. It owns
+ *                    nothing, so this is the only thing scoping it.
+ *
+ * Neither one means NO SESSION, and it has to: every school-scoped query in
+ * this codebase filters by req.user.schoolId, and Prisma reads
+ * `where: { schoolId: undefined }` as no filter at all rather than as an error
+ * — which would answer with every school's rows. Failing closed here is the
+ * same rule requireSchoolActor asserts one layer out.
+ *
+ * `School` is returned as a one-element array either way, because downstream
+ * code reads req.user.School[0] for the school's live registrationStatus (the
+ * approval gate) and for its academicYear/term. An Administrator must see the
+ * same shape as an Owner or it would sail through a gate meant to stop it.
  *
  * The whole row is spread onto req.user, passwordHash included, because
  * PUT /settings/password verifies the current password straight off req.user.
+ * `role` rides along with it — that is what the Owner/Administrator guards in
+ * src/utils/attribution.js read, and reading it from the row rather than from
+ * the token means a role change takes effect on the very next request.
  */
 async function loadAdminActor(id) {
-  const user = await prisma.adminUser.findUnique({ where: { id }, include: { School: true } });
-  if (!user || user.isActive === false || !user.School.length) return null;
+  const user = await prisma.adminUser.findUnique({
+    where: { id },
+    include: { School: true, memberOfSchool: true },
+  });
+  if (!user || user.isActive === false) return null;
+
+  const school = user.School[0] ?? user.memberOfSchool ?? null;
+  if (!school) return null;
+
+  // memberOfSchool is dropped from the spread on purpose: it would be a second,
+  // differently-shaped copy of the same School row sitting next to School[0],
+  // and two answers to "which school is this" is how they drift apart.
+  const { memberOfSchool, ...row } = user;
   return {
-    ...user,
+    ...row,
     actorType: ACTOR_ADMIN,
-    schoolId: user.School[0].id,
+    schoolId: school.id,
+    School: [school],
   };
 }
 
