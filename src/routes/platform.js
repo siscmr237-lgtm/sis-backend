@@ -15,7 +15,8 @@ const { prisma } = require('../db/prisma');
 const { requirePlatformFounder } = require('../roleGuards');
 const { validatePlatformPassword } = require('../utils/platformPassword');
 // The SCHOOL rule, for school credentials this console sets on a school's
-// behalf. Distinct from validatePlatformPassword, which guards team accounts.
+// behalf. validatePlatformPassword above is an alias for this same rule; both
+// names are kept so a team-only requirement has a place to live later.
 const { validatePassword } = require('../utils/validatePassword');
 const { supabase, BUCKET } = require('../utils/storage');
 // Phone comparison on DIGITS, shared with the login path. The console must ask
