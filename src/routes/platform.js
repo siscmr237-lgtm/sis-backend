@@ -502,6 +502,259 @@ router.post('/schools/:id/revert-to-pending', async (req, res) => {
   }
 });
 
+/**
+ * Every object a school ever uploaded, removed from the bucket.
+ *
+ * ONE PREFIX IS THE WHOLE OF IT. buildStoragePath in src/routes/upload.js is
+ * the only writer into this bucket and it puts everything under schools/<id>/ —
+ * logos at the top, student and staff photos in per-entity folders below. So a
+ * school's files are exactly this subtree and nothing outside it, which is also
+ * what makes deleting by prefix safe to do at all.
+ *
+ * Supabase has no real directories, so the tree has to be walked: an entry that
+ * comes back with no id and no metadata is a prefix rather than an object — the
+ * same test _storage_list.js uses. Listing is paged because a school with a
+ * photo per student has more than one page of them, and a silently truncated
+ * list would leave files behind while reporting success.
+ *
+ * IT NEVER THROWS. By the time this runs the school is already gone from the
+ * database; a bucket that refuses is a leftover to report, not a reason to turn
+ * a completed deletion into a 500. The caller puts what happened into the
+ * response and into the audit row.
+ */
+const STORAGE_PAGE = 1000;
+const STORAGE_REMOVE_BATCH = 500;
+
+async function removeSchoolStorage(schoolId) {
+  if (!supabase) {
+    return { removed: 0, error: 'Storage is not configured on this server, so no files were removed.' };
+  }
+  const prefix = `schools/${schoolId}`;
+  const objects = [];
+  try {
+    const walk = async (dir) => {
+      for (let offset = 0; ; offset += STORAGE_PAGE) {
+        const { data, error } = await supabase.storage
+          .from(BUCKET)
+          .list(dir, { limit: STORAGE_PAGE, offset });
+        if (error) throw new Error(error.message);
+        const entries = data ?? [];
+        for (const entry of entries) {
+          const full = `${dir}/${entry.name}`;
+          if (entry.id === null || entry.metadata === null) await walk(full);
+          else objects.push(full);
+        }
+        if (entries.length < STORAGE_PAGE) return;
+      }
+    };
+    await walk(prefix);
+
+    for (let i = 0; i < objects.length; i += STORAGE_REMOVE_BATCH) {
+      const { error } = await supabase.storage
+        .from(BUCKET)
+        .remove(objects.slice(i, i + STORAGE_REMOVE_BATCH));
+      if (error) throw new Error(error.message);
+    }
+    return { removed: objects.length, error: null };
+  } catch (e) {
+    console.error(`platform school delete: storage cleanup of ${prefix} failed`, e.message);
+    return { removed: 0, error: e.message };
+  }
+}
+
+/**
+ * DELETE /platform/schools/:id
+ *
+ * THE SCHOOL, AND EVERYTHING IT EVER RECORDED. Its students and their marks,
+ * its staff and their pay, every attendance mark, ledger entry, report card,
+ * timetable row and uploaded photo, and every account that signs in to it —
+ * the owner and any Administrator the owner invited.
+ *
+ * FOUNDER ONLY, and this is the one route in this file where that gate is the
+ * point rather than tidiness. Approve and revert-to-pending are deliberately
+ * open to any team member because each moves one status column and the other
+ * one puts it back. This has no other side to it: no soft-delete column to
+ * flip, no archive, and nothing exported on the way out. If any of it is wanted
+ * afterwards it has to come from a database backup.
+ *
+ * THE NAME HAS TO BE IN THE BODY. `confirmName` must match the school's own
+ * name or nothing is deleted. A DELETE that needs no payload is one a mistyped
+ * path, a replayed request or a script walking ids can fire blind; making the
+ * caller say WHICH school it means is what stops that. The console's dialog
+ * makes the team member type the name to enable its button and then sends the
+ * stored name, so the two checks cannot come to disagree about what counts as a
+ * match — see DeleteSchoolControl.tsx.
+ *
+ * ORDER, NOT CASCADE. Almost none of the foreign keys pointing at School are ON
+ * DELETE CASCADE, which is deliberate: it is what stops anything in the school
+ * API taking a whole tenant with it by accident. The price is that this route
+ * has to name every table itself, children before parents. If a table is added
+ * to the schema later and not added here, the final school.delete() fails its
+ * foreign key and the whole transaction rolls back — the school survives whole
+ * rather than half-deleted, which is the right way round for this to break.
+ *
+ * ONE TRANSACTION, for that reason. A half-deleted school would be worse than
+ * either outcome: rows no page can load, and a School row whose counts lie. The
+ * timeout is generous but finite, and a school big enough to exceed it aborts
+ * having lost nothing.
+ *
+ * STORAGE LAST, and outside the transaction, because a bucket cannot be in one.
+ * The order is chosen for which mess is survivable: files left behind for a
+ * school that no longer exists are bytes nobody can reach, while emptying the
+ * bucket first and then failing would leave a live school full of broken
+ * images. A storage failure is reported and audited and does not fail the
+ * request — the database is the authority on whether the school still exists,
+ * and by then it does not.
+ */
+router.delete('/schools/:id', requirePlatformFounder, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  const confirmName = typeof req.body?.confirmName === 'string' ? req.body.confirmName.trim() : '';
+
+  try {
+    const school = await prisma.school.findUnique({
+      where: { id },
+      select: { id: true, name: true, adminUserId: true },
+    });
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    if (!confirmName || confirmName !== school.name.trim()) {
+      return res.status(400).json({
+        code: 'NAME_MISMATCH',
+        error: "Send the school's exact name as confirmName to delete it.",
+      });
+    }
+
+    /**
+     * The owning account, and whether this school is all it owns.
+     *
+     * AdminUser.School is an array: nothing in the schema stops one account
+     * owning two schools, even though signup never makes one. So the login goes
+     * only when this was its last school and is left alone otherwise — deleting
+     * it would lock somebody out of a school this route is not touching. It also
+     * cannot go inside the block below until the school row has: School is the
+     * side that holds the foreign key to AdminUser.
+     */
+    const owner = await prisma.adminUser.findUnique({
+      where: { id: school.adminUserId },
+      select: { id: true, name: true, email: true, School: { select: { id: true } } },
+    });
+    const ownerLosesLastSchool = Boolean(owner) && owner.School.every((s) => s.id === id);
+
+    /**
+     * The ADMINISTRATOR accounts the owner invited into this school.
+     *
+     * The other direction of the same relationship, and it has to be handled
+     * the other way round. School holds the foreign key to its owner, so the
+     * owner goes AFTER the school row; these hold a foreign key to School, so
+     * they go BEFORE it. An invited account exists for one school and nothing
+     * else — memberOfSchoolId is the only thing that scopes it, see
+     * loadAdminActor — so there is no equivalent here of the "does it own
+     * another one" question the owner gets: when the school goes, it goes.
+     */
+    const members = await prisma.adminUser.findMany({
+      where: { memberOfSchoolId: id },
+      select: { id: true, email: true },
+    });
+
+    const removed = await prisma.$transaction(
+      async (tx) => {
+        const counts = { adminAccounts: 0, otpCodes: 0 };
+
+        // Leaves first: rows reached only through a student, a class or a
+        // test/exam of this school, with no schoolId of their own to filter on.
+        counts.marks = (await tx.studentMark.deleteMany({ where: { student: { schoolId: id } } })).count;
+        counts.testExamSubjectTotals = (await tx.testExamSubjectTotal.deleteMany({ where: { testExam: { schoolId: id } } })).count;
+        counts.pickupContacts = (await tx.pickupContact.deleteMany({ where: { student: { schoolId: id } } })).count;
+        // Before Class, Subject AND Staff: the staff side of this row is the one
+        // foreign key on it that is not ON DELETE CASCADE.
+        counts.subjectTeachers = (await tx.classSubjectTeacher.deleteMany({ where: { class: { schoolId: id } } })).count;
+
+        // Money. Ledger entries lead, because they point at charge categories,
+        // class-level fees, per-student overrides, students, staff — and at one
+        // another, through the settlement link.
+        counts.ledgerEntries = (await tx.ledgerEntry.deleteMany({ where: { schoolId: id } })).count;
+        counts.studentFeeOverrides = (await tx.studentFeeOverride.deleteMany({ where: { schoolId: id } })).count;
+        counts.classLevelFees = (await tx.classLevelFee.deleteMany({ where: { schoolId: id } })).count;
+        counts.classLevelNoFees = (await tx.classLevelNoFees.deleteMany({ where: { schoolId: id } })).count;
+        counts.chargeCategories = (await tx.chargeCategory.deleteMany({ where: { schoolId: id } })).count;
+
+        // Academics and the daily record.
+        counts.testExams = (await tx.testExam.deleteMany({ where: { schoolId: id } })).count;
+        counts.classLevelSubjects = (await tx.classLevelSubject.deleteMany({ where: { schoolId: id } })).count;
+        counts.reportCards = (await tx.reportCard.deleteMany({ where: { schoolId: id } })).count;
+        counts.timetableEntries = (await tx.timetableEntry.deleteMany({ where: { schoolId: id } })).count;
+        counts.attendanceRecords = (await tx.attendanceRecord.deleteMany({ where: { schoolId: id } })).count;
+        counts.workRecords = (await tx.workRecord.deleteMany({ where: { schoolId: id } })).count;
+        counts.expenses = (await tx.expense.deleteMany({ where: { schoolId: id } })).count;
+
+        // Now the rows all of the above pointed at.
+        counts.classes = (await tx.class.deleteMany({ where: { schoolId: id } })).count;
+        counts.subjects = (await tx.subject.deleteMany({ where: { schoolId: id } })).count;
+        counts.students = (await tx.student.deleteMany({ where: { schoolId: id } })).count;
+        // After Student, which is what carries parentId.
+        counts.parents = (await tx.parent.deleteMany({ where: { schoolId: id } })).count;
+        counts.staff = (await tx.staff.deleteMany({ where: { schoolId: id } })).count;
+
+        // The invited Administrators, before the school they point at. Their
+        // signup codes go with them for the same reason the owner's do below:
+        // OtpCode is keyed by email, not by a foreign key.
+        const memberEmails = members.map((m) => m.email).filter(Boolean);
+        if (memberEmails.length) {
+          counts.otpCodes += (await tx.otpCode.deleteMany({ where: { identifier: { in: memberEmails } } })).count;
+        }
+        counts.adminAccounts += (await tx.adminUser.deleteMany({ where: { memberOfSchoolId: id } })).count;
+
+        await tx.school.delete({ where: { id } });
+        counts.schools = 1;
+
+        if (ownerLosesLastSchool) {
+          // Signup codes are keyed by EMAIL rather than by a foreign key, so
+          // deleting the account does not reach them and they have to be named
+          // here. Password reset links are ON DELETE CASCADE and go on their own.
+          if (owner.email) {
+            counts.otpCodes += (await tx.otpCode.deleteMany({ where: { identifier: owner.email } })).count;
+          }
+          await tx.adminUser.delete({ where: { id: owner.id } });
+          counts.adminAccounts += 1;
+        }
+
+        return counts;
+      },
+      { timeout: 60_000, maxWait: 20_000 },
+    );
+
+    const storage = await removeSchoolStorage(id);
+
+    await recordAudit(req, ACTIONS.SCHOOL_DELETED, {
+      target: `school:${id}`,
+      detail: {
+        name: school.name,
+        // The destroyed login, named because once the row is gone nothing else
+        // records which one it was. The same reasoning as the phone number on
+        // school_admin.phone_changed: not a secret, and unanswerable afterwards
+        // without it.
+        adminEmail: owner?.email ?? null,
+        ownerAccountDeleted: ownerLosesLastSchool,
+        records: removed,
+        storage,
+      },
+    });
+
+    res.json({ deleted: true, school: { id, name: school.name }, records: removed, storage });
+  } catch (e) {
+    console.error('platform /schools/:id delete failed', e.code || e.message);
+    // The transaction is the only thing here that writes, so a throw means it
+    // rolled back and the school is exactly as it was. Saying so is the
+    // difference between "try again" and "go and find out what survived".
+    res.status(503).json({
+      code: 'SERVER_UNAVAILABLE',
+      error: 'Could not delete the school. Nothing was removed.',
+    });
+  }
+});
+
 // ── A school's staff ────────────────────────────────────────────────────────
 // passwordHash is never selected, let alone returned. `hasLogin` is the only
 // thing said about it — the same contract serializeStaff uses in

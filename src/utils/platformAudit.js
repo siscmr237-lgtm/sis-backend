@@ -92,6 +92,25 @@ const ACTIONS = {
    */
   SCHOOL_APPROVED: 'school.approved',
   SCHOOL_REVERTED_TO_PENDING: 'school.reverted_to_pending',
+
+  /**
+   * A school was DELETED, with everything it ever recorded.
+   *
+   * The one action in this console that no other action can undo, and so the
+   * one row in this table that has to outlive the thing it describes. Every
+   * other target here can be looked up afterwards to see what it is now;
+   * after this, the school, its data and its login are gone, and this row is
+   * the only remaining record that any of them existed.
+   *
+   * The detail is therefore written to stand on its own rather than to point
+   * at a row: the school's name, the per-table counts of what went with it,
+   * the email of the account that signed in to it, and whether the bucket was
+   * emptied too. The target keeps the id, which is what ties this row to the
+   * school.viewed and school.approved entries before it — but that id is now
+   * free for Postgres to hand to some other school, so it is a key into this
+   * trail and no longer a way to find anything.
+   */
+  SCHOOL_DELETED: 'school.deleted',
 };
 
 /** The client's address, honouring the proxy header Vercel actually sets. */
