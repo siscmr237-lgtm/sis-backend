@@ -147,6 +147,9 @@ model Staff {
   ledgerEntries         LedgerEntry[]
 
   /// WHO ADDED THIS STAFF MEMBER. See the note on AdminUser.role.
+  /// This person's own daily submissions. See the StaffAttendance model.
+  staffAttendance       StaffAttendance[]
+
   createdBy        AdminUser? @relation("StaffCreatedBy", fields: [createdByAdminId], references: [id])
   createdByAdminId Int?
   createdByName    String?
@@ -223,6 +226,87 @@ model AttendanceRecord {
   @@index([schoolId, date])
   @@index([schoolId, personId])
   @@index([createdByAdminId])
+}
+
+/// Whether a staff member was at work. Two values, deliberately: this is the
+/// register a teacher takes of THEMSELVES, and "late" or "excused" are
+/// judgements somebody else makes about the day, not facts the person submits.
+/// AttendanceRecord.status stays the free-text column it has always been.
+enum StaffAttendanceStatus {
+  PRESENT
+  ABSENT
+}
+
+/// Where a submission stands with the school.
+///
+/// PENDING is where every submission starts, and it is a real state rather than
+/// a formality: a teacher marking themselves present marks their whole class
+/// present with them, and until somebody says otherwise that is a claim, not a
+/// finding. It becomes APPROVED by an Owner, or by the 48-hour sweep in
+/// src/routes/cron.js when nobody got to it.
+enum StaffAttendanceApproval {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A STAFF MEMBER'S OWN SUBMISSION for one day, and what became of it.
+///
+/// NOT the same thing as an AttendanceRecord with type = 'staff', and the two
+/// must never be conflated. Those rows are what an ADMIN recorded ABOUT someone
+/// from the Staff Attendance tab; this table is what the person SUBMITTED about
+/// themselves, and it carries an approval lifecycle those rows have no concept
+/// of. A day can legitimately have both, saying different things — which is the
+/// point of keeping them apart rather than overloading one column.
+///
+/// The student register a submission carries with it lives where it always has,
+/// in AttendanceRecord. This table does not duplicate it: rejecting a submission
+/// rewrites those rows (see POST /staff-attendance/:id/reject), it does not
+/// store a second copy of them.
+model StaffAttendance {
+  id             Int                     @id @default(autoincrement())
+  school         School                  @relation(fields: [schoolId], references: [id])
+  schoolId       Int
+  staff          Staff                   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId        Int
+  /// Normalised to midnight UTC on write, exactly as AttendanceRecord.date is —
+  /// see startOfDayUTC in src/utils/attendanceDay.js. Without that the unique
+  /// index below would key on the time of day and admit a second submission for
+  /// the same calendar day, which is the one thing it exists to prevent.
+  date           DateTime
+  status         StaffAttendanceStatus
+  /// WHEN IT WAS SUBMITTED, and the only clock the 48-hour auto-approval reads.
+  /// Deliberately its own column rather than leaning on createdAt: createdAt is
+  /// a row-lifecycle timestamp that any future backfill, import or repair would
+  /// move, and moving it would silently reset somebody's approval window.
+  submittedAt    DateTime                @default(now())
+  approvalStatus StaffAttendanceApproval @default(PENDING)
+  /// Who approved it — an AdminUser, or NULL when the 48-hour sweep did it with
+  /// nobody looking. A null approver next to a non-null approvedAt is therefore
+  /// meaningful: it says the school never answered. ON DELETE SET NULL, never
+  /// cascade: an account going away must not delete the decision it made.
+  approvedBy     AdminUser?              @relation("StaffAttendanceApprovedBy", fields: [approvedById], references: [id])
+  approvedById   Int?
+  approvedAt     DateTime?
+  /// Who rejected it. Always an AdminUser — nothing automatic ever rejects, so
+  /// unlike approvedById a null here alongside a rejectedAt would be a bug.
+  rejectedBy     AdminUser?              @relation("StaffAttendanceRejectedBy", fields: [rejectedById], references: [id])
+  rejectedById   Int?
+  rejectedAt     DateTime?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  /// ONE SUBMISSION PER STAFF MEMBER PER DAY, enforced by the database rather
+  /// than by a check-then-insert two tabs could race through.
+  ///
+  /// Keyed on (staffId, date) and NOT on schoolId as well: a Staff row belongs
+  /// to exactly one school, so adding schoolId could only ever weaken this —
+  /// a wrong schoolId would let a second row through for the same person and
+  /// day, which is precisely what must not happen.
+  @@unique([staffId, date])
+  @@index([schoolId, date])
+  /// The 48-hour sweep's query, exactly: PENDING rows older than a cutoff.
+  @@index([approvalStatus, submittedAt])
 }
 
 model WorkRecord {
@@ -569,6 +653,7 @@ model School {
   Staff                     Staff[]
   Expense                   Expense[]
   AttendanceRecord          AttendanceRecord[]
+  staffAttendance           StaffAttendance[]
   WorkRecord                WorkRecord[]
   ReportCard                ReportCard[]
   TimetableEntry            TimetableEntry[]
@@ -920,6 +1005,12 @@ model AdminUser {
   createdAttendance AttendanceRecord[] @relation("AttendanceRecordCreatedBy")
   createdWork       WorkRecord[]       @relation("WorkRecordCreatedBy")
   createdExpenses   Expense[]          @relation("ExpenseCreatedBy")
+
+  /// Staff attendance submissions this account approved or rejected. Present so
+  /// Prisma can express the other side of each relation; the screens read the
+  /// decision off the submission, not by walking back from here.
+  approvedStaffAttendance StaffAttendance[] @relation("StaffAttendanceApprovedBy")
+  rejectedStaffAttendance StaffAttendance[] @relation("StaffAttendanceRejectedBy")
 
   @@index([memberOfSchoolId])
 }

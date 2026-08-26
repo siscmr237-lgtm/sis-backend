@@ -13,6 +13,7 @@ const studentsRouter = require('./routes/students');
 const staffRouter = require('./routes/staff');
 const expensesRouter = require('./routes/expenses');
 const attendanceRouter = require('./routes/attendance');
+const staffAttendanceRouter = require('./routes/staffAttendance');
 const workRecordsRouter = require('./routes/workRecords');
 const reportCardsRouter = require('./routes/reportCards');
 const timetableRouter = require('./routes/timetable');
@@ -214,6 +215,12 @@ app.use(requireApprovedSchool);
 app.use('/students', studentsRouter);
 app.use('/staff', staffRouter);
 app.use('/attendance', attendanceRouter);
+// Staff attendance submissions and their approval. In the MIXED group, not the
+// admin-only one below: a teacher submits and reads their own here, and an admin
+// reads and decides on all of them. The split is made per route inside the
+// router (requireTeacher / requireAdmin / requireOwner) because both actor types
+// have legitimate business in it. See src/routes/staffAttendance.js.
+app.use('/staff-attendance', staffAttendanceRouter);
 app.use('/timetable', timetableRouter);
 app.use('/ledger', ledgerRouter);
 app.use('/test-exams', testExamsRouter);

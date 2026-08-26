@@ -2,6 +2,11 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { advanceYearIfDue } = require('../utils/academicYear');
 const { applyTermEndZeros } = require('../utils/termEndZeros');
+const {
+  AUTO_APPROVE_AFTER_HOURS,
+  autoApproveCutoff,
+  autoApproveOverdue,
+} = require('../utils/staffAttendance');
 
 const router = express.Router();
 
@@ -158,6 +163,64 @@ router.get('/apply-term-end-zeros', async (req, res) => {
       `${summary.schoolsZeroed} swept, ${summary.zerosCreated} zeros, ${summary.unchanged} unchanged, ${summary.failed} failed`,
   );
   res.status(summary.ok ? 200 : 500).json(summary);
+});
+
+/**
+ * GET /cron/auto-approve-staff-attendance
+ *
+ * A staff attendance submission the school never answered is taken as accepted
+ * once it has waited 48 hours. This is what does that.
+ *
+ * NOT PROTECTED BY A ROLE — protected by CRON_SECRET, like its two neighbours,
+ * and that distinction is the whole reason this router is mounted ABOVE
+ * authMiddleware in src/app.js. A school admin or a teacher has no session that
+ * reaches here at all: they are not refused for having the wrong role, they are
+ * refused for not holding a secret only the scheduler has. Which also means a
+ * teacher cannot approve their own submission early by finding this URL.
+ *
+ * submittedAt is the ONLY clock read. createdAt is a row-lifecycle timestamp
+ * that a backfill, an import or a repair would move, and moving it would
+ * silently reset somebody's window — see autoApproveOverdue.
+ *
+ * ONE updateMany across every school rather than a per-school loop, because
+ * unlike the two jobs above there is nothing school-specific to decide: the
+ * filter IS the rule. That also makes it safe to overlap with the same sweep
+ * running opportunistically on the admin and teacher read paths — whichever
+ * runs first moves the rows out of PENDING and the other matches nothing.
+ */
+router.get('/auto-approve-staff-attendance', async (req, res) => {
+  if (!authorised(req)) {
+    console.warn('cron/auto-approve-staff-attendance: rejected an unauthorised request');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const startedAt = new Date();
+  try {
+    const approved = await autoApproveOverdue(prisma, startedAt);
+    const summary = {
+      ok: true,
+      startedAt,
+      finishedAt: new Date(),
+      windowHours: AUTO_APPROVE_AFTER_HOURS,
+      cutoff: autoApproveCutoff(startedAt),
+      approved,
+    };
+    console.log(
+      `cron/auto-approve-staff-attendance: ${approved} submission(s) approved after ${AUTO_APPROVE_AFTER_HOURS}h`,
+    );
+    return res.json(summary);
+  } catch (e) {
+    // 503, not 500: nothing was half-done — updateMany is one statement — so
+    // this is "could not run", and the scheduler should record a failed run and
+    // try again next hour.
+    console.error('cron/auto-approve-staff-attendance FAILED —', e.code || e.message);
+    return res.status(503).json({
+      ok: false,
+      error: 'Could not sweep staff attendance',
+      code: e.code || null,
+      startedAt,
+    });
+  }
 });
 
 module.exports = router;
