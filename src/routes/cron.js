@@ -6,6 +6,7 @@ const {
   AUTO_APPROVE_AFTER_HOURS,
   autoApproveCutoff,
   autoApproveOverdue,
+  autoApproveOverdueQuietly,
 } = require('../utils/staffAttendance');
 
 const router = express.Router();
@@ -147,6 +148,23 @@ router.get('/apply-term-end-zeros', async (req, res) => {
     }
   }
 
+  // The staff-attendance sweep rides along on this job.
+  //
+  // It has an endpoint of its own below and wants to run HOURLY, but this
+  // project's Vercel plan would not take a third scheduled job — the deployment
+  // was refused outright rather than merely failing to register the schedule —
+  // so the nightly sweep is what guarantees it happens for a school nobody
+  // opened. For a school anybody IS using, the same sweep runs on every admin
+  // and teacher read of staff attendance, which is far more often than hourly.
+  //
+  // Quietly: this job's own outcome must not turn on it, and the sweep reports
+  // its own failure. One updateMany whose filter is the rule, so overlapping
+  // with any other caller is harmless.
+  const staffAttendanceApproved = await autoApproveOverdueQuietly(prisma, startedAt);
+  if (staffAttendanceApproved) {
+    console.log(`cron: ${staffAttendanceApproved} staff attendance submission(s) auto-approved`);
+  }
+
   const summary = {
     ok: results.failed.length === 0,
     startedAt,
@@ -156,6 +174,7 @@ router.get('/apply-term-end-zeros', async (req, res) => {
     zerosCreated: totalZeros,
     unchanged: results.unchanged.length,
     failed: results.failed.length,
+    staffAttendanceApproved,
     details: results,
   };
   console.log(
@@ -184,9 +203,19 @@ router.get('/apply-term-end-zeros', async (req, res) => {
  *
  * ONE updateMany across every school rather than a per-school loop, because
  * unlike the two jobs above there is nothing school-specific to decide: the
- * filter IS the rule. That also makes it safe to overlap with the same sweep
- * running opportunistically on the admin and teacher read paths — whichever
- * runs first moves the rows out of PENDING and the other matches nothing.
+ * filter IS the rule. That also makes it safe to overlap with every other caller
+ * — whichever runs first moves the rows out of PENDING and the rest match
+ * nothing.
+ *
+ * NOT ON A VERCEL SCHEDULE OF ITS OWN. It wants to run hourly, and this
+ * project's plan would not take a third scheduled job: adding one had the
+ * deployment refused outright rather than merely losing the schedule. So the
+ * sweep is invoked from three places instead, and this endpoint stays as the
+ * one an external scheduler or a person can call directly:
+ *
+ *   the nightly apply-term-end-zeros job   guarantees it for a school nobody opened
+ *   every admin/teacher read of staff attendance   covers a school anybody is using
+ *   this endpoint                          for anything else, with CRON_SECRET
  */
 router.get('/auto-approve-staff-attendance', async (req, res) => {
   if (!authorised(req)) {
