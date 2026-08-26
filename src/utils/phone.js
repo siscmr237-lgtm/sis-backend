@@ -166,7 +166,14 @@ async function findAdminByPhone(prisma, value) {
   // answer on a login path — picking one could sign somebody into the wrong
   // account, and that must never be a silent outcome.
   if (ids.length !== 1) return null;
-  return prisma.adminUser.findUnique({ where: { id: ids[0] }, include: { School: true } });
+  // memberOfSchool alongside School because an ADMINISTRATOR owns no school and
+  // is scoped by that column instead — see loadAdminActor in src/auth.js.
+  // Without it the login path reads an empty School array and turns a perfectly
+  // good account away as having no school.
+  return prisma.adminUser.findUnique({
+    where: { id: ids[0] },
+    include: { School: true, memberOfSchool: true },
+  });
 }
 
 /**

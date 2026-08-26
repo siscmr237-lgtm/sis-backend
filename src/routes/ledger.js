@@ -5,6 +5,7 @@ const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
+const { attributionFor, canEdit, canDelete } = require('../utils/attribution');
 const { FEE_GROUPS } = require('../utils/feeCategories');
 const { computeOwingByCategory, computeFeesStatusForStudents } = require('../utils/feesStatus');
 const { feeDriveSignature } = require('../utils/proprietor');
@@ -714,6 +715,11 @@ router.post('/charge', requireAdmin, async (req, res) => {
         paymentMethod: paymentMethod || null,
         academicYear,
         term,
+        // Who raised this charge. Only the HAND-WRITTEN rows carry this — the
+        // fee-structure rows syncLevelFeeCharges writes deliberately do not, so
+        // a machine-written charge is never attributed to whoever happened to
+        // trigger the sync.
+        ...attributionFor(req),
       },
       include: { classLevelFee: true },
     });
@@ -854,6 +860,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
         paymentMethod: paymentMethod || null,
         academicYear,
         term,
+        ...attributionFor(req),
       },
     });
     res.status(201).json(withIdAsCode(entry));
@@ -961,6 +968,9 @@ router.post('/payments', requireAdmin, async (req, res) => {
 
     const { academicYear, term } = await getSchoolPeriod(schoolId);
     const when = new Date(entryDate);
+    // Resolved once, outside the map: every row of one hand-over of money was
+    // recorded by the same person in the same act.
+    const attribution = attributionFor(req);
 
     // One transaction. Either every fee on the table is recorded or none is.
     const created = await prisma.$transaction(
@@ -986,6 +996,7 @@ router.post('/payments', requireAdmin, async (req, res) => {
           paymentMethod: paymentMethod || null,
           academicYear,
           term,
+          ...attribution,
         },
       })),
     );
@@ -1209,6 +1220,7 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
           paymentMethod: paymentMethod || null,
           academicYear,
           term,
+          ...attributionFor(req),
         },
       });
       created.push(withIdAsCode(entry));
@@ -1308,6 +1320,7 @@ router.post('/staff-charge', requireAdmin, async (req, res) => {
         paymentMethod: null,
         academicYear,
         term,
+        ...attributionFor(req),
       },
       include: { category: true },
     });
@@ -1487,6 +1500,9 @@ router.post('/staff-payroll', requireAdmin, async (req, res) => {
 
     // One transaction: a run that recorded the pay but not the settlements would
     // leave fines outstanding that the staff member has already been docked for.
+    // One person, one act, however many rows it writes.
+    const attribution = attributionFor(req);
+
     const written = await prisma.$transaction(async (tx) => {
       const run = await tx.ledgerEntry.create({
         data: {
@@ -1507,6 +1523,7 @@ router.post('/staff-payroll', requireAdmin, async (req, res) => {
           paymentMethod,
           academicYear,
           term,
+          ...attribution,
         },
       });
 
@@ -1526,6 +1543,7 @@ router.post('/staff-payroll', requireAdmin, async (req, res) => {
             paymentMethod,
             academicYear,
             term,
+            ...attribution,
           },
         }));
       }
@@ -1583,6 +1601,7 @@ router.post('/staff-payment', requireAdmin, async (req, res) => {
         paymentMethod: paymentMethod || null,
         academicYear,
         term,
+        ...attributionFor(req),
       },
     });
     res.status(201).json(withIdAsCode(entry));
@@ -1619,6 +1638,12 @@ router.patch('/:id', requireAdmin, async (req, res) => {
         error: "This charge comes from the student's fee structure. Edit it there instead.",
       });
     }
+
+    // AFTER the 404 and after the fee-structure refusal, so neither answer is
+    // reachable only by whoever happens to own the row. No stripAttribution
+    // below: this route builds `data` field by field from an allow-list, so a
+    // createdByAdminId in the body is simply never read.
+    if (!canEdit(req, res, entry)) return;
 
     // Only the fields actually supplied are touched, so a caller sending just an
     // amount cannot blank out the description by omission.
@@ -1660,6 +1685,10 @@ router.patch('/:id', requireAdmin, async (req, res) => {
 });
 
 router.delete('/:id', requireAdmin, async (req, res) => {
+  // Owner only. Deleting a ledger row moves money that a receipt has already
+  // been issued for, and a payment row deleted by mistake cannot be recovered
+  // from anywhere else in the system.
+  if (!canDelete(req, res)) return;
   try {
     const schoolId = req.user.schoolId;
     const { id } = req.params;

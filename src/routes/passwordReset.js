@@ -128,6 +128,10 @@ router.post('/request', async (req, res) => {
         name: true,
         isActive: true,
         School: { select: { name: true }, take: 1 },
+        // An ADMINISTRATOR owns no school, so School is empty for them and the
+        // reset email would greet them on behalf of nobody. Their school is
+        // reached through memberOfSchool instead — see loadAdminActor.
+        memberOfSchool: { select: { name: true } },
       },
     });
 
@@ -166,7 +170,7 @@ router.post('/request', async (req, res) => {
     await sendPasswordResetLink({
       to: user.email,
       name: user.name,
-      schoolName: user.School[0]?.name ?? null,
+      schoolName: user.School[0]?.name ?? user.memberOfSchool?.name ?? null,
       link: `${appBaseUrl()}/school/reset-password?token=${encodeURIComponent(token)}`,
     });
 

@@ -128,7 +128,10 @@ async function forceVerifySignup(email, reason) {
       email: pending.email,
       passwordHash: pending.passwordHash,
       name: pending.name,
-      role: 'admin',
+      // OWNER: this creates the account that OWNS the school, exactly as
+      // POST /auth/signup does. The old 'admin' string is not a member of the
+      // AdminRole enum and would now fail outright.
+      role: 'OWNER',
     },
   });
   await prisma.school.create({

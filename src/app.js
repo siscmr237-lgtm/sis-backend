@@ -17,6 +17,7 @@ const workRecordsRouter = require('./routes/workRecords');
 const reportCardsRouter = require('./routes/reportCards');
 const timetableRouter = require('./routes/timetable');
 const settingsRouter = require('./routes/settings');
+const adminsRouter = require('./routes/admins');
 const authRouter = require('./routes/auth');
 const passwordResetRouter = require('./routes/passwordReset');
 const dashboardRouter = require('./routes/dashboard');
@@ -232,6 +233,12 @@ app.use('/expenses', requireAdmin, expensesRouter);
 app.use('/work-records', requireAdmin, workRecordsRouter);
 app.use('/report-cards', requireAdmin, reportCardsRouter);
 app.use('/settings', requireAdmin, settingsRouter);
+// The Administrators section. requireAdmin here for the same reason as its
+// neighbours — a teacher's token is a valid session and would otherwise reach
+// it — and requireOwner INSIDE the router, at its own mount, because that is the
+// narrower rule and it belongs next to the routes it governs. See
+// src/routes/admins.js.
+app.use('/admins', requireAdmin, adminsRouter);
 app.use('/academic-year', requireAdmin, academicYearRouter);
 app.use('/dashboard', requireAdmin, dashboardRouter);
 app.use('/classes', requireAdmin, classesRouter);

@@ -11,6 +11,7 @@ const {
   getTeacherSubjectAssignments,
   getTeacherTeachingMap,
 } = require('../roleGuards');
+const { attributionFor, canEdit, canDelete } = require('../utils/attribution');
 
 const router = express.Router();
 
@@ -382,6 +383,8 @@ router.post('/', requireAdmin, async (req, res) => {
         salary: Number(body.salary ?? 0),
         isTeacher: body.isTeacher ?? false,
         schoolId,
+        // Who added this staff member.
+        ...attributionFor(req),
       },
     });
     res.status(201).json(publicStaff(created));
@@ -404,6 +407,11 @@ router.put('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.staff.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  // AFTER the 404, so the difference between 403 and 404 cannot be used to probe
+  // for which staff codes exist. No stripAttribution needed here: unlike the
+  // student route, this one names each column it writes rather than spreading
+  // the body — a createdByAdminId in the payload is simply never read.
+  if (!canEdit(req, res, found)) return;
   const body = req.body || {};
   try {
     const updated = await prisma.staff.update({
@@ -441,6 +449,9 @@ router.post('/:id/invite', requireAdmin, async (req, res) => {
     include: { school: true },
   });
   if (!staff) return res.status(404).json({ error: 'Not found' });
+  // Giving somebody a login is a change to their record, and a privileged one,
+  // so it answers to the same rule an ordinary edit does.
+  if (!canEdit(req, res, staff)) return;
 
   if (!staff.isTeacher) {
     return res.status(400).json({
@@ -553,6 +564,10 @@ router.patch('/:id/access', requireAdmin, async (req, res) => {
     where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },
   });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  // Taking somebody's login away is a change to their record — the most
+  // consequential one this router makes short of deleting them — so it carries
+  // the same rule as an ordinary edit rather than a looser one.
+  if (!canEdit(req, res, found)) return;
 
   try {
     const updated = await prisma.staff.update({
@@ -610,6 +625,10 @@ router.patch('/:id/access', requireAdmin, async (req, res) => {
  * remove a string that harms nothing by remaining.
  */
 router.delete('/:id', requireAdmin, async (req, res) => {
+  // Owner only. This takes the staff member's attendance, work records, class
+  // assignments and entire salary history with it, and there is no undo — see
+  // the transaction below for the full list.
+  if (!canDelete(req, res)) return;
   const schoolId = req.user.schoolId;
   const found = await prisma.staff.findFirst({
     where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] },

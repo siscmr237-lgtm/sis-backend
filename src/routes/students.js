@@ -14,6 +14,7 @@ const {
 const { findStudentsWithZeroMarks, findZeroMarkSubjects } = require('../utils/zeroMarks');
 const { applyTermEndZerosQuietly } = require('../utils/termEndZeros');
 const { requireAdmin, getTeacherClassNames } = require('../roleGuards');
+const { attributionFor, stripAttribution, canEdit, canDelete } = require('../utils/attribution');
 const { hideStudentFinancialsFromTeachers } = require('../utils/feeVisibility');
 const { ACTOR_TEACHER } = require('../utils/sessionToken');
 
@@ -210,6 +211,9 @@ router.post('/', requireAdmin, async (req, res) => {
         currentMedications: body.currentMedications || null,
         medicalNotes: body.medicalNotes || null,
         schoolId,
+        // Who enrolled this student. Spread LAST of the caller-supplied fields
+        // so a body carrying createdByAdminId cannot pre-empt it.
+        ...attributionFor(req),
       },
       include: { parent: true },
     });
@@ -226,8 +230,14 @@ router.put('/:id', requireAdmin, async (req, res) => {
   const schoolId = req.user.schoolId;
   const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });
+  // AFTER the 404, so an Administrator cannot use the difference between 403 and
+  // 404 to find out which student codes exist.
+  if (!canEdit(req, res, found)) return;
   try {
-    const { parentId: rawParentId, parentName, parentPhone, ...rest } = req.body || {};
+    // stripAttribution because the spread below puts req.body straight into
+    // Prisma's data: without it a caller could post createdByAdminId and hand
+    // the record to themselves, which is exactly the check just made above.
+    const { parentId: rawParentId, parentName, parentPhone, ...rest } = stripAttribution(req.body || {});
     const data = { ...rest };
     if (rawParentId !== undefined || parentName !== undefined || parentPhone !== undefined) {
       data.parentId = await resolveParentId(schoolId, { parentId: rawParentId, parentName, parentPhone });
@@ -297,10 +307,14 @@ router.get('/:id/fee-override', requireAdmin, async (req, res) => {
 // COMPLETE set — an omitted fee is removed for them. Then reconciles their
 // existing charges to the new amounts.
 router.put('/:id/fee-override', requireAdmin, async (req, res) => {
+  // Detaching a student from their class fees is an edit OF THAT STUDENT, so it
+  // answers to the same rule PUT /:id does — resolved below, once the row has
+  // been read, because the rule compares against the row.
   try {
     const schoolId = req.user.schoolId;
     const student = await findStudent(schoolId, req.params.id);
     if (!student) return res.status(404).json({ error: 'Not found' });
+    if (!canEdit(req, res, student)) return;
 
     const { fees } = req.body || {};
     if (!Array.isArray(fees)) return res.status(400).json({ error: 'fees array required' });
@@ -346,11 +360,15 @@ router.put('/:id/fee-override', requireAdmin, async (req, res) => {
 
 // DELETE /students/:id/fee-override — re-attach to the standard class fees,
 // discarding the custom setup.
+// Re-attaching a student to their class fees. An EDIT of the student, not a
+// record deletion — nothing is destroyed, the student goes back onto the
+// standard structure — so it carries canEdit rather than canDelete.
 router.delete('/:id/fee-override', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const student = await findStudent(schoolId, req.params.id);
     if (!student) return res.status(404).json({ error: 'Not found' });
+    if (!canEdit(req, res, student)) return;
     const rebill = await removeStudentFeeOverride(prisma, schoolId, student.id);
     res.json({ studentId: student.code, overridden: false, rebill });
   } catch (e) {
@@ -367,6 +385,10 @@ router.delete('/:id/fee-override', requireAdmin, async (req, res) => {
 // The shared Parent record is intentionally left alone: it may still be
 // linked to the student's siblings.
 router.delete('/:id', requireAdmin, async (req, res) => {
+  // Owner only, whoever enrolled the student. Deleting a student takes their
+  // ledger, attendance and marks with it, which is not an edit at scale — it is
+  // the loss of everything the school recorded about a child.
+  if (!canDelete(req, res)) return;
   const schoolId = req.user.schoolId;
   const found = await prisma.student.findFirst({ where: { schoolId, OR: [{ code: req.params.id }, { id: parseInt(req.params.id) || 0 }] } });
   if (!found) return res.status(404).json({ error: 'Not found' });

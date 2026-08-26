@@ -63,9 +63,15 @@ model Student {
   pickupContacts     PickupContact[]
   marks              StudentMark[]
 
+  /// WHO ENROLLED THIS STUDENT. See the note on AdminUser.role.
+  createdBy        AdminUser? @relation("StudentCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   @@index([schoolId])
   @@index([schoolId, class])
   @@index([parentId])
+  @@index([createdByAdminId])
 }
 
 // A parent/guardian contact, shared across however many of their children are
@@ -140,6 +146,11 @@ model Staff {
   subjectAssignments    ClassSubjectTeacher[]
   ledgerEntries         LedgerEntry[]
 
+  /// WHO ADDED THIS STAFF MEMBER. See the note on AdminUser.role.
+  createdBy        AdminUser? @relation("StaffCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   // All three are scoped per school, never globally: the same person can
   // legitimately be on staff at more than one school, so one school holding
   // their email, phone or ID must not block another from entering them — nor
@@ -149,6 +160,7 @@ model Staff {
   @@unique([schoolId, phone])
   @@unique([schoolId, idNumber])
   @@index([schoolId])
+  @@index([createdByAdminId])
 }
 
 model Expense {
@@ -168,8 +180,14 @@ model Expense {
   // that another school already used the number.
   invoiceNumber String
 
+  /// WHO RECORDED THIS EXPENSE. See the note on AdminUser.role.
+  createdBy        AdminUser? @relation("ExpenseCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   @@unique([schoolId, invoiceNumber])
   @@index([schoolId, date])
+  @@index([createdByAdminId])
 }
 
 model AttendanceRecord {
@@ -184,6 +202,15 @@ model AttendanceRecord {
   status     String
   remarks    String?
 
+  /// WHO TOOK THIS REGISTER. Nullable on both counts, and for two different
+  /// reasons. A teacher may mark attendance (POST /attendance/mark and /bulk),
+  /// and a teacher is not an AdminUser — so the id stays NULL while the name
+  /// records who it actually was. Every row written before this feature has
+  /// neither, which reads as "not recorded" rather than as anybody.
+  createdBy        AdminUser? @relation("AttendanceRecordCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   /// One record per person per DAY. Attendance is a yes/no fact about a date, so
   /// a second row for the same person and day is never a second fact — it is a
   /// duplicate that double-counts in every percentage derived from it, including
@@ -195,6 +222,7 @@ model AttendanceRecord {
   @@unique([schoolId, type, personId, date])
   @@index([schoolId, date])
   @@index([schoolId, personId])
+  @@index([createdByAdminId])
 }
 
 model WorkRecord {
@@ -214,8 +242,14 @@ model WorkRecord {
   evaluation String
   remarks    String?
 
+  /// WHO WROTE THIS RECORD UP. See the note on AdminUser.role.
+  createdBy        AdminUser? @relation("WorkRecordCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   @@index([schoolId])
   @@index([staffId, schoolId])
+  @@index([createdByAdminId])
 }
 
 model ReportCard {
@@ -520,8 +554,16 @@ model School {
   /// dismissed it; a bare `true` says nothing useful a month later.
   setupWizardCompletedAt    DateTime?
   subjectsPerClass          Json
-  adminUser                 AdminUser            @relation(fields: [adminUserId], references: [id])
+  /// THE OWNER. Named because there are now two relations between School and
+  /// AdminUser and Prisma disambiguates them by name; naming an explicit
+  /// fields/references relation changes no SQL — the column and the constraint
+  /// keep the names they already have.
+  adminUser                 AdminUser            @relation("SchoolOwner", fields: [adminUserId], references: [id])
   adminUserId               Int
+  /// The ADMINISTRATOR accounts the owner has invited into this school. They do
+  /// not own it — adminUserId above is still the single owning account — so this
+  /// is the only thing that scopes them to a school at all. See loadAdminActor.
+  admins                    AdminUser[]          @relation("SchoolAdmins")
   Student                   Student[]
   Parent                    Parent[]
   Staff                     Staff[]
@@ -791,6 +833,14 @@ model LedgerEntry {
   createdAt            DateTime            @default(now())
   updatedAt            DateTime            @updatedAt
 
+  /// WHO RECORDED THIS ENTRY. NULL on both columns for the fee-structure rows
+  /// syncLevelFeeCharges writes: nobody records those by hand, so attributing
+  /// them to whoever happened to trigger the sync would name the wrong person.
+  /// See isFeeStructureCharge above and the note on AdminUser.role.
+  createdBy        AdminUser? @relation("LedgerEntryCreatedBy", fields: [createdByAdminId], references: [id])
+  createdByAdminId Int?
+  createdByName    String?
+
   /// A staff member's month can be paid at most once, enforced by the database
   /// rather than by a check-then-insert that two admins could race through.
   /// Only payroll rows carry a payrollMonth, and NULLs are distinct in Postgres,
@@ -805,22 +855,73 @@ model LedgerEntry {
   /// Drives "how much of this charge has been settled?", which the owing endpoint
   /// asks per standalone charge.
   @@index([settlesEntryId])
+  @@index([createdByAdminId])
+}
+
+/// Who an account is INSIDE ONE SCHOOL. Nothing to do with PlatformRole, which
+/// is a role on the internal team — the two enums live on different tables and
+/// must never be compared or substituted for one another. Nor with Staff.role,
+/// which is a free-text job title.
+enum AdminRole {
+  /// The account created at signup, which owns the School row. It may do
+  /// anything: edit or delete any record whoever made it, and invite and remove
+  /// Administrators.
+  OWNER
+  /// An account the Owner invited. It does the day-to-day work but may only
+  /// edit what it created itself, may delete nothing, and cannot see the
+  /// Administrators section at all. Enforced in the API, not by hiding buttons.
+  ADMINISTRATOR
 }
 
 model AdminUser {
-  id            Int      @id @default(autoincrement())
-  phoneNumber   String   @unique
-  email         String?  @unique
-  passwordHash  String
-  name          String
-  role          String   @default("admin")
-  isActive      Boolean  @default(true)
-  emailVerified Boolean  @default(false)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  School        School[]
+  id               Int       @id @default(autoincrement())
+  /// OPTIONAL since Administrator invites. An Owner always has one — signup
+  /// asks for it — but an invite carries a name and an email and nothing else,
+  /// so an invited account has no number until it chooses to add one. NULLs are
+  /// distinct in a unique index, so any number of accounts may have none.
+  phoneNumber      String?   @unique
+  email            String?   @unique
+  /// OPTIONAL for the same reason, and it carries the same meaning it does on
+  /// Staff: NULL is "cannot log in yet", never "locked out". An invited
+  /// Administrator has none until they follow their emailed link and choose a
+  /// password. NEVER compare a supplied password against a NULL hash — treat
+  /// NULL as no-login before any bcrypt call, which is what POST /auth/login does.
+  passwordHash     String?
+  name             String
+  /// WAS a free-text String defaulting to "admin", written at signup and read by
+  /// nothing. It is now the enum above, and OWNER is the default precisely so
+  /// that every account that existed before this — all of which were the school
+  /// signup account — keeps every power it had.
+  role             AdminRole @default(OWNER)
+  isActive         Boolean   @default(true)
+  emailVerified    Boolean   @default(false)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  /// The school this account OWNS. An array only because the relation is
+  /// modelled from School.adminUserId; in practice it holds one row for an
+  /// OWNER and none at all for an ADMINISTRATOR.
+  School           School[]  @relation("SchoolOwner")
+  /// The school this account is a MEMBER of, which is how an ADMINISTRATOR is
+  /// scoped. Set on exactly the accounts School above is empty for. An OWNER
+  /// leaves it NULL and is scoped by the school it owns instead — see
+  /// loadAdminActor in src/auth.js, which accepts either and refuses a session
+  /// that has neither rather than letting a query run unscoped.
+  memberOfSchool   School?   @relation("SchoolAdmins", fields: [memberOfSchoolId], references: [id])
+  memberOfSchoolId Int?
 
   passwordResetTokens PasswordResetToken[]
+
+  /// Everything this account has created. Present so Prisma can express the
+  /// other side of each createdBy; nothing reads these arrays — attribution is
+  /// read off the record, from createdByName, not by walking back from here.
+  createdStudents   Student[]          @relation("StudentCreatedBy")
+  createdStaff      Staff[]            @relation("StaffCreatedBy")
+  createdLedger     LedgerEntry[]      @relation("LedgerEntryCreatedBy")
+  createdAttendance AttendanceRecord[] @relation("AttendanceRecordCreatedBy")
+  createdWork       WorkRecord[]       @relation("WorkRecordCreatedBy")
+  createdExpenses   Expense[]          @relation("ExpenseCreatedBy")
+
+  @@index([memberOfSchoolId])
 }
 
 /// Who a platform account is on the INTERNAL team. Nothing to do with
