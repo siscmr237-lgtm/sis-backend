@@ -13,10 +13,6 @@
     {
       "path": "/cron/apply-term-end-zeros",
       "schedule": "25 2 * * *"
-    },
-    {
-      "path": "/cron/auto-approve-staff-attendance",
-      "schedule": "0 * * * *"
     }
   ]
 }
