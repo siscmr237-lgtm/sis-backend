@@ -1,4 +1,5 @@
 const { prisma } = require('../db/prisma');
+const { resolveAssessmentNames } = require('./assessmentNames');
 
 /**
  * The assessment structure a class starts a term with.
@@ -9,28 +10,36 @@ const { prisma } = require('../db/prisma');
  * ensureDefaultTestExams only ever fills a (class, year, term) that is missing a
  * default BY NAME, and the backfill runs once per term rather than on a timer.
  *
+ * COUNTS, NOT NAMES. Only the shape of a term is written down here; the names
+ * come from resolveAssessmentNames, the same function the Manage Sequence Tests
+ * & Exams dialog uses when a school saves a structure of its own. Spelling the
+ * names out a second time is exactly how the seeded set and the hand-built one
+ * would drift apart.
+ *
  * Term 3 is deliberately shorter: it is the shortest term in the calendar
- * (Apr 1 – Jun 14, see src/utils/academicTerm.js) and carries one test plus the
- * exam rather than three.
+ * (Apr 1 – Jun 14, see src/utils/academicTerm.js) and carries one sequence test
+ * plus the exam rather than three.
  */
-const DEFAULT_TEST_EXAM_STRUCTURE = {
-  'Term 1': [
-    { name: 'Test 1', type: 'TEST', order: 1 },
-    { name: 'Test 2', type: 'TEST', order: 2 },
-    { name: 'Test 3', type: 'TEST', order: 3 },
-    { name: 'Exam', type: 'EXAM', order: 4 },
-  ],
-  'Term 2': [
-    { name: 'Test 1', type: 'TEST', order: 1 },
-    { name: 'Test 2', type: 'TEST', order: 2 },
-    { name: 'Test 3', type: 'TEST', order: 3 },
-    { name: 'Exam', type: 'EXAM', order: 4 },
-  ],
-  'Term 3': [
-    { name: 'Test 1', type: 'TEST', order: 1 },
-    { name: 'Exam', type: 'EXAM', order: 2 },
-  ],
+const DEFAULT_TEST_EXAM_COUNTS = {
+  'Term 1': { tests: 3, exams: 1 },
+  'Term 2': { tests: 3, exams: 1 },
+  'Term 3': { tests: 1, exams: 1 },
 };
+
+/** The seeded rows for one term: [{ name, type, order }]. */
+function buildDefaultsFor(term) {
+  const counts = DEFAULT_TEST_EXAM_COUNTS[String(term)];
+  if (!counts) return [];
+  return resolveAssessmentNames(
+    term,
+    Array.from({ length: counts.tests }, () => ({})),
+    Array.from({ length: counts.exams }, () => ({})),
+  ).map(({ name, type, order }) => ({ name, type, order }));
+}
+
+const DEFAULT_TEST_EXAM_STRUCTURE = Object.fromEntries(
+  Object.keys(DEFAULT_TEST_EXAM_COUNTS).map((term) => [term, buildDefaultsFor(term)]),
+);
 
 const DEFAULT_TERMS = Object.keys(DEFAULT_TEST_EXAM_STRUCTURE);
 
@@ -124,6 +133,7 @@ async function ensureDefaultTestExamsForYear({ schoolId, classId, academicYear }
 }
 
 module.exports = {
+  DEFAULT_TEST_EXAM_COUNTS,
   DEFAULT_TEST_EXAM_STRUCTURE,
   DEFAULT_TERMS,
   defaultsForTerm,

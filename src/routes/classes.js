@@ -616,7 +616,7 @@ router.post('/', async (req, res) => {
     });
 
     // A new class arrives with the default assessment structure for the whole of
-    // the school's current year, so a teacher never meets an empty Tests & Exams
+    // the school's current year, so a teacher never meets an empty Sequence Tests & Exams
     // screen. Best-effort: the class itself is created and returned either way,
     // because failing the creation over its starting structure would be a worse
     // outcome than a class the backfill can top up later. Idempotent, so a retry
@@ -840,7 +840,7 @@ router.delete('/:id/subject-teachers/:assignmentId', async (req, res) => {
 // GET /classes/:id/subjects
 //
 // Kept at this URL but resolved from the class's LEVEL, so existing callers —
-// Tests & Exams, marks entry, report cards — pick up level-scoped subjects
+// Sequence Tests & Exams, marks entry, report cards — pick up level-scoped subjects
 // without changing. A student in any section sees their level's subjects.
 router.get('/:id/subjects', async (req, res) => {
   try {
