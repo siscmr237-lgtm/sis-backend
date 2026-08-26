@@ -360,7 +360,7 @@ router.delete('/:id/fee-override', requireAdmin, async (req, res) => {
 
 // DELETE /students/:id — removes the student and every record that
 // references them, so no other page (Finance, Report Cards, Attendance,
-// Tests & Exams) is left holding a dangling reference. PgBouncer transaction
+// Sequence Tests & Exams) is left holding a dangling reference. PgBouncer transaction
 // mode doesn't support interactive transactions, so these run sequentially in
 // dependency order (children first) rather than wrapped in $transaction — the
 // same approach scripts/delete-all-schools.js uses for the same reason.

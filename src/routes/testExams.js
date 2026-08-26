@@ -1,6 +1,8 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
 const { classLevelOf } = require('../utils/classLevels');
+const { resolveAssessmentNames } = require('../utils/assessmentNames');
+const { nextAutoName, reconcileAutoNamesQuietly } = require('../utils/assessmentStructure');
 const { resolveEffectiveSchoolTerm, termHasEnded } = require('../utils/academicTerm');
 const { applyTermEndZerosQuietly } = require('../utils/termEndZeros');
 const { applyActivationZeros } = require('../utils/markActivation');
@@ -82,6 +84,18 @@ async function resolveStudent(schoolId, studentId) {
 
 async function resolveTestExam(schoolId, id) {
   return prisma.testExam.findFirst({ where: { schoolId, id: toId(id) } });
+}
+
+/**
+ * The (class, year, term) buckets an edit disturbed — one when the assessment
+ * stayed put, two when it was moved. Automatic names describe a position within
+ * a bucket, so BOTH ends of a move have to be re-resolved: the one it left is
+ * now a paper short, and the one it joined is a paper longer.
+ */
+function periodsTouchedBy(before, after) {
+  const key = (r) => `${r.classId}|${r.academicYear}|${r.term}`;
+  const scope = (r) => ({ classId: r.classId, academicYear: r.academicYear, term: r.term });
+  return key(before) === key(after) ? [scope(after)] : [scope(before), scope(after)];
 }
 
 // Resolves the academicYear/term to compute against: explicit query params win,
@@ -421,6 +435,275 @@ router.get('/student-breakdown', requireAdmin, async (req, res) => {
   }
 });
 
+/* ------------------------------------------------------------------------- *
+ * The assessment STRUCTURE of a class level, for one term.
+ *
+ * A TestExam row is per SECTION — the schema keys on (classId, academicYear,
+ * term, name) — but the structure it describes belongs to the LEVEL: every
+ * section of "Class 1" sits the same sequence tests and the same exams. These
+ * two endpoints are what make that true rather than merely intended. Before
+ * them the dialog read one section and fanned each edit out itself, a request
+ * per section, with nothing able to tell a half-applied change from a finished
+ * one.
+ *
+ * MATCHING IS BY POSITION WITHIN TYPE — not by id, not by name. The i-th
+ * sequence test the school sends replaces the i-th sequence test the section
+ * holds. That is what lets "this term runs 3 sequence tests" mean what it says:
+ * raising the count appends, lowering it removes from the end, and renaming any
+ * of them disturbs nothing else. It also squares up sections that had already
+ * drifted, which neither ids (representative-only, so meaningless to the other
+ * sections) nor names (the very thing being edited) can do.
+ * ------------------------------------------------------------------------- */
+
+// Generous rather than tight: the point is to stop a runaway request, not to
+// tell a school how many papers its term may hold.
+const MAX_STRUCTURE_ROWS = 40;
+const MAX_NAME_LENGTH = 80;
+
+/** The sections of a level, ordered the way a person reads them: A, B, C. */
+async function sectionsOfLevel(schoolId, level) {
+  const classes = await prisma.class.findMany({
+    where: { schoolId },
+    select: { id: true, name: true },
+  });
+  return classes
+    .filter((c) => classLevelOf(c.name) === level)
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+/** One section's rows for a period, split by type and ordered as they are sat. */
+function splitByType(rows) {
+  const byOrder = [...rows].sort((a, b) => (a.order - b.order) || (a.id - b.id));
+  return {
+    tests: byOrder.filter((r) => r.type === 'TEST'),
+    exams: byOrder.filter((r) => r.type === 'EXAM'),
+  };
+}
+
+// GET /test-exams/levels/:level/structure?term=&academicYear=
+//
+// The level's structure in the shape the dialog edits it: two ordered lists.
+// Read from the FIRST section and reported as the level's, which holds because
+// saving writes every section identically; a level that drifted before this
+// existed reads as its first section's shape and is squared up by the next save.
+//
+// markCount is counted across EVERY section, because deleting an assessment
+// deletes it from all of them. It is what lets the dialog warn honestly before
+// a count is lowered instead of after.
+router.get('/levels/:level/structure', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const { term, academicYear } = resolvePeriod(req);
+
+    const sections = await sectionsOfLevel(schoolId, level);
+    if (!sections.length) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    const allRows = await prisma.testExam.findMany({
+      where: { schoolId, classId: { in: sections.map((s) => s.id) }, academicYear, term },
+      select: { id: true, classId: true, name: true, type: true, order: true, activatedAt: true },
+    });
+
+    const counts = allRows.length
+      ? await prisma.studentMark.groupBy({
+        by: ['testExamId'],
+        where: { testExamId: { in: allRows.map((r) => r.id) } },
+        _count: { _all: true },
+      })
+      : [];
+    // groupBy keys on the per-section row id, so the tallies are folded back
+    // onto the NAME — that is what identifies one assessment across the level.
+    const nameOfId = new Map(allRows.map((r) => [r.id, r.name]));
+    const marksByName = new Map();
+    for (const c of counts) {
+      const name = nameOfId.get(c.testExamId);
+      if (name != null) marksByName.set(name, (marksByName.get(name) ?? 0) + c._count._all);
+    }
+
+    const shape = (r) => ({
+      id: r.id,
+      name: r.name,
+      order: r.order,
+      markCount: marksByName.get(r.name) ?? 0,
+      // Written: a mark has been entered against this paper at some point, and
+      // that never becomes untrue again — deleting every mark afterwards does
+      // not un-sit a paper. Reported alongside markCount because the two can
+      // disagree: a paper whose marks were all cleared reads 0 marks but is
+      // still one the school has actually run.
+      activated: r.activatedAt != null,
+    });
+
+    const { tests, exams } = splitByType(allRows.filter((r) => r.classId === sections[0].id));
+    res.json({
+      classLevel: level,
+      sections: sections.map((s) => ({ id: s.id, name: s.name })),
+      term,
+      academicYear,
+      tests: tests.map(shape),
+      exams: exams.map(shape),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT /test-exams/levels/:level/structure
+// Body: { term, academicYear, tests: [{ name? }], exams: [{ name? }], confirmDelete? }
+//
+// Sets a whole term's structure across every section of the level at once. The
+// two lists ARE the answer to "how many sequence tests and how many exams does
+// this term run" — their lengths are the counts, and every name is optional. A
+// blank one is filled by resolveAssessmentNames, so a school that just wants
+// three tests and an exam gets "1st/2nd/3rd Sequence Test" and "1st Term Exam"
+// without typing anything.
+//
+// IT REFUSES TO DESTROY MARKS SILENTLY. Shortening a list deletes the rows past
+// the new end, and deleting a TestExam cascades its subject totals AND every
+// mark entered against it. When any doomed row holds marks the save is refused
+// with 409 and the names listed; only a `confirmDelete: true` retry goes
+// through. Nothing is written on the refusal.
+router.put('/levels/:level/structure', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const { term, academicYear, tests, exams, confirmDelete } = req.body || {};
+
+    if (!term) return res.status(400).json({ error: 'term is required' });
+    if (!academicYear) return res.status(400).json({ error: 'academicYear is required' });
+    if (!Array.isArray(tests) || !Array.isArray(exams)) {
+      return res.status(400).json({ error: 'tests and exams must each be a list' });
+    }
+    if (tests.length + exams.length > MAX_STRUCTURE_ROWS) {
+      return res.status(400).json({ error: `A term can hold at most ${MAX_STRUCTURE_ROWS} sequence tests and exams together.` });
+    }
+
+    const desired = resolveAssessmentNames(term, tests, exams);
+
+    // A duplicate name would hit the unique index part-way through the write and
+    // fail for a reason nobody could read off the screen, so it is caught here,
+    // where the message can name the collision.
+    const seen = new Set();
+    for (const row of desired) {
+      if (row.name.length > MAX_NAME_LENGTH) {
+        return res.status(400).json({ error: `"${row.name}" is too long — keep names under ${MAX_NAME_LENGTH} characters.` });
+      }
+      const key = row.name.toLowerCase();
+      if (seen.has(key)) {
+        return res.status(400).json({ error: `Two assessments are both called "${row.name}". Names must differ within a term.` });
+      }
+      seen.add(key);
+    }
+
+    const sections = await sectionsOfLevel(schoolId, level);
+    if (!sections.length) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    const existing = await prisma.testExam.findMany({
+      where: { schoolId, classId: { in: sections.map((s) => s.id) }, academicYear: String(academicYear), term: String(term) },
+      select: { id: true, classId: true, name: true, type: true, order: true },
+    });
+    const bySection = new Map(
+      sections.map((s) => [s.id, splitByType(existing.filter((r) => r.classId === s.id))]),
+    );
+
+    // Everything this save would delete, across every section.
+    const doomed = [];
+    for (const section of sections) {
+      const have = bySection.get(section.id);
+      doomed.push(...have.tests.slice(tests.length), ...have.exams.slice(exams.length));
+    }
+
+    if (doomed.length && !confirmDelete) {
+      const withMarks = await prisma.studentMark.groupBy({
+        by: ['testExamId'],
+        where: { testExamId: { in: doomed.map((d) => d.id) } },
+        _count: { _all: true },
+      });
+      if (withMarks.length) {
+        const atRisk = new Set(withMarks.map((w) => w.testExamId));
+        const names = [...new Set(doomed.filter((d) => atRisk.has(d.id)).map((d) => d.name))];
+        return res.status(409).json({
+          code: 'DELETES_MARKS',
+          names,
+          markCount: withMarks.reduce((sum, w) => sum + w._count._all, 0),
+          error: `Removing ${names.join(', ')} also deletes every mark already entered against ${names.length > 1 ? 'them' : 'it'}.`,
+        });
+      }
+    }
+
+    // ONE transaction for the whole level. A partial apply is the failure this
+    // replaces: it leaves sections of the same level sitting different papers,
+    // and nothing afterwards can tell that from a difference somebody meant.
+    //
+    // Deletes first, then renames, then creates — the unique index on
+    // (classId, academicYear, term, name) is checked per statement, so a name
+    // freed by a shortened list, or swapped between two rows, would otherwise
+    // collide with a row that is on its way out.
+    await prisma.$transaction(async (tx) => {
+      if (doomed.length) {
+        await tx.testExam.deleteMany({ where: { id: { in: doomed.map((d) => d.id) } } });
+      }
+
+      // Renames go out in two passes through a name nothing else can hold, so a
+      // straight swap ("1st Sequence Test" <-> "2nd Sequence Test") cannot fail
+      // on the index half way through.
+      const renames = [];
+      const creates = [];
+      for (const section of sections) {
+        const have = bySection.get(section.id);
+        for (const want of desired) {
+          const pool = want.type === 'TEST' ? have.tests : have.exams;
+          const at = (want.type === 'TEST' ? want.order : want.order - tests.length) - 1;
+          const row = pool[at];
+          if (!row) {
+            creates.push({
+              schoolId,
+              classId: section.id,
+              academicYear: String(academicYear),
+              term: String(term),
+              name: want.name,
+              type: want.type,
+              order: want.order,
+            });
+          } else if (row.name !== want.name || row.order !== want.order) {
+            renames.push({ id: row.id, name: want.name, order: want.order, renamed: row.name !== want.name });
+          }
+        }
+      }
+
+      for (const r of renames) {
+        if (r.renamed) await tx.testExam.update({ where: { id: r.id }, data: { name: `__restructuring_${r.id}__` } });
+      }
+      for (const r of renames) {
+        await tx.testExam.update({ where: { id: r.id }, data: { name: r.name, order: r.order } });
+      }
+      if (creates.length) await tx.testExam.createMany({ data: creates });
+    }, { timeout: 30000, maxWait: 15000 });
+
+    const saved = await prisma.testExam.findMany({
+      where: { schoolId, classId: sections[0].id, academicYear: String(academicYear), term: String(term) },
+      select: { id: true, name: true, type: true, order: true },
+    });
+    const { tests: outTests, exams: outExams } = splitByType(saved);
+    res.json({
+      classLevel: level,
+      sections: sections.map((s) => ({ id: s.id, name: s.name })),
+      term: String(term),
+      academicYear: String(academicYear),
+      tests: outTests,
+      exams: outExams,
+    });
+  } catch (e) {
+    if (e.code === 'P2002') {
+      return res.status(409).json({ error: 'Two assessments in this term ended up with the same name. Rename one and try again.' });
+    }
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // GET /test-exams?classId=&term=&academicYear=
 router.get('/', async (req, res) => {
   try {
@@ -467,6 +750,12 @@ router.get('/:id', async (req, res) => {
 
 // POST /test-exams
 // Body: { classId, academicYear, term, name, type, order? }
+//
+// NAME IS OPTIONAL. Left out, the row is named for where it lands — the term's
+// 3rd sequence test becomes "3rd Sequence Test" — and its automatically-named
+// siblings are renamed to match the term's new shape. That second half matters
+// for exams: a term with one exam calls it "1st Term Exam", and adding a second
+// turns that into "1st Term Exam 1". See src/utils/assessmentStructure.js.
 router.post('/', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
@@ -475,7 +764,6 @@ router.post('/', requireAdmin, async (req, res) => {
     if (!classId) return res.status(400).json({ error: 'classId is required' });
     if (!academicYear) return res.status(400).json({ error: 'academicYear is required' });
     if (!term) return res.status(400).json({ error: 'term is required' });
-    if (!name) return res.status(400).json({ error: 'name is required' });
     if (!VALID_TYPES.includes(type)) return res.status(400).json({ error: `type must be one of: ${VALID_TYPES.join(', ')}` });
 
     const cls = await resolveClass(schoolId, classId);
@@ -489,20 +777,30 @@ router.post('/', requireAdmin, async (req, res) => {
       }
     }
 
+    const typed = String(name ?? '').trim();
+    const resolvedName = typed || await nextAutoName(prisma, {
+      schoolId, classId: cls.id, academicYear, term, type,
+    });
+
     const created = await prisma.testExam.create({
       data: {
         schoolId,
         classId: cls.id,
         academicYear: String(academicYear),
         term: String(term),
-        name: String(name),
+        name: resolvedName,
         type,
         ...(orderValue !== undefined && { order: orderValue }),
       },
     });
-    res.status(201).json(created);
+
+    // After the create, never before: the row that has just been added is what
+    // changes what its neighbours should be called.
+    await reconcileAutoNamesQuietly({ schoolId, classId: cls.id, academicYear, term });
+    const fresh = await prisma.testExam.findUnique({ where: { id: created.id } });
+    res.status(201).json(fresh ?? created);
   } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ error: 'A test/exam with this name already exists for this class, term, and academic year.' });
+    if (e.code === 'P2002') return res.status(409).json({ error: 'A sequence test or exam with this name already exists for this class, term, and academic year.' });
     res.status(400).json({ error: e.message });
   }
 });
@@ -538,9 +836,16 @@ router.put('/:id', requireAdmin, async (req, res) => {
     }
 
     const updated = await prisma.testExam.update({ where: { id: found.id }, data });
-    res.json(updated);
+
+    // Both the term it left and the term it landed in: moving an exam out of
+    // Term 1 can take that term back down to a single exam, which renames the
+    // one left behind from "1st Term Exam 1" to "1st Term Exam".
+    for (const scope of periodsTouchedBy(found, updated)) {
+      await reconcileAutoNamesQuietly({ schoolId, ...scope });
+    }
+    res.json(await prisma.testExam.findUnique({ where: { id: found.id } }) ?? updated);
   } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ error: 'A test/exam with this name already exists for this class, term, and academic year.' });
+    if (e.code === 'P2002') return res.status(409).json({ error: 'A sequence test or exam with this name already exists for this class, term, and academic year.' });
     res.status(400).json({ error: e.message });
   }
 });
@@ -552,6 +857,12 @@ router.delete('/:id', requireAdmin, async (req, res) => {
     const found = await resolveTestExam(schoolId, req.params.id);
     if (!found) return res.status(404).json({ error: 'Not found' });
     await prisma.testExam.delete({ where: { id: found.id } });
+
+    // Dropping a term back to one exam renames it: "2nd Term Exam 1" becomes
+    // "2nd Term Exam", because that is what a term with a single exam is called.
+    await reconcileAutoNamesQuietly({
+      schoolId, classId: found.classId, academicYear: found.academicYear, term: found.term,
+    });
     res.json(found);
   } catch (e) {
     res.status(400).json({ error: e.message });
@@ -563,7 +874,7 @@ router.get('/:id/subject-totals', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const testExam = await resolveTestExam(schoolId, req.params.id);
-    if (!testExam) return res.status(404).json({ error: 'Test/exam not found' });
+    if (!testExam) return res.status(404).json({ error: 'Sequence test or exam not found' });
     if (isTeacher(req.user) && !(await teacherMaySeeClass(req.user, testExam.classId))) {
       return forbid(res, 'You are not assigned to this class.');
     }
@@ -587,7 +898,7 @@ router.get('/:id/marks', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const testExam = await resolveTestExam(schoolId, req.params.id);
-    if (!testExam) return res.status(404).json({ error: 'Test/exam not found' });
+    if (!testExam) return res.status(404).json({ error: 'Sequence test or exam not found' });
 
     const subject = await resolveSubject(schoolId, req.query.subjectId);
     if (!subject) return res.status(400).json({ error: 'Invalid subjectId' });
@@ -608,7 +919,7 @@ router.get('/:id/marks', async (req, res) => {
     if (!levelSubject) return res.status(400).json({ error: 'That subject is not taught at this class level.' });
 
     const cls = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId } });
-    if (!cls) return res.status(400).json({ error: "This test/exam's class no longer exists." });
+    if (!cls) return res.status(400).json({ error: "This assessment's class no longer exists." });
 
     // Swept before reading so a term that has ended shows its zeros here — the
     // marks screen is where a teacher would otherwise see blanks that the rest
@@ -663,7 +974,7 @@ router.put('/:id/subject-totals/:subjectId', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const testExam = await resolveTestExam(schoolId, req.params.id);
-    if (!testExam) return res.status(404).json({ error: 'Test/exam not found' });
+    if (!testExam) return res.status(404).json({ error: 'Sequence test or exam not found' });
 
     const subject = await resolveSubject(schoolId, req.params.subjectId);
     if (!subject) return res.status(404).json({ error: 'Subject not found' });
@@ -709,7 +1020,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const testExam = await resolveTestExam(schoolId, req.params.id);
-    if (!testExam) return res.status(404).json({ error: 'Test/exam not found' });
+    if (!testExam) return res.status(404).json({ error: 'Sequence test or exam not found' });
 
     const { subjectId, marks, entries } = req.body || {};
     const subject = await resolveSubject(schoolId, subjectId);
@@ -733,7 +1044,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
       where: { testExamId_subjectId: { testExamId: testExam.id, subjectId: subject.id } },
     });
     if (!subjectTotal) {
-      return res.status(400).json({ error: 'Configure a total for this subject on this test/exam before entering marks.' });
+      return res.status(400).json({ error: 'Configure a total for this subject on this assessment before entering marks.' });
     }
 
     // Normalise both body shapes into one list of { studentId, state, marksObtained }.
@@ -768,7 +1079,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
     }
 
     const cls = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId } });
-    if (!cls) return res.status(400).json({ error: "This test/exam's class no longer exists." });
+    if (!cls) return res.status(400).json({ error: "This assessment's class no longer exists." });
 
     const errors = [];
     const resolvedRows = [];
@@ -817,7 +1128,7 @@ router.post('/:id/marks/bulk', async (req, res) => {
       where: { testExamId_subjectId: { testExamId: testExam.id, subjectId: subject.id } },
     });
     if (!freshTotal) {
-      return res.status(400).json({ error: 'This test/exam or its subject total no longer exists; please retry.' });
+      return res.status(400).json({ error: 'This assessment or its subject total no longer exists; please retry.' });
     }
     const nowOverLimit = resolvedRows.filter((r) => r.state === 'MARKED' && r.marksObtained > freshTotal.totalMarks);
     if (nowOverLimit.length) {

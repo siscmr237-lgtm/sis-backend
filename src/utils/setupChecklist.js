@@ -154,7 +154,7 @@ async function buildSetupChecklist(prisma, schoolId) {
     },
     {
       id: 'assessment-totals',
-      title: 'Tests & exams subject totals',
+      title: 'Sequence tests & exams subject totals',
       description: 'What each subject is marked out of.',
       page: 'tests-exams',
       action: 'Set totals',
