@@ -988,17 +988,24 @@ router.put('/levels/:level/subject-totals', requireAdmin, async (req, res) => {
 });
 
 // POST /test-exams/levels/:level/structure/copy
-// Body: { term, academicYear, targetLevels: [], confirmDelete? }
+// Body: { academicYear, targetLevels: [], terms?: [], confirmDelete? }
 //
-// Copies ONE class level's whole set-up for a term — its sequence tests, its
-// exams, their names and order, and what every subject is marked out of — onto
-// other class levels.
+// Copies ONE class level's whole year of set-up — every term's sequence tests,
+// its exams, their names and order, and what every subject is marked out of —
+// onto other class levels.
+//
+// EVERY TERM THE SOURCE HAS SET UP, not the one the dialog happens to be
+// showing. A term-at-a-time copy is the same repetition it was meant to remove,
+// one level down: an admin who has laid out all three terms of Class 1 would
+// have to come back and press the button three times per target, and the term
+// they forget is the one that silently differs. `terms` narrows it when a caller
+// genuinely wants a subset; omitted, it means the whole year.
 //
 // The case it exists for is the same one the fee copy exists for: a school whose
-// Class 1 through Class 6 all run three sequence tests and one exam, each marked
-// out of the same totals, set out once and then repeated five times by hand.
-// That repetition is where two classes end up marked out of different totals by
-// a typo nobody notices until the report cards disagree.
+// Class 1 through Class 6 all run three sequence tests and one exam a term, each
+// marked out of the same totals, set out once and then repeated five times by
+// hand. That repetition is where two classes end up marked out of different
+// totals by a typo nobody notices until the report cards disagree.
 //
 // THE STRUCTURE IS REPLACED; THE TOTALS ARE MERGED. Those are different rules on
 // purpose, because the two deletions are not alike:
@@ -1010,8 +1017,13 @@ router.put('/levels/:level/subject-totals', requireAdmin, async (req, res) => {
 //   Totals — a TestExamSubjectTotal does NOT cascade its marks (StudentMark
 //   hangs off TestExam, not off the total), so deleting one leaves marks with no
 //   total to be out of, and every screen that scores them skips the subject
-//   silently. So totals are upserted: the source's are written, and a total the
-//   target holds for a subject the source does not cover is left standing.
+//   silently. So totals are written over, never cleared: a total the target
+//   holds for a subject the source does not cover is left standing.
+//
+// A TERM THE SOURCE HAS NOTHING IN IS NOT TOUCHED. Copying "no papers" onto a
+// term would delete whatever the target runs in it, which is a deletion nobody
+// asked for — the admin picked classes to receive a set-up, not terms to clear.
+// Only terms the source actually holds rows for are written.
 //
 // SUBJECTS ARE MATCHED BY ID and only where the TARGET actually teaches them.
 // Class levels do not have to share a subject list, and writing a total for a
@@ -1020,24 +1032,29 @@ router.put('/levels/:level/subject-totals', requireAdmin, async (req, res) => {
 //
 // A TOTAL IS NEVER LOWERED UNDER A MARK ALREADY ENTERED — same rule, and same
 // reasoning, as the bulk endpoint above. Here it is a skip rather than a refusal:
-// the admin is copying a whole level and cannot sensibly answer per subject, so
-// the pairs that would strand a mark are left alone and named in `skippedTotals`.
+// the admin is copying a whole year and cannot sensibly answer per subject, so
+// the pairs that would strand a mark are left alone and named in
+// `strandedSubjects`.
 //
-// ONE TRANSACTION PER TARGET LEVEL, and per target only — mirroring
+// ONE TRANSACTION PER TARGET LEVEL, covering all of its terms — mirroring
 // POST /classes/fees/copy. Wrapping every target together would let one bad level
-// discard five good ones; leaving them unwrapped would leave a level half
-// rebuilt. So each stands alone, and the response says which landed.
+// discard five good ones; splitting a single level's terms apart would let it
+// end up with Term 1 copied and Term 2 not, which is the half-applied state the
+// whole endpoint exists to prevent. So each level stands alone and lands whole,
+// and the response says which did.
 router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const source = String(req.params.level);
-    const { term, academicYear, targetLevels, confirmDelete } = req.body || {};
+    const { academicYear, targetLevels, terms, confirmDelete } = req.body || {};
 
-    if (!term) return res.status(400).json({ error: 'term is required' });
     if (!academicYear) return res.status(400).json({ error: 'academicYear is required' });
     if (!Array.isArray(targetLevels) || !targetLevels.length) {
       return res.status(400).json({ error: 'targetLevels array required' });
     }
+    const onlyTerms = Array.isArray(terms) && terms.length
+      ? new Set(terms.map((t) => String(t ?? '').trim()).filter(Boolean))
+      : null;
 
     const sourceSections = await sectionsOfLevel(schoolId, source);
     if (!sourceSections.length) {
@@ -1059,81 +1076,99 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
       sectionsByTarget.set(target, rows);
     }
 
-    // Read ONCE, outside the transactions. The source is not among the targets,
-    // so nothing inside them can change it.
+    // Read ONCE, outside the transactions, for the whole year. The source is not
+    // among the targets, so nothing inside them can change it.
     const sourceRows = await prisma.testExam.findMany({
       where: {
         schoolId,
         classId: sourceSections[0].id,
         academicYear: String(academicYear),
-        term: String(term),
+        ...(onlyTerms ? { term: { in: [...onlyTerms] } } : {}),
       },
-      select: { id: true, name: true, type: true, order: true },
+      select: { id: true, name: true, type: true, order: true, term: true },
     });
     if (!sourceRows.length) {
-      return res.status(400).json({ error: `${source} has no sequence tests or exams in ${term} to copy.` });
+      return res.status(400).json({
+        error: onlyTerms
+          ? `${source} has no sequence tests or exams in ${[...onlyTerms].join(', ')} to copy.`
+          : `${source} has no sequence tests or exams set up in ${academicYear} to copy.`,
+      });
     }
-    const { tests: sourceTests, exams: sourceExams } = splitByType(sourceRows);
 
-    // Names are passed through as TYPED. This copies the set-up the source
-    // actually holds — a school that renamed its papers "CA1", "CA2" wants those
-    // names on the other classes too, not regenerated defaults.
-    const desired = resolveAssessmentNames(
-      term,
-      sourceTests.map((r) => ({ name: r.name })),
-      sourceExams.map((r) => ({ name: r.name })),
-    );
-    const problem = structureProblem(desired);
-    if (problem) return res.status(400).json({ error: problem });
+    // One plan per term the source actually holds rows for.
+    const plans = [];
+    const sourceTerms = [...new Set(sourceRows.map((r) => r.term))]
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    for (const t of sourceTerms) {
+      const { tests, exams } = splitByType(sourceRows.filter((r) => r.term === t));
+      // Names are passed through as TYPED. This copies the set-up the source
+      // actually holds — a school that renamed its papers "CA1", "CA2" wants
+      // those names on the other classes too, not regenerated defaults.
+      const desired = resolveAssessmentNames(
+        t,
+        tests.map((r) => ({ name: r.name })),
+        exams.map((r) => ({ name: r.name })),
+      );
+      const problem = structureProblem(desired);
+      if (problem) return res.status(400).json({ error: `${t}: ${problem}` });
+      plans.push({ term: t, desired, testCount: tests.length, examCount: exams.length });
+    }
 
-    // assessment name -> [{ subjectId, totalMarks }], read from the source's
-    // first section. Every section of a level carries the same totals.
+    // "term|assessment name" -> [{ subjectId, totalMarks }], read from the
+    // source's first section. Every section of a level carries the same totals.
     const sourceTotals = await prisma.testExamSubjectTotal.findMany({
       where: { testExamId: { in: sourceRows.map((r) => r.id) } },
       select: { testExamId: true, subjectId: true, totalMarks: true },
     });
-    const sourceNameOf = new Map(sourceRows.map((r) => [r.id, r.name]));
-    const totalsByName = new Map();
+    const sourceKeyOf = new Map(sourceRows.map((r) => [r.id, `${r.term}|${r.name}`]));
+    const totalsByKey = new Map();
     for (const t of sourceTotals) {
-      const key = sourceNameOf.get(t.testExamId);
+      const key = sourceKeyOf.get(t.testExamId);
       if (key == null) continue;
-      if (!totalsByName.has(key)) totalsByName.set(key, []);
-      totalsByName.get(key).push({ subjectId: t.subjectId, totalMarks: t.totalMarks });
+      if (!totalsByKey.has(key)) totalsByKey.set(key, []);
+      totalsByKey.get(key).push({ subjectId: t.subjectId, totalMarks: t.totalMarks });
     }
 
-    // Everything the whole request would delete, checked BEFORE any of it runs.
-    // Refusing target by target would leave the first few already rewritten by
-    // the time the admin is asked, which is not a question they can answer.
-    const doomedByTarget = new Map();
-    const existingByTarget = new Map();
+    // Everything the whole request would delete, across every target and every
+    // term, checked BEFORE any of it runs. Refusing target by target would leave
+    // the first few already rewritten by the time the admin is asked, which is
+    // not a question they can answer.
+    const stateByTarget = new Map();
     for (const target of targets) {
       const sections = sectionsByTarget.get(target);
-      const bySection = await existingBySection(schoolId, sections, academicYear, term);
-      existingByTarget.set(target, bySection);
-      doomedByTarget.set(target, doomedRowsFor(sections, bySection, sourceTests.length, sourceExams.length));
+      const perTerm = [];
+      for (const plan of plans) {
+        const bySection = await existingBySection(schoolId, sections, academicYear, plan.term);
+        perTerm.push({
+          ...plan,
+          bySection,
+          doomed: doomedRowsFor(sections, bySection, plan.testCount, plan.examCount),
+        });
+      }
+      stateByTarget.set(target, perTerm);
     }
 
     if (!confirmDelete) {
-      const allDoomed = [...doomedByTarget.values()].flat();
+      const allDoomed = [...stateByTarget.values()].flat().flatMap((s) => s.doomed);
       const { names, markCount } = await marksAtRisk(allDoomed);
       if (names.length) {
-        const levels = targets.filter((t) => (doomedByTarget.get(t) ?? []).length);
+        const levels = targets.filter((t) => stateByTarget.get(t).some((s) => s.doomed.length));
         return res.status(409).json({
           code: 'DELETES_MARKS',
           names,
           levels,
           markCount,
-          error: `${levels.join(', ')} run assessments ${source} does not. Copying removes ${names.join(', ')} and every mark already entered against ${names.length > 1 ? 'them' : 'it'}.`,
+          error: `${levels.join(', ')} run assessments ${source} does not. Copying removes ${[...new Set(names)].join(', ')} and every mark already entered against ${names.length > 1 ? 'them' : 'it'}.`,
         });
       }
     }
 
-    // Read for every target at once, and BEFORE the transactions — an id
-    // survives a rename, so a row's marks are just as findable now as they will
-    // be afterwards, and a row this creates has none by definition. Doing it
-    // here keeps the transactions to two statements each.
-    const existingTargetRowIds = targets.flatMap((t) => [...(existingByTarget.get(t)?.values() ?? [])]
-      .flatMap((have) => [...have.tests, ...have.exams].map((r) => r.id)));
+    // Read for every target and term at once, and BEFORE the transactions — an
+    // id survives a rename, so a row's marks are just as findable now as they
+    // will be afterwards, and a row this creates has none by definition. Doing
+    // it here keeps each transaction to a handful of statements.
+    const existingTargetRowIds = [...stateByTarget.values()].flat()
+      .flatMap((s) => [...s.bySection.values()].flatMap((have) => [...have.tests, ...have.exams].map((r) => r.id)));
     const highest = await highestMarksByExamSubject(prisma, existingTargetRowIds);
 
     const applied = [];
@@ -1142,8 +1177,7 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
     for (const target of targets) {
       try {
         const sections = sectionsByTarget.get(target);
-        const bySection = existingByTarget.get(target);
-        const doomed = doomedByTarget.get(target) ?? [];
+        const perTerm = stateByTarget.get(target);
 
         const levelSubjects = await prisma.classLevelSubject.findMany({
           where: { schoolId, classLevel: target },
@@ -1153,16 +1187,18 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
 
         const result = await prisma.$transaction(
           async (tx) => {
-            await applyStructureToSections(tx, {
-              schoolId,
-              sections,
-              bySection,
-              desired,
-              testCount: sourceTests.length,
-              academicYear,
-              term,
-              doomed,
-            });
+            for (const s of perTerm) {
+              await applyStructureToSections(tx, {
+                schoolId,
+                sections,
+                bySection: s.bySection,
+                desired: s.desired,
+                testCount: s.testCount,
+                academicYear,
+                term: s.term,
+                doomed: s.doomed,
+              });
+            }
 
             // Re-read INSIDE the transaction: the rows above were just created
             // or renamed, so their ids are only knowable now.
@@ -1171,9 +1207,9 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
                 schoolId,
                 classId: { in: sections.map((s) => s.id) },
                 academicYear: String(academicYear),
-                term: String(term),
+                term: { in: perTerm.map((s) => s.term) },
               },
-              select: { id: true, name: true },
+              select: { id: true, name: true, term: true },
             });
 
             const skippedSubjects = new Set();
@@ -1181,14 +1217,14 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
             const pairs = [];
 
             for (const row of written) {
-              for (const w of totalsByName.get(row.name) ?? []) {
+              for (const w of totalsByKey.get(`${row.term}|${row.name}`) ?? []) {
                 // A level does not have to teach what the source teaches, and
                 // writing a total for a subject it does not would put a column
                 // on its report cards that no teacher can enter.
                 if (!taught.has(w.subjectId)) { skippedSubjects.add(w.subjectId); continue; }
                 // Same no-stranded-marks rule as everywhere else a total is
                 // written, at the grain a mark actually lives at. A skip here,
-                // not a refusal: the admin is copying a whole level and cannot
+                // not a refusal: the admin is copying a whole year and cannot
                 // sensibly be asked about it one subject at a time.
                 const seen = highest.get(`${row.id}:${w.subjectId}`);
                 if (seen && seen.highest > w.totalMarks) { strandedSubjects.add(w.subjectId); continue; }
@@ -1199,7 +1235,8 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
             const totalsWritten = await writeSubjectTotals(tx, pairs);
             return {
               sections: sections.length,
-              assessments: desired.length,
+              terms: perTerm.map((s) => s.term),
+              assessments: perTerm.reduce((sum, s) => sum + s.desired.length, 0),
               totalsWritten,
               skippedSubjectIds: [...skippedSubjects],
               strandedSubjectIds: [...strandedSubjects],
@@ -1236,8 +1273,8 @@ router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
 
     res.json({
       sourceLevel: source,
-      term: String(term),
       academicYear: String(academicYear),
+      terms: plans.map((p) => p.term),
       applied,
       failed,
       // Not taught at the target at all.
