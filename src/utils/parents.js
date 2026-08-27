@@ -14,7 +14,7 @@ const { prisma } = require('../db/prisma');
 // that are both blank — or absent entirely — resolve to null instead of being
 // refused. Either one on its own is still enough to make a Parent: a number
 // with no name is a usable contact, and so is a name the school can ask after.
-async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) {
+async function resolveParentId(schoolId, { parentId, parentName, parentPhone, parentWhatsappConsent }) {
   const id = parentId ? parseInt(parentId, 10) : null;
   // Whether the caller SAID anything about the two text fields, as distinct
   // from what they said. Absent means "leave the link alone"; present but empty
@@ -22,6 +22,9 @@ async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) 
   const mentionsText = parentName !== undefined || parentPhone !== undefined;
   const name = String(parentName ?? '').trim();
   const phone = String(parentPhone ?? '').trim();
+  // undefined -> leave whatever is stored; anything else -> an explicit boolean.
+  const consent = parentWhatsappConsent === undefined ? undefined : Boolean(parentWhatsappConsent);
+  const consentData = consent === undefined ? {} : { whatsappConsent: consent };
 
   if (id) {
     const existing = await prisma.parent.findFirst({ where: { id, schoolId } });
@@ -30,7 +33,14 @@ async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) 
     }
 
     if (!mentionsText) {
-      // Pure relink — the admin picked this parent via the typeahead, nothing to edit.
+      // Pure relink — the admin picked this parent via the typeahead, nothing to
+      // edit. An explicitly sent consent is still honoured: it is the one field
+      // on this form that can change without the name or the number changing,
+      // and dropping it here would make the tick appear to save and then
+      // silently not have.
+      if (consent !== undefined) {
+        await prisma.parent.update({ where: { id: existing.id }, data: consentData });
+      }
       return existing.id;
     }
 
@@ -45,7 +55,7 @@ async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) 
     try {
       await prisma.parent.update({
         where: { id: existing.id },
-        data: { name: nextName, phone: nextPhone },
+        data: { name: nextName, phone: nextPhone, ...consentData },
       });
       return existing.id;
     } catch (e) {
@@ -56,7 +66,15 @@ async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) 
         const collision = await prisma.parent.findFirst({
           where: { schoolId, name: nextName, phone: nextPhone },
         });
-        if (collision) return collision.id;
+        if (collision) {
+          // Linking to an identical Parent that already exists. An explicit
+          // consent still has to land, or the tick is lost to a collision the
+          // admin never saw happen.
+          if (consent !== undefined) {
+            await prisma.parent.update({ where: { id: collision.id }, data: consentData });
+          }
+          return collision.id;
+        }
       }
       throw e;
     }
@@ -71,8 +89,11 @@ async function resolveParentId(schoolId, { parentId, parentName, parentPhone }) 
   // Find-or-create by exact match.
   const parent = await prisma.parent.upsert({
     where: { schoolId_name_phone: { schoolId, name, phone } },
-    update: {},
-    create: { schoolId, name, phone },
+    // An existing row keeps its consent unless this request explicitly set one.
+    update: consentData,
+    // A NEW guardian defaults to false via the schema, so an omitted consent
+    // creates somebody who has not agreed — never somebody who has.
+    create: { schoolId, name, phone, ...consentData },
   });
   return parent.id;
 }
@@ -88,6 +109,9 @@ function withFlatParent(student) {
     parentId: student.parentId,
     parentName: parent?.name ?? '',
     parentPhone: parent?.phone ?? '',
+    // Always a boolean, never undefined: a student with no guardian reads as no
+    // consent, which is the same conclusion the send route reaches.
+    parentWhatsappConsent: parent?.whatsappConsent ?? false,
   };
 }
 

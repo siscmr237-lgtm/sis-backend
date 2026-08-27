@@ -12,7 +12,8 @@
     "db:generate": "prisma generate",
     "db:format": "prisma format",
     "db:seed": "node prisma/seed.js",
-    "db:deploy": "prisma migrate deploy"
+    "db:deploy": "prisma migrate deploy",
+    "test": "node --test src/utils/*.test.js"
   },
   "dependencies": {
     "@prisma/client": "^5.19.1",

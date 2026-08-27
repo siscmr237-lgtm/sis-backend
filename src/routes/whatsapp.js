@@ -2,6 +2,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { toE164 } = require('../utils/phone');
 const { sendWhatsAppMessage } = require('../services/twilioWhatsApp');
+const { router: absenceRouter } = require('./whatsappAbsence');
 
 const router = express.Router();
 
@@ -268,5 +269,17 @@ router.post('/payment-confirmation', async (req, res) => {
     sendFailure(res, e);
   }
 });
+
+/**
+ * The ABSENCE NOTICES, mounted into this router so they answer at
+ * /whatsapp/absence-notices behind the same requireAdmin as everything above.
+ *
+ * They live in their own file because they are a different kind of message —
+ * an approved TEMPLATE sent in a batch and logged to WhatsAppMessage, rather
+ * than free text sent one at a time — and because their other half is a PUBLIC
+ * status callback that mounts above authMiddleware. A public route inside this
+ * file would make the header above it untrue.
+ */
+router.use(absenceRouter);
 
 module.exports = router;
