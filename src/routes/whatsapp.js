@@ -7,7 +7,7 @@ const { router: absenceRouter } = require('./whatsappAbsence');
 const router = express.Router();
 
 /**
- * Outbound WhatsApp to guardians.
+ * Outbound WhatsApp to guardians: the FINANCE messages.
  *
  * Mounted admin-only in src/app.js. Every route here reaches a PARENT'S phone
  * with a figure from the school's books on it, which is both a financial
@@ -16,6 +16,17 @@ const router = express.Router();
  * resolve the student inside the caller's own school, resolve the number to
  * exactly one international form, and compute the money from the ledger instead
  * of trusting what the request said it was.
+ *
+ * Two routes now, /fee-reminder and /payment-confirmation, both reached from the
+ * student profile. A third, POST /send, has been REMOVED: it took a free phone
+ * number and free message text from the request body and forwarded both, which
+ * made it the one endpoint here with no rule about who could be messaged or what
+ * they could be told. Nothing in the frontend ever called it, and leaving a
+ * general-purpose "message anyone anything" route sitting beside two careful ones
+ * is how the next change picks the wrong one.
+ *
+ * The absence notices are a separate concern and live in ./whatsappAbsence,
+ * mounted into this router at the bottom of the file.
  */
 
 /**
@@ -24,7 +35,7 @@ const router = express.Router();
  * `schoolId` is not optional here and never comes from the body: Prisma reads
  * `where: { schoolId: undefined }` as "no filter", so a lookup that lost it
  * would happily message another school's parents. The parent and school are
- * included because all three routes need the guardian's number and the school's
+ * included because both routes need the guardian's number and the school's
  * name, and one query is cheaper than three.
  */
 const findStudentByParam = (schoolId, param) => prisma.student.findFirst({
@@ -72,7 +83,7 @@ const formatFcfa = (amount) => Math.round(Number(amount)).toLocaleString('en-US'
  *
  * Three distinct failures, kept distinct because the admin's next action differs
  * for each: nobody linked, linked but no number recorded, and a number that
- * cannot be resolved to one country. A single "no phone" error for all three
+ * cannot be resolved to one country. A single "no phone" error for all of them
  * sends someone hunting through the wrong screen.
  *
  * The name is allowed to be blank — Parent takes a phone with no name, and
@@ -108,8 +119,8 @@ function resolveRecipient(student) {
 }
 
 /**
- * One place that turns a thrown error into a status, so all three routes answer
- * the same failure the same way.
+ * One place that turns a thrown error into a status, so both routes answer the
+ * same failure the same way.
  *
  *   503  the server has no Twilio credentials — not the caller's fault, and not
  *        something retrying the same request will fix
@@ -134,34 +145,6 @@ function sendFailure(res, e) {
   }
   return res.status(e?.status || 400).json({ error: e?.message || 'Could not send the message.' });
 }
-
-// POST /whatsapp/send — { phone, message }
-//
-// The unstructured one: whatever the admin typed, to whoever they typed it to.
-// The number still goes through toE164 rather than straight to Twilio, so a
-// local "679379134" works from the console the same way it does everywhere else
-// in this app.
-router.post('/send', async (req, res) => {
-  try {
-    const { phone, message } = req.body ?? {};
-
-    const body = String(message ?? '').trim();
-    if (!String(phone ?? '').trim()) return res.status(400).json({ error: 'A phone number is required.' });
-    if (!body) return res.status(400).json({ error: 'A message is required.' });
-
-    const to = toE164(phone);
-    if (!to) {
-      return res.status(400).json({
-        error: `"${String(phone).trim()}" is not a complete phone number. Include the country code — a Cameroon number is +237 followed by 9 digits.`,
-      });
-    }
-
-    const result = await sendWhatsAppMessage(to, body);
-    res.json({ sent: true, to, result });
-  } catch (e) {
-    sendFailure(res, e);
-  }
-});
 
 // POST /whatsapp/fee-reminder — { studentId }
 //

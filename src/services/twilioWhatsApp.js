@@ -35,8 +35,8 @@ function configError(message) {
  * takes down the whole API — every unrelated route included — in any
  * environment where the Twilio keys are absent. That is most of them: a
  * teammate's checkout, CI, a preview deploy. Deferring the construction keeps a
- * missing credential a 503 on three endpoints instead of a server that will not
- * boot.
+ * missing credential a 503 on the endpoints that use it instead of a server that
+ * will not boot.
  *
  * Cached after the first successful build; twilio() opens no connection of its
  * own, so there is nothing to keep warm beyond the object itself.

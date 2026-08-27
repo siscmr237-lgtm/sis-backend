@@ -113,7 +113,7 @@ const absenceTemplateVariables = ({ guardianName, studentName, schoolName }) => 
 });
 
 /**
- * The four states a row on the panel can be in, and the reason it is in it.
+ * The states a row on the panel can be in, and the reason it is in it.
  *
  * Kept as machine-readable codes rather than sentences so the frontend decides
  * the wording and the colour, and so "ready" is a value the send route can test
@@ -123,7 +123,39 @@ const READY = 'ready';
 const NO_CONSENT = 'no_consent';
 const NO_NUMBER = 'no_number';
 const ALREADY_SENT = 'already_sent';
+/** Present, or no register entry at all — nothing to notify anyone about. */
 const NOT_ABSENT = 'not_absent';
+/** Marked, and not present, but not ABSENT either: late, excused, anything else. */
+const OTHER_STATUS = 'other_status';
+
+/**
+ * LISTING AND SENDING ASK TWO DIFFERENT QUESTIONS, AND MUST.
+ *
+ * The panel LISTS everyone who is not present, because that is what the register
+ * on the screen behind it shows, and a student the admin can see marked
+ * non-present who then silently vanished from this list would just look broken.
+ *
+ * But only a genuine 'absent' can be SENT to, because of what the template
+ * actually says: "was absent from school today. Please let us know the reason
+ * for the absence." Sent to the parent of a child who arrived late, or whose
+ * absence the school itself excused, that is not a nuance — it is a false
+ * statement about their child, from the school, in writing. Parents report
+ * messages like that, and reported messages are what get a Meta template paused
+ * and then killed, which takes the working notices down with it.
+ *
+ * So isAbsent is deliberately NOT the negation of isPresent. Both are needed:
+ *   isPresent(s)             -> attending; excluded from the list entirely
+ *   !isPresent(s)            -> listed on the panel
+ *   isAbsent(s)              -> and only this may actually be sent
+ *
+ * Matched with the same tolerance isPresent uses — trimmed, lower-cased —
+ * because POST /attendance/ and PUT /attendance/:id write `body.status`
+ * completely unvalidated, so " Absent" and "ABSENT" are values that can really
+ * be on disk. An UNRECOGNISED status is refused rather than guessed at: the
+ * safe reading of a word we do not know is "do not send a message asserting
+ * this child was absent".
+ */
+const isAbsent = (status) => String(status ?? '').trim().toLowerCase() === 'absent';
 
 /**
  * Everything needed to decide whether one student's guardian can be messaged.
@@ -134,7 +166,7 @@ const NOT_ABSENT = 'not_absent';
  * drift would show up as a parent who was told nothing while the screen said
  * they had been.
  */
-function assess(student, existingMessage, absentRecord) {
+function assess(student, existingMessage, attendanceStatus) {
   const studentName = `${student.firstName} ${student.lastName}`.trim();
   const guardianName = student.parent?.name?.trim() || '';
   const rawPhone = student.parent?.phone ?? '';
@@ -154,6 +186,11 @@ function assess(student, existingMessage, absentRecord) {
     // The stored value too, so "no valid number" can show what is on file and
     // the admin knows which record to go and fix.
     storedPhone: String(rawPhone).trim() || null,
+    // The register's OWN word for this student on this date, passed through
+    // verbatim rather than reduced to a flag. The panel prints it as the skip
+    // reason for anyone who cannot be sent to, and "Late" tells the admin
+    // something true about that child that "not eligible" does not.
+    attendanceStatus: attendanceStatus == null ? null : String(attendanceStatus),
     to,
   };
 
@@ -171,7 +208,14 @@ function assess(student, existingMessage, absentRecord) {
   // Re-read from the register rather than trusted from the request. The panel
   // was built from a snapshot, and a register corrected in the meantime — a
   // student ticked back to present — must not still produce a notice.
-  if (!absentRecord) return { ...base, state: NOT_ABSENT, status: null };
+  if (attendanceStatus == null || isPresent(attendanceStatus)) {
+    return { ...base, state: NOT_ABSENT, status: null };
+  }
+  // Marked non-present, but not ABSENT: late, excused, or a word from the
+  // unvalidated write routes that nobody here recognises. Listed, never sent —
+  // see the note on isAbsent above for why this is deliberately not the same
+  // question as isPresent, and what a wrong answer costs.
+  if (!isAbsent(attendanceStatus)) return { ...base, state: OTHER_STATUS, status: null };
   if (!student.parent || !student.parent.whatsappConsent) return { ...base, state: NO_CONSENT, status: null };
   if (!to) return { ...base, state: NO_NUMBER, status: null };
   return { ...base, state: READY, status: null };
@@ -181,10 +225,18 @@ function assess(student, existingMessage, absentRecord) {
  * The students of one school marked NOT PRESENT on one day, with everything the
  * panel and the send route need about each.
  *
- * "Not present" rather than "status = absent" on purpose: attendance.js treats
- * every status other than 'present' as not attending, and a register showing a
- * student as 'late' or 'excused' would otherwise be read one way by the sheet
- * and another way here. One rule, in both places.
+ * WHO IS LISTED is "not present" — not "absent". attendance.js treats every
+ * status other than 'present' as not attending, and a student the admin can see
+ * marked late on the register behind this panel, who then quietly failed to
+ * appear on it, would just look like the feature was broken. So they are listed,
+ * with their real status shown.
+ *
+ * WHO CAN BE SENT TO is decided separately, by assess() above, and is narrower:
+ * only a genuine 'absent'. The two questions are not the same one, and the note
+ * on isAbsent says what conflating them costs.
+ *
+ * The STATUS ITSELF is carried through, not a boolean. A flag could only say
+ * "not present", which is exactly the distinction this now turns on.
  *
  * `onlyCodes` narrows to an explicit list (the send route's studentIds);
  * `sectionId` narrows to a class (the panel's current view).
@@ -194,7 +246,12 @@ async function absenceRows(schoolId, day, { onlyCodes = null, sectionId = null }
     where: { schoolId, type: 'student', date: day },
     select: { personId: true, status: true },
   });
-  const absentCodes = new Set(records.filter((r) => !isPresent(r.status)).map((r) => r.personId));
+  // code -> the register's word for that student, for every student who is not
+  // present. A student with no entry at all is simply absent from this map, and
+  // assess() reads that as "no register", which is not an absence.
+  const statusByCode = new Map(
+    records.filter((r) => !isPresent(r.status)).map((r) => [r.personId, r.status]),
+  );
 
   // The class currently on screen, when the panel names one. Resolved to its
   // NAME because Student.class is the class's name, not its id.
@@ -218,7 +275,7 @@ async function absenceRows(schoolId, day, { onlyCodes = null, sectionId = null }
     where: {
       schoolId,
       ...(className ? { class: className } : {}),
-      ...(onlyCodes ? { code: { in: onlyCodes } } : { code: { in: [...absentCodes] } }),
+      ...(onlyCodes ? { code: { in: onlyCodes } } : { code: { in: [...statusByCode.keys()] } }),
     },
     include: { parent: true },
     orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
@@ -236,7 +293,7 @@ async function absenceRows(schoolId, day, { onlyCodes = null, sectionId = null }
 
   return students.map((s) => ({
     student: s,
-    row: assess(s, byStudent.get(s.id) ?? null, absentCodes.has(s.code)),
+    row: assess(s, byStudent.get(s.id) ?? null, statusByCode.get(s.code) ?? null),
   }));
 }
 
@@ -328,6 +385,17 @@ router.post('/absence-notices', async (req, res) => {
     for (const { student, row } of rows) {
       // Everything the panel already refused stays refused, reported the same
       // way, so the response can be laid straight back over the rows on screen.
+      // THE ENDPOINT IS THE CONTROL, NOT THE PANEL.
+      //
+      // Everything the screen refused is refused again here, from the register
+      // re-read a moment ago rather than from anything the request said. That
+      // covers the case this exists for: a POST naming a LATE student, whether
+      // it came from a tab opened before the register was corrected or from
+      // somebody calling the endpoint directly. The UI filter is a convenience;
+      // this is the thing that actually decides.
+      //
+      // `reason` is the state itself, so "other_status" arrives alongside the
+      // attendanceStatus that caused it and the caller can say which word it was.
       if (row.state !== READY) {
         results.push({ ...publicRow(row), sent: false, reason: row.state });
         continue;
