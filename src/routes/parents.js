@@ -14,7 +14,12 @@ router.get('/search', async (req, res) => {
 
     const rows = await prisma.parent.findMany({
       where: { schoolId, name: { contains: query, mode: 'insensitive' } },
-      select: { id: true, name: true, phone: true },
+      // whatsappConsent comes back so the form that adopts this parent can show
+      // the agreement they have ALREADY given. Without it the consent box would
+      // sit unticked over a guardian who had consented, and saving the student
+      // would post a false that revoked it — silently, as a side effect of
+      // picking a name from a list.
+      select: { id: true, name: true, phone: true, whatsappConsent: true },
       orderBy: { name: 'asc' },
       take: 10,
     });

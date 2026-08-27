@@ -237,10 +237,19 @@ router.put('/:id', requireAdmin, async (req, res) => {
     // stripAttribution because the spread below puts req.body straight into
     // Prisma's data: without it a caller could post createdByAdminId and hand
     // the record to themselves, which is exactly the check just made above.
-    const { parentId: rawParentId, parentName, parentPhone, ...rest } = stripAttribution(req.body || {});
+    // parentWhatsappConsent is pulled out with the other guardian fields, and
+    // it MUST be: `rest` is spread straight into Prisma's data below, and a
+    // field that belongs to Parent rather than Student would be rejected as an
+    // unknown argument, failing the whole save.
+    const {
+      parentId: rawParentId, parentName, parentPhone, parentWhatsappConsent, ...rest
+    } = stripAttribution(req.body || {});
     const data = { ...rest };
-    if (rawParentId !== undefined || parentName !== undefined || parentPhone !== undefined) {
-      data.parentId = await resolveParentId(schoolId, { parentId: rawParentId, parentName, parentPhone });
+    if (rawParentId !== undefined || parentName !== undefined
+        || parentPhone !== undefined || parentWhatsappConsent !== undefined) {
+      data.parentId = await resolveParentId(schoolId, {
+        parentId: rawParentId, parentName, parentPhone, parentWhatsappConsent,
+      });
     }
 
     const updated = await prisma.student.update({

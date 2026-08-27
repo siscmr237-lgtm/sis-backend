@@ -37,6 +37,7 @@ const platformAuthRouter = require('./routes/platformAuth');
 const platformRouter = require('./routes/platform');
 const schoolRouter = require('./routes/school');
 const whatsappRouter = require('./routes/whatsapp');
+const { statusRouter: whatsappStatusRouter } = require('./routes/whatsappAbsence');
 const publicRouter = require('./routes/public');
 
 const app = express();
@@ -160,6 +161,17 @@ app.use('/cron', cronRouter);
 // need one. It returns two integers and nothing else - see src/routes/public.js,
 // which is also where the never-500 rule is written out.
 app.use('/public', publicRouter);
+
+// Twilio delivery receipts for outbound WhatsApp. Public for the same reason
+// /cron is: the caller is a machine with no session and never will have one, so
+// it authenticates with a shared secret in the path instead (TWILIO_STATUS_SECRET,
+// compared in constant time, 404 on mismatch). It MUST stay above
+// authMiddleware -- behind it, every delivery receipt is a 401, Twilio retries
+// each one with backoff, and the message log silently never leaves 'queued'.
+//
+// Mounted at the more specific path than the admin /whatsapp router further
+// down, and reached first because it is registered first.
+app.use('/whatsapp/status', whatsappStatusRouter);
 
 // All routes below this line are protected
 app.use(authMiddleware);

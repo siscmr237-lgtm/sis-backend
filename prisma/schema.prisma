@@ -62,6 +62,7 @@ model Student {
   ledgerEntries      LedgerEntry[]
   pickupContacts     PickupContact[]
   marks              StudentMark[]
+  whatsappMessages   WhatsAppMessage[]
 
   /// WHO ENROLLED THIS STUDENT. See the note on AdminUser.role.
   createdBy        AdminUser? @relation("StudentCreatedBy", fields: [createdByAdminId], references: [id])
@@ -79,12 +80,31 @@ model Student {
 // to every linked Student. Deliberately dedupes only on an exact (schoolId,
 // name, phone) match, never fuzzy — near-identical entries stay separate.
 model Parent {
-  id       Int       @id @default(autoincrement())
-  school   School    @relation(fields: [schoolId], references: [id])
-  schoolId Int
-  name     String
-  phone    String
-  students Student[]
+  id               Int               @id @default(autoincrement())
+  school           School            @relation(fields: [schoolId], references: [id])
+  schoolId         Int
+  name             String
+  phone            String
+  /// Whether this guardian has AGREED to receive WhatsApp messages from the
+  /// school. Gates the outbound absence notice and nothing else -- the existing
+  /// fee-reminder and payment-confirmation routes predate it and are each sent
+  /// by an admin looking at that one parent, which is a different act from a
+  /// batch send to forty families at once.
+  ///
+  /// Defaults FALSE, and every row that exists before this migration therefore
+  /// reads as no consent. That is the honest default: nobody enrolled before
+  /// this field existed was ever asked, and a backfill to true would be the
+  /// school asserting an agreement that never happened. It means the feature
+  /// reaches nobody until each guardian is ticked individually, which is the
+  /// intended cost of it.
+  ///
+  /// On PARENT rather than on Student because the phone number is here, and a
+  /// guardian with three children at the school consented once, not three
+  /// times. Ticking it on one child form ticks it for their siblings -- which
+  /// is correct, and is also why the form says so out loud.
+  whatsappConsent  Boolean           @default(false)
+  students         Student[]
+  whatsappMessages WhatsAppMessage[]
 
   @@unique([schoolId, name, phone])
   @@index([schoolId])
@@ -148,7 +168,7 @@ model Staff {
 
   /// WHO ADDED THIS STAFF MEMBER. See the note on AdminUser.role.
   /// This person's own daily submissions. See the StaffAttendance model.
-  staffAttendance       StaffAttendance[]
+  staffAttendance StaffAttendance[]
 
   createdBy        AdminUser? @relation("StaffCreatedBy", fields: [createdByAdminId], references: [id])
   createdByAdminId Int?
@@ -666,6 +686,7 @@ model School {
   studentFeeOverrides       StudentFeeOverride[]
   ledgerEntries             LedgerEntry[]
   TestExam                  TestExam[]
+  whatsappMessages          WhatsAppMessage[]
 }
 
 model ChargeCategory {
@@ -710,15 +731,15 @@ model ChargeCategory {
 /// level can be configured before any section of it exists). src/utils/
 /// classLevels.js is the only place that derives a level from a class name.
 model ClassLevelFee {
-  id                      Int           @id @default(autoincrement())
-  school                  School        @relation(fields: [schoolId], references: [id])
-  schoolId                Int
-  classLevel              String
-  name                    String
+  id                     Int           @id @default(autoincrement())
+  school                 School        @relation(fields: [schoolId], references: [id])
+  schoolId               Int
+  classLevel             String
+  name                   String
   /// What every student of this level is charged for this fee. 0 is a real,
   /// valid value: the defaults are seeded with no amount so a school fills in
   /// its own, and a guessed figure would look authoritative.
-  amount                  Int           @default(0)
+  amount                 Int           @default(0)
   /// How much of `amount` must be paid for this fee to count as part of the
   /// first installment — an absolute figure, not a share. NULL means the
   /// category asks nothing upfront: it is met automatically and contributes
@@ -729,15 +750,15 @@ model ClassLevelFee {
   /// dialog, because a requirement larger than the bill is unmeetable — the
   /// student could pay the fee in full and still read as short.
   /// clampFirstInstallmentAmount is the one place that clamp lives.
-  firstInstallmentAmount  Float?
+  firstInstallmentAmount Float?
   /// Which fixed group this fee belongs to. REGISTRATION is structurally
   /// outside the first-installment rule — see computeStudentFeesStatus, which
   /// drops these fees from the rule whatever firstInstallmentAmount says on
   /// them. OTHER_FEES is the default and covers everything else.
-  group                   FeeGroup      @default(OTHER_FEES)
-  charges                 LedgerEntry[]
-  createdAt               DateTime      @default(now())
-  updatedAt               DateTime      @updatedAt
+  group                  FeeGroup      @default(OTHER_FEES)
+  charges                LedgerEntry[]
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
 
   @@unique([schoolId, classLevel, name])
   @@index([schoolId, classLevel])
@@ -782,25 +803,25 @@ model ClassLevelNoFees {
 /// a waiver silently changed whenever the class fee moved, which is exactly what
 /// detaching is meant to prevent.
 model StudentFeeOverride {
-  id                      Int           @id @default(autoincrement())
-  school                  School        @relation(fields: [schoolId], references: [id])
-  schoolId                Int
-  student                 Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  studentId               Int
-  name                    String
-  amount                  Int           @default(0)
+  id                     Int           @id @default(autoincrement())
+  school                 School        @relation(fields: [schoolId], references: [id])
+  schoolId               Int
+  student                Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId              Int
+  name                   String
+  amount                 Int           @default(0)
   /// Same meaning as on ClassLevelFee: an absolute amount, NULL meaning this
   /// category asks nothing upfront and is met automatically. Never above
   /// `amount`.
-  firstInstallmentAmount  Float?
+  firstInstallmentAmount Float?
   /// Which fixed group this fee belongs to. REGISTRATION is structurally
   /// outside the first-installment rule — see computeStudentFeesStatus, which
   /// drops these fees from the rule whatever firstInstallmentAmount says on
   /// them. OTHER_FEES is the default and covers everything else.
-  group                   FeeGroup      @default(OTHER_FEES)
-  charges                 LedgerEntry[]
-  createdAt               DateTime      @default(now())
-  updatedAt               DateTime      @updatedAt
+  group                  FeeGroup      @default(OTHER_FEES)
+  charges                LedgerEntry[]
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
 
   @@unique([studentId, name])
   @@index([schoolId])
@@ -1060,21 +1081,21 @@ model PlatformUser {
 /// than added after something goes wrong. This table is append-only by
 /// convention: no route updates or deletes a row.
 model PlatformAuditLog {
-  id        Int      @id @default(autoincrement())
+  id         Int           @id @default(autoincrement())
   /// Null only for a failed login, where there may be no identifiable account.
-  actorId   Int?
-  actor     PlatformUser? @relation(fields: [actorId], references: [id])
+  actorId    Int?
+  actor      PlatformUser? @relation(fields: [actorId], references: [id])
   /// The email that was used, kept verbatim so a failed login against a
   /// non-existent account is still attributable to an attempt.
   actorEmail String?
-  action    String
+  action     String
   /// What was acted on: "platform_user:4", "school:2", or null for a plain read.
-  target    String?
+  target     String?
   /// Small JSON blob of extra context. Never contains a password or a hash.
-  detail    Json?
-  ip        String?
-  userAgent String?
-  createdAt DateTime @default(now())
+  detail     Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime      @default(now())
 
   @@index([actorId, createdAt])
   @@index([action, createdAt])
@@ -1134,4 +1155,82 @@ model PasswordResetToken {
   /// Requesting a reset supersedes that account's outstanding links, which is a
   /// delete by adminUserId.
   @@index([adminUserId])
+}
+
+// One outbound WhatsApp message to a guardian, written BEFORE the provider is
+// called and updated afterwards with what came back.
+//
+// It exists for two reasons that pull in the same direction. The first is that a
+// sent WhatsApp cannot be unsent: when a parent rings to ask why they were told
+// their child was absent, the school needs a row saying which number was dialled
+// on which date and what the provider said about it, and Twilio's own console is
+// not something a school secretary is going to be given access to.
+//
+// The second is the duplicate guard below, which is the more load-bearing of the
+// two.
+model WhatsAppMessage {
+  id            Int      @id @default(autoincrement())
+  school        School   @relation(fields: [schoolId], references: [id])
+  schoolId      Int
+  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId     Int
+  /// The guardian this actually went to, as opposed to whoever is on the
+  /// student's record TODAY. Nullable because a Parent may be unlinked later
+  /// (Student.parentId is ON DELETE SET NULL) and the log of what was sent must
+  /// survive that -- a message history that rewrites itself when the guardian
+  /// changes is not a history.
+  parent        Parent?  @relation(fields: [parentId], references: [id], onDelete: SetNull)
+  parentId      Int?
+  /// Twilio's Content template identifier ("HX..."). Stored per row rather than
+  /// read from config at display time because the template's WORDING can be
+  /// edited in Twilio's console, and a row needs to say which version of the
+  /// message this parent was actually sent.
+  templateSid   String
+  /// Why this was sent -- "absence" today. Part of the unique key below, so a
+  /// later fee-reminder for the same student on the same day is a different
+  /// message and is not blocked by an absence notice already sent.
+  purpose       String
+  /// The date the message is ABOUT (the register's date), not the date it was
+  /// sent -- those differ whenever a register is chased up the next morning.
+  /// Normalised to midnight UTC by startOfDayUTC(), the same normaliser
+  /// AttendanceRecord.date goes through; without that the unique key below
+  /// would key on a timestamp and admit a second notice per day.
+  referenceDate DateTime
+  /// The number as it was DIALLED, post-normalisation, channel prefix and all
+  /// ("whatsapp:+237679379134"). The stored Parent.phone is not enough: it can
+  /// be edited afterwards, and the question this row has to answer is which
+  /// digits the message actually went to.
+  toNumber      String
+  twilioSid     String?
+  /// "queued" until the provider answers, then Twilio's own vocabulary --
+  /// accepted, sending, sent, delivered, read, failed, undelivered. Kept as
+  /// Twilio spells it rather than mapped to an enum of ours: a status we have
+  /// not seen before should show up verbatim in the log rather than being
+  /// flattened into an "unknown" that hides it.
+  ///
+  /// "failed_to_send" is the one value of ours, for the case where the HTTP call
+  /// itself never got an answer -- no Twilio status exists for a request Twilio
+  /// never received.
+  status        String   @default("queued")
+  errorCode     String?
+  errorMessage  String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  /// THE DUPLICATE GUARD, and it lives here rather than in a check in the route
+  /// on purpose.
+  ///
+  /// Two admins on the attendance screen at the same time -- or one admin who
+  /// double-clicks Send, or a request the browser retried after a timeout --
+  /// both read "not sent yet", both pass an application-level check, and both
+  /// send. A parent then gets told twice that their child was absent, which
+  /// reads as the school being confused about their child. An index is the only
+  /// version of this rule that two concurrent requests cannot both satisfy.
+  ///
+  /// The route relies on that: it CREATES the row first and treats a P2002 as
+  /// "already sent", so the row is claimed before the provider is called and the
+  /// loser of the race never reaches Twilio at all.
+  @@unique([studentId, purpose, referenceDate])
+  @@index([schoolId, referenceDate])
+  @@index([twilioSid])
 }
