@@ -37,6 +37,7 @@ const platformAuthRouter = require('./routes/platformAuth');
 const platformRouter = require('./routes/platform');
 const schoolRouter = require('./routes/school');
 const whatsappRouter = require('./routes/whatsapp');
+const publicRouter = require('./routes/public');
 
 const app = express();
 
@@ -154,6 +155,11 @@ app.use('/platform/auth', platformAuthRouter);
 // Scheduled jobs authenticate with CRON_SECRET, not a session, so they mount
 // above authMiddleware. See src/routes/cron.js.
 app.use('/cron', cronRouter);
+// Aggregate counts for the public marketing page at the site root. Mounted here
+// for the same reason as its neighbours above: it has no session and must not
+// need one. It returns two integers and nothing else - see src/routes/public.js,
+// which is also where the never-500 rule is written out.
+app.use('/public', publicRouter);
 
 // All routes below this line are protected
 app.use(authMiddleware);
