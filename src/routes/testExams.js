@@ -13,7 +13,7 @@ const {
   getTeacherSubjectAssignments,
   canTeacherRecordMarks,
 } = require('../roleGuards');
-const { ACTOR_TEACHER } = require('../utils/sessionToken');
+const { ACTOR_ADMIN, ACTOR_TEACHER } = require('../utils/sessionToken');
 
 const router = express.Router();
 
@@ -480,6 +480,230 @@ function splitByType(rows) {
   };
 }
 
+/* -- The pieces a structure write is made of ------------------------------- *
+ *
+ * Extracted from the level save so the copy-to-other-classes button can run the
+ * SAME write. A copied level has to end up in exactly the state saving that
+ * structure by hand would have produced — if the two had their own copies of
+ * this logic they would eventually disagree, and the disagreement would show up
+ * as two classes that were supposed to match and do not.
+ * -------------------------------------------------------------------------- */
+
+/** Every section's existing rows for a period, split by type, keyed by classId. */
+async function existingBySection(schoolId, sections, academicYear, term) {
+  const existing = await prisma.testExam.findMany({
+    where: {
+      schoolId,
+      classId: { in: sections.map((s) => s.id) },
+      academicYear: String(academicYear),
+      term: String(term),
+    },
+    select: { id: true, classId: true, name: true, type: true, order: true },
+  });
+  return new Map(
+    sections.map((s) => [s.id, splitByType(existing.filter((r) => r.classId === s.id))]),
+  );
+}
+
+/**
+ * Everything a structure save would delete, across every section of a level.
+ * Matching is by position within type, so what a save destroys is exactly the
+ * tail of each list past the new count — in every section, not just the one the
+ * dialog happened to read.
+ */
+function doomedRowsFor(sections, bySection, testCount, examCount) {
+  const doomed = [];
+  for (const section of sections) {
+    const have = bySection.get(section.id);
+    if (!have) continue;
+    doomed.push(...have.tests.slice(testCount), ...have.exams.slice(examCount));
+  }
+  return doomed;
+}
+
+/**
+ * Which of `doomed` hold marks, by name, and how many marks altogether.
+ * Deleting a TestExam cascades its subject totals AND every mark entered
+ * against it, so this is what a save has to say out loud before it runs.
+ */
+async function marksAtRisk(doomed) {
+  if (!doomed.length) return { names: [], markCount: 0 };
+  const rows = await prisma.studentMark.groupBy({
+    by: ['testExamId'],
+    where: { testExamId: { in: doomed.map((d) => d.id) } },
+    _count: { _all: true },
+  });
+  if (!rows.length) return { names: [], markCount: 0 };
+  const atRisk = new Set(rows.map((r) => r.testExamId));
+  return {
+    names: [...new Set(doomed.filter((d) => atRisk.has(d.id)).map((d) => d.name))],
+    markCount: rows.reduce((sum, r) => sum + r._count._all, 0),
+  };
+}
+
+/**
+ * The highest mark already entered against each (assessment, subject) pair,
+ * keyed "testExamId:subjectId".
+ *
+ * WHY IT MATTERS. Marks are validated against the total when they are saved, so
+ * a total lowered AFTERWARDS leaves scores like 18/15 standing, and every
+ * average, ranking and report card built on them is then wrong with nothing to
+ * flag it. Every path that writes a total checks this first.
+ *
+ * ONE groupBy, not a count per pair. A level's worth of totals is sections ×
+ * assessments × subjects pairs — a hundred or more for an ordinary school — and
+ * a hundred round trips over the Supabase pooler is tens of seconds, most of it
+ * inside a transaction that is then held open for all of it.
+ *
+ * Exempt rows carry no number and cannot be above anything, so they are excluded
+ * rather than counted as 0.
+ */
+async function highestMarksByExamSubject(db, testExamIds) {
+  const out = new Map();
+  if (!testExamIds.length) return out;
+  const rows = await db.studentMark.groupBy({
+    by: ['testExamId', 'subjectId'],
+    where: { testExamId: { in: testExamIds }, isExempt: false },
+    _max: { marksObtained: true },
+    _count: { _all: true },
+  });
+  for (const r of rows) {
+    out.set(`${r.testExamId}:${r.subjectId}`, {
+      highest: r._max.marksObtained ?? 0,
+      markCount: r._count._all,
+    });
+  }
+  return out;
+}
+
+/**
+ * The subjects among `wanted` whose new total would sit under a mark already
+ * entered, across the given assessment rows, and how many marks that is.
+ *
+ * Two passes on purpose. The groupBy above answers "does any subject trip at
+ * all" for the whole batch in one query; the exact count is then asked only of
+ * the subjects that did trip — normally none, occasionally one. Counting every
+ * subject exactly would be a query per subject on the overwhelmingly common path
+ * where nothing is wrong.
+ */
+async function marksAboveTotals(testExamIds, wanted) {
+  if (!testExamIds.length || !wanted.length) return [];
+  const highest = await highestMarksByExamSubject(prisma, testExamIds);
+  const tripped = wanted.filter((w) => testExamIds.some((id) => {
+    const seen = highest.get(`${id}:${w.subjectId}`);
+    return seen && seen.highest > w.totalMarks;
+  }));
+  const out = [];
+  for (const w of tripped) {
+    const markCount = await prisma.studentMark.count({
+      where: {
+        testExamId: { in: testExamIds },
+        subjectId: w.subjectId,
+        isExempt: false,
+        marksObtained: { gt: w.totalMarks },
+      },
+    });
+    if (markCount > 0) out.push({ subjectId: w.subjectId, totalMarks: w.totalMarks, markCount });
+  }
+  return out;
+}
+
+/**
+ * Writes a batch of (assessment, subject) totals inside `tx`.
+ *
+ * Delete-then-create, not an upsert per pair, for the same round-trip reason as
+ * above — two statements instead of a hundred. It is safe to delete these rows
+ * and recreate them under new ids because nothing points at a
+ * TestExamSubjectTotal: a StudentMark keys on (studentId, subjectId,
+ * testExamId), so the marks are untouched by this and simply find the new total
+ * in its place. The delete names EXACTLY the pairs being rewritten, so a subject
+ * left out of this batch — skipped, or one this level has that the source does
+ * not — keeps whatever total it had.
+ */
+async function writeSubjectTotals(tx, pairs) {
+  if (!pairs.length) return 0;
+  const byExam = new Map();
+  for (const p of pairs) {
+    if (!byExam.has(p.testExamId)) byExam.set(p.testExamId, []);
+    byExam.get(p.testExamId).push(p.subjectId);
+  }
+  await tx.testExamSubjectTotal.deleteMany({
+    where: {
+      OR: [...byExam.entries()].map(([testExamId, subjectIds]) => ({ testExamId, subjectId: { in: subjectIds } })),
+    },
+  });
+  await tx.testExamSubjectTotal.createMany({
+    data: pairs.map((p) => ({ testExamId: p.testExamId, subjectId: p.subjectId, totalMarks: p.totalMarks })),
+  });
+  return pairs.length;
+}
+
+/** Length and collision check on a resolved structure. A message, or null. */
+function structureProblem(desired) {
+  const seen = new Set();
+  for (const row of desired) {
+    if (row.name.length > MAX_NAME_LENGTH) {
+      return `"${row.name}" is too long — keep names under ${MAX_NAME_LENGTH} characters.`;
+    }
+    const key = row.name.toLowerCase();
+    if (seen.has(key)) {
+      return `Two assessments are both called "${row.name}". Names must differ within a term.`;
+    }
+    seen.add(key);
+  }
+  return null;
+}
+
+/**
+ * Writes one resolved structure across every section of a level, inside `tx`.
+ *
+ * Deletes first, then renames, then creates — the unique index on
+ * (classId, academicYear, term, name) is checked per statement, so a name freed
+ * by a shortened list, or swapped between two rows, would otherwise collide
+ * with a row that is on its way out. The renames themselves go out in two
+ * passes through a name nothing else can hold, so a straight swap
+ * ("1st Sequence Test" <-> "2nd Sequence Test") cannot fail half way.
+ */
+async function applyStructureToSections(tx, {
+  schoolId, sections, bySection, desired, testCount, academicYear, term, doomed,
+}) {
+  if (doomed.length) {
+    await tx.testExam.deleteMany({ where: { id: { in: doomed.map((d) => d.id) } } });
+  }
+
+  const renames = [];
+  const creates = [];
+  for (const section of sections) {
+    const have = bySection.get(section.id) ?? { tests: [], exams: [] };
+    for (const want of desired) {
+      const pool = want.type === 'TEST' ? have.tests : have.exams;
+      const at = (want.type === 'TEST' ? want.order : want.order - testCount) - 1;
+      const row = pool[at];
+      if (!row) {
+        creates.push({
+          schoolId,
+          classId: section.id,
+          academicYear: String(academicYear),
+          term: String(term),
+          name: want.name,
+          type: want.type,
+          order: want.order,
+        });
+      } else if (row.name !== want.name || row.order !== want.order) {
+        renames.push({ id: row.id, name: want.name, order: want.order, renamed: row.name !== want.name });
+      }
+    }
+  }
+
+  for (const r of renames) {
+    if (r.renamed) await tx.testExam.update({ where: { id: r.id }, data: { name: `__restructuring_${r.id}__` } });
+  }
+  for (const r of renames) {
+    await tx.testExam.update({ where: { id: r.id }, data: { name: r.name, order: r.order } });
+  }
+  if (creates.length) await tx.testExam.createMany({ data: creates });
+}
+
 // GET /test-exams/levels/:level/structure?term=&academicYear=
 //
 // The level's structure in the shape the dialog edits it: two ordered lists.
@@ -584,51 +808,24 @@ router.put('/levels/:level/structure', requireAdmin, async (req, res) => {
     // A duplicate name would hit the unique index part-way through the write and
     // fail for a reason nobody could read off the screen, so it is caught here,
     // where the message can name the collision.
-    const seen = new Set();
-    for (const row of desired) {
-      if (row.name.length > MAX_NAME_LENGTH) {
-        return res.status(400).json({ error: `"${row.name}" is too long — keep names under ${MAX_NAME_LENGTH} characters.` });
-      }
-      const key = row.name.toLowerCase();
-      if (seen.has(key)) {
-        return res.status(400).json({ error: `Two assessments are both called "${row.name}". Names must differ within a term.` });
-      }
-      seen.add(key);
-    }
+    const problem = structureProblem(desired);
+    if (problem) return res.status(400).json({ error: problem });
 
     const sections = await sectionsOfLevel(schoolId, level);
     if (!sections.length) {
       return res.status(404).json({ error: `This school has no class level "${level}".` });
     }
 
-    const existing = await prisma.testExam.findMany({
-      where: { schoolId, classId: { in: sections.map((s) => s.id) }, academicYear: String(academicYear), term: String(term) },
-      select: { id: true, classId: true, name: true, type: true, order: true },
-    });
-    const bySection = new Map(
-      sections.map((s) => [s.id, splitByType(existing.filter((r) => r.classId === s.id))]),
-    );
-
-    // Everything this save would delete, across every section.
-    const doomed = [];
-    for (const section of sections) {
-      const have = bySection.get(section.id);
-      doomed.push(...have.tests.slice(tests.length), ...have.exams.slice(exams.length));
-    }
+    const bySection = await existingBySection(schoolId, sections, academicYear, term);
+    const doomed = doomedRowsFor(sections, bySection, tests.length, exams.length);
 
     if (doomed.length && !confirmDelete) {
-      const withMarks = await prisma.studentMark.groupBy({
-        by: ['testExamId'],
-        where: { testExamId: { in: doomed.map((d) => d.id) } },
-        _count: { _all: true },
-      });
-      if (withMarks.length) {
-        const atRisk = new Set(withMarks.map((w) => w.testExamId));
-        const names = [...new Set(doomed.filter((d) => atRisk.has(d.id)).map((d) => d.name))];
+      const { names, markCount } = await marksAtRisk(doomed);
+      if (names.length) {
         return res.status(409).json({
           code: 'DELETES_MARKS',
           names,
-          markCount: withMarks.reduce((sum, w) => sum + w._count._all, 0),
+          markCount,
           error: `Removing ${names.join(', ')} also deletes every mark already entered against ${names.length > 1 ? 'them' : 'it'}.`,
         });
       }
@@ -637,51 +834,12 @@ router.put('/levels/:level/structure', requireAdmin, async (req, res) => {
     // ONE transaction for the whole level. A partial apply is the failure this
     // replaces: it leaves sections of the same level sitting different papers,
     // and nothing afterwards can tell that from a difference somebody meant.
-    //
-    // Deletes first, then renames, then creates — the unique index on
-    // (classId, academicYear, term, name) is checked per statement, so a name
-    // freed by a shortened list, or swapped between two rows, would otherwise
-    // collide with a row that is on its way out.
-    await prisma.$transaction(async (tx) => {
-      if (doomed.length) {
-        await tx.testExam.deleteMany({ where: { id: { in: doomed.map((d) => d.id) } } });
-      }
-
-      // Renames go out in two passes through a name nothing else can hold, so a
-      // straight swap ("1st Sequence Test" <-> "2nd Sequence Test") cannot fail
-      // on the index half way through.
-      const renames = [];
-      const creates = [];
-      for (const section of sections) {
-        const have = bySection.get(section.id);
-        for (const want of desired) {
-          const pool = want.type === 'TEST' ? have.tests : have.exams;
-          const at = (want.type === 'TEST' ? want.order : want.order - tests.length) - 1;
-          const row = pool[at];
-          if (!row) {
-            creates.push({
-              schoolId,
-              classId: section.id,
-              academicYear: String(academicYear),
-              term: String(term),
-              name: want.name,
-              type: want.type,
-              order: want.order,
-            });
-          } else if (row.name !== want.name || row.order !== want.order) {
-            renames.push({ id: row.id, name: want.name, order: want.order, renamed: row.name !== want.name });
-          }
-        }
-      }
-
-      for (const r of renames) {
-        if (r.renamed) await tx.testExam.update({ where: { id: r.id }, data: { name: `__restructuring_${r.id}__` } });
-      }
-      for (const r of renames) {
-        await tx.testExam.update({ where: { id: r.id }, data: { name: r.name, order: r.order } });
-      }
-      if (creates.length) await tx.testExam.createMany({ data: creates });
-    }, { timeout: 30000, maxWait: 15000 });
+    await prisma.$transaction(
+      (tx) => applyStructureToSections(tx, {
+        schoolId, sections, bySection, desired, testCount: tests.length, academicYear, term, doomed,
+      }),
+      { timeout: 30000, maxWait: 15000 },
+    );
 
     const saved = await prisma.testExam.findMany({
       where: { schoolId, classId: sections[0].id, academicYear: String(academicYear), term: String(term) },
@@ -700,6 +858,394 @@ router.put('/levels/:level/structure', requireAdmin, async (req, res) => {
     if (e.code === 'P2002') {
       return res.status(409).json({ error: 'Two assessments in this term ended up with the same name. Rename one and try again.' });
     }
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// PUT /test-exams/levels/:level/subject-totals
+// Body: { term, academicYear, assessmentName, totals: [{ subjectId, totalMarks }], confirmLower? }
+//
+// Sets what EVERY subject is marked out of for one assessment, across every
+// section of a class level, in one request.
+//
+// It replaces a loop the dialog used to run itself — resolve the assessment in
+// each section, then one PUT per subject per section. That is O(sections ×
+// subjects) round trips over the pooler, it has no transaction around it, and it
+// routinely stopped part way: the failure it leaves behind is a level whose
+// sections are marked out of different totals, which nothing downstream can tell
+// from a difference somebody meant.
+//
+// KEYED BY NAME, not by id. Each section holds its OWN TestExam row for the same
+// assessment — the schema keys on (classId, academicYear, term, name) — so the id
+// the dialog is looking at names one section's row and means nothing to the
+// others. The name is what identifies one assessment across a level.
+//
+// A TOTAL IS NEVER LOWERED UNDER A MARK ALREADY ENTERED. Marks are validated
+// against the total when they are saved, so dropping it afterwards leaves scores
+// like 18/15 standing, and every average and ranking computed off them is then
+// wrong in a way nothing flags. Those subjects are refused with the count, and
+// only a confirmLower retry writes them.
+router.put('/levels/:level/subject-totals', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const level = String(req.params.level);
+    const { term, academicYear, assessmentName, totals, confirmLower } = req.body || {};
+
+    if (!term) return res.status(400).json({ error: 'term is required' });
+    if (!academicYear) return res.status(400).json({ error: 'academicYear is required' });
+    const name = String(assessmentName ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'assessmentName is required' });
+    if (!Array.isArray(totals) || !totals.length) {
+      return res.status(400).json({ error: 'totals must be a non-empty list' });
+    }
+
+    const sections = await sectionsOfLevel(schoolId, level);
+    if (!sections.length) {
+      return res.status(404).json({ error: `This school has no class level "${level}".` });
+    }
+
+    // Subjects belong to the class LEVEL, shared by every section of it, so one
+    // check here covers all of them.
+    const levelSubjects = await prisma.classLevelSubject.findMany({
+      where: { schoolId, classLevel: level },
+      select: { subjectId: true },
+    });
+    const taught = new Set(levelSubjects.map((s) => s.subjectId));
+
+    const wanted = [];
+    for (const row of totals) {
+      const subjectId = toId(row?.subjectId);
+      const totalMarks = Number(row?.totalMarks);
+      if (!subjectId || !taught.has(subjectId)) {
+        return res.status(400).json({ error: 'One of those subjects is not taught at this class level.' });
+      }
+      if (!Number.isInteger(totalMarks) || totalMarks <= 0 || totalMarks > MAX_INT32) {
+        return res.status(400).json({ error: 'Every total must be a whole number greater than zero.' });
+      }
+      wanted.push({ subjectId, totalMarks });
+    }
+
+    // The one row per section that carries this name. A section genuinely
+    // lacking the assessment is reported rather than skipped in silence — it
+    // means the level has drifted and the structure needs saving again.
+    const rows = await prisma.testExam.findMany({
+      where: {
+        schoolId,
+        classId: { in: sections.map((s) => s.id) },
+        academicYear: String(academicYear),
+        term: String(term),
+        name,
+      },
+      select: { id: true, classId: true },
+    });
+    if (!rows.length) {
+      return res.status(404).json({ error: `No assessment called "${name}" in ${level} for ${term}.` });
+    }
+    const missingSections = sections
+      .filter((s) => !rows.some((r) => r.classId === s.id))
+      .map((s) => s.name);
+
+    if (!confirmLower) {
+      const conflicts = await marksAboveTotals(rows.map((r) => r.id), wanted);
+      if (conflicts.length) {
+        const subjects = await prisma.subject.findMany({
+          where: { id: { in: conflicts.map((c) => c.subjectId) } },
+          select: { id: true, name: true },
+        });
+        const nameOf = new Map(subjects.map((s) => [s.id, s.name]));
+        return res.status(409).json({
+          code: 'MARKS_ABOVE_TOTAL',
+          subjects: conflicts.map((c) => ({ ...c, name: nameOf.get(c.subjectId) ?? `Subject ${c.subjectId}` })),
+          error: `${conflicts.map((c) => nameOf.get(c.subjectId) ?? 'A subject').join(', ')} already ${conflicts.length > 1 ? 'have marks' : 'has marks'} above the total you set. Lowering it leaves those scores above what the paper is out of.`,
+        });
+      }
+    }
+
+    const pairs = rows.flatMap((row) => wanted.map((w) => ({
+      testExamId: row.id, subjectId: w.subjectId, totalMarks: w.totalMarks,
+    })));
+
+    // ONE transaction for the whole level, so its sections cannot end up marked
+    // out of different totals — which is exactly what the per-section loop this
+    // replaces left behind whenever it stopped part way.
+    await prisma.$transaction(
+      (tx) => writeSubjectTotals(tx, pairs),
+      { timeout: 30000, maxWait: 15000 },
+    );
+
+    res.json({
+      classLevel: level,
+      assessmentName: name,
+      term: String(term),
+      academicYear: String(academicYear),
+      sections: rows.length,
+      subjects: wanted.length,
+      missingSections,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// POST /test-exams/levels/:level/structure/copy
+// Body: { term, academicYear, targetLevels: [], confirmDelete? }
+//
+// Copies ONE class level's whole set-up for a term — its sequence tests, its
+// exams, their names and order, and what every subject is marked out of — onto
+// other class levels.
+//
+// The case it exists for is the same one the fee copy exists for: a school whose
+// Class 1 through Class 6 all run three sequence tests and one exam, each marked
+// out of the same totals, set out once and then repeated five times by hand.
+// That repetition is where two classes end up marked out of different totals by
+// a typo nobody notices until the report cards disagree.
+//
+// THE STRUCTURE IS REPLACED; THE TOTALS ARE MERGED. Those are different rules on
+// purpose, because the two deletions are not alike:
+//
+//   Structure — a target running four tests where the source runs three loses
+//   the fourth, and with it every mark against it. That is the point of matching
+//   the levels, and it is confirmed first (see confirmDelete below).
+//
+//   Totals — a TestExamSubjectTotal does NOT cascade its marks (StudentMark
+//   hangs off TestExam, not off the total), so deleting one leaves marks with no
+//   total to be out of, and every screen that scores them skips the subject
+//   silently. So totals are upserted: the source's are written, and a total the
+//   target holds for a subject the source does not cover is left standing.
+//
+// SUBJECTS ARE MATCHED BY ID and only where the TARGET actually teaches them.
+// Class levels do not have to share a subject list, and writing a total for a
+// subject a level does not teach would put a column on its report cards that no
+// teacher can enter. Those are reported back in `skippedSubjects`.
+//
+// A TOTAL IS NEVER LOWERED UNDER A MARK ALREADY ENTERED — same rule, and same
+// reasoning, as the bulk endpoint above. Here it is a skip rather than a refusal:
+// the admin is copying a whole level and cannot sensibly answer per subject, so
+// the pairs that would strand a mark are left alone and named in `skippedTotals`.
+//
+// ONE TRANSACTION PER TARGET LEVEL, and per target only — mirroring
+// POST /classes/fees/copy. Wrapping every target together would let one bad level
+// discard five good ones; leaving them unwrapped would leave a level half
+// rebuilt. So each stands alone, and the response says which landed.
+router.post('/levels/:level/structure/copy', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const source = String(req.params.level);
+    const { term, academicYear, targetLevels, confirmDelete } = req.body || {};
+
+    if (!term) return res.status(400).json({ error: 'term is required' });
+    if (!academicYear) return res.status(400).json({ error: 'academicYear is required' });
+    if (!Array.isArray(targetLevels) || !targetLevels.length) {
+      return res.status(400).json({ error: 'targetLevels array required' });
+    }
+
+    const sourceSections = await sectionsOfLevel(schoolId, source);
+    if (!sourceSections.length) {
+      return res.status(404).json({ error: `This school has no class level "${source}".` });
+    }
+
+    // Deduplicated: the same level named twice would run the copy twice, and the
+    // second pass would be working against rows the first had just rewritten.
+    const targets = [...new Set(targetLevels.map((t) => String(t ?? '').trim()))].filter(Boolean);
+    if (!targets.length) return res.status(400).json({ error: 'targetLevels array required' });
+    if (targets.includes(source)) {
+      return res.status(400).json({ error: 'A class level cannot be copied onto itself.' });
+    }
+
+    const sectionsByTarget = new Map();
+    for (const target of targets) {
+      const rows = await sectionsOfLevel(schoolId, target);
+      if (!rows.length) return res.status(404).json({ error: `This school has no class level "${target}".` });
+      sectionsByTarget.set(target, rows);
+    }
+
+    // Read ONCE, outside the transactions. The source is not among the targets,
+    // so nothing inside them can change it.
+    const sourceRows = await prisma.testExam.findMany({
+      where: {
+        schoolId,
+        classId: sourceSections[0].id,
+        academicYear: String(academicYear),
+        term: String(term),
+      },
+      select: { id: true, name: true, type: true, order: true },
+    });
+    if (!sourceRows.length) {
+      return res.status(400).json({ error: `${source} has no sequence tests or exams in ${term} to copy.` });
+    }
+    const { tests: sourceTests, exams: sourceExams } = splitByType(sourceRows);
+
+    // Names are passed through as TYPED. This copies the set-up the source
+    // actually holds — a school that renamed its papers "CA1", "CA2" wants those
+    // names on the other classes too, not regenerated defaults.
+    const desired = resolveAssessmentNames(
+      term,
+      sourceTests.map((r) => ({ name: r.name })),
+      sourceExams.map((r) => ({ name: r.name })),
+    );
+    const problem = structureProblem(desired);
+    if (problem) return res.status(400).json({ error: problem });
+
+    // assessment name -> [{ subjectId, totalMarks }], read from the source's
+    // first section. Every section of a level carries the same totals.
+    const sourceTotals = await prisma.testExamSubjectTotal.findMany({
+      where: { testExamId: { in: sourceRows.map((r) => r.id) } },
+      select: { testExamId: true, subjectId: true, totalMarks: true },
+    });
+    const sourceNameOf = new Map(sourceRows.map((r) => [r.id, r.name]));
+    const totalsByName = new Map();
+    for (const t of sourceTotals) {
+      const key = sourceNameOf.get(t.testExamId);
+      if (key == null) continue;
+      if (!totalsByName.has(key)) totalsByName.set(key, []);
+      totalsByName.get(key).push({ subjectId: t.subjectId, totalMarks: t.totalMarks });
+    }
+
+    // Everything the whole request would delete, checked BEFORE any of it runs.
+    // Refusing target by target would leave the first few already rewritten by
+    // the time the admin is asked, which is not a question they can answer.
+    const doomedByTarget = new Map();
+    const existingByTarget = new Map();
+    for (const target of targets) {
+      const sections = sectionsByTarget.get(target);
+      const bySection = await existingBySection(schoolId, sections, academicYear, term);
+      existingByTarget.set(target, bySection);
+      doomedByTarget.set(target, doomedRowsFor(sections, bySection, sourceTests.length, sourceExams.length));
+    }
+
+    if (!confirmDelete) {
+      const allDoomed = [...doomedByTarget.values()].flat();
+      const { names, markCount } = await marksAtRisk(allDoomed);
+      if (names.length) {
+        const levels = targets.filter((t) => (doomedByTarget.get(t) ?? []).length);
+        return res.status(409).json({
+          code: 'DELETES_MARKS',
+          names,
+          levels,
+          markCount,
+          error: `${levels.join(', ')} run assessments ${source} does not. Copying removes ${names.join(', ')} and every mark already entered against ${names.length > 1 ? 'them' : 'it'}.`,
+        });
+      }
+    }
+
+    // Read for every target at once, and BEFORE the transactions — an id
+    // survives a rename, so a row's marks are just as findable now as they will
+    // be afterwards, and a row this creates has none by definition. Doing it
+    // here keeps the transactions to two statements each.
+    const existingTargetRowIds = targets.flatMap((t) => [...(existingByTarget.get(t)?.values() ?? [])]
+      .flatMap((have) => [...have.tests, ...have.exams].map((r) => r.id)));
+    const highest = await highestMarksByExamSubject(prisma, existingTargetRowIds);
+
+    const applied = [];
+    const failed = [];
+
+    for (const target of targets) {
+      try {
+        const sections = sectionsByTarget.get(target);
+        const bySection = existingByTarget.get(target);
+        const doomed = doomedByTarget.get(target) ?? [];
+
+        const levelSubjects = await prisma.classLevelSubject.findMany({
+          where: { schoolId, classLevel: target },
+          select: { subjectId: true },
+        });
+        const taught = new Set(levelSubjects.map((s) => s.subjectId));
+
+        const result = await prisma.$transaction(
+          async (tx) => {
+            await applyStructureToSections(tx, {
+              schoolId,
+              sections,
+              bySection,
+              desired,
+              testCount: sourceTests.length,
+              academicYear,
+              term,
+              doomed,
+            });
+
+            // Re-read INSIDE the transaction: the rows above were just created
+            // or renamed, so their ids are only knowable now.
+            const written = await tx.testExam.findMany({
+              where: {
+                schoolId,
+                classId: { in: sections.map((s) => s.id) },
+                academicYear: String(academicYear),
+                term: String(term),
+              },
+              select: { id: true, name: true },
+            });
+
+            const skippedSubjects = new Set();
+            const strandedSubjects = new Set();
+            const pairs = [];
+
+            for (const row of written) {
+              for (const w of totalsByName.get(row.name) ?? []) {
+                // A level does not have to teach what the source teaches, and
+                // writing a total for a subject it does not would put a column
+                // on its report cards that no teacher can enter.
+                if (!taught.has(w.subjectId)) { skippedSubjects.add(w.subjectId); continue; }
+                // Same no-stranded-marks rule as everywhere else a total is
+                // written, at the grain a mark actually lives at. A skip here,
+                // not a refusal: the admin is copying a whole level and cannot
+                // sensibly be asked about it one subject at a time.
+                const seen = highest.get(`${row.id}:${w.subjectId}`);
+                if (seen && seen.highest > w.totalMarks) { strandedSubjects.add(w.subjectId); continue; }
+                pairs.push({ testExamId: row.id, subjectId: w.subjectId, totalMarks: w.totalMarks });
+              }
+            }
+
+            const totalsWritten = await writeSubjectTotals(tx, pairs);
+            return {
+              sections: sections.length,
+              assessments: desired.length,
+              totalsWritten,
+              skippedSubjectIds: [...skippedSubjects],
+              strandedSubjectIds: [...strandedSubjects],
+            };
+          },
+          { timeout: 60000, maxWait: 15000 },
+        );
+
+        applied.push({ classLevel: target, ...result });
+      } catch (e) {
+        // This target rolled back whole; the rest still run. Named rather than
+        // counted — which class still has its old set-up is what has to be fixed.
+        failed.push({
+          classLevel: target,
+          error: e.code === 'P2002'
+            ? 'Two assessments in this term ended up with the same name.'
+            : (e.message || 'Could not copy this set-up to that class.'),
+        });
+      }
+    }
+
+    // Subject names for anything skipped, resolved once at the end so the caller
+    // can say "Further Maths was skipped" rather than print an id.
+    const skippedIds = [...new Set(applied.flatMap((a) => a.skippedSubjectIds))];
+    const strandedIds = [...new Set(applied.flatMap((a) => a.strandedSubjectIds))];
+    const named = (skippedIds.length + strandedIds.length)
+      ? (await prisma.subject.findMany({
+        where: { id: { in: [...new Set([...skippedIds, ...strandedIds])] } },
+        select: { id: true, name: true },
+      }))
+      : [];
+    const nameOf = new Map(named.map((s) => [s.id, s.name]));
+    const listed = (ids) => ids.map((id) => ({ id, name: nameOf.get(id) ?? `Subject ${id}` }));
+
+    res.json({
+      sourceLevel: source,
+      term: String(term),
+      academicYear: String(academicYear),
+      applied,
+      failed,
+      // Not taught at the target at all.
+      skippedSubjects: listed(skippedIds),
+      // Taught there, but the copied total sits under a mark already entered.
+      strandedSubjects: listed(strandedIds),
+    });
+  } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
@@ -969,8 +1515,26 @@ router.get('/:id/marks', async (req, res) => {
 });
 
 // PUT /test-exams/:id/subject-totals/:subjectId
-// Sets/updates the total marks configured for one subject on this test/exam.
-router.put('/:id/subject-totals/:subjectId', requireAdmin, async (req, res) => {
+// Body: { totalMarks, confirmLower? }
+//
+// Sets what one subject is marked out of on one assessment, for the one section
+// this assessment belongs to.
+//
+// A TEACHER MAY SET IT, for a class and subject they may already record marks
+// for — the same canTeacherRecordMarks pairing that gates reading the roster and
+// writing the marks, and nothing wider. The total and the marks are one piece of
+// work: a teacher who can enter "14" is the person who knows the paper was out
+// of 20, and making them ask an administrator for it is what left subjects
+// sitting un-enterable with nobody able to say so. An administrator keeps the
+// level-wide tools; this is the single-paper one.
+//
+// IT WILL NOT LOWER A TOTAL UNDER A MARK ALREADY ENTERED without being told
+// twice. Marks are checked against the total as they are saved, so lowering it
+// afterwards leaves scores above what the paper is out of, and every average and
+// ranking built on them is quietly wrong. The refusal names the count; a
+// confirmLower retry goes through, because re-scaling a paper you then re-enter
+// is a real thing to want.
+router.put('/:id/subject-totals/:subjectId', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
     const testExam = await resolveTestExam(schoolId, req.params.id);
@@ -978,6 +1542,14 @@ router.put('/:id/subject-totals/:subjectId', requireAdmin, async (req, res) => {
 
     const subject = await resolveSubject(schoolId, req.params.subjectId);
     if (!subject) return res.status(404).json({ error: 'Subject not found' });
+
+    if (isTeacher(req.user)) {
+      if (!(await canTeacherRecordMarks(req.user.id, schoolId, testExam.classId, subject.id))) {
+        return forbid(res, 'You are not assigned to teach this subject in this class.');
+      }
+    } else if (req.user?.actorType !== ACTOR_ADMIN) {
+      return forbid(res, 'Only an administrator or the subject teacher can do this.');
+    }
 
     const examClass = await prisma.class.findFirst({ where: { schoolId, id: testExam.classId }, select: { name: true } });
     // Subjects belong to the class LEVEL, shared by every section of it.
@@ -987,6 +1559,17 @@ router.put('/:id/subject-totals/:subjectId', requireAdmin, async (req, res) => {
     const totalMarks = Number(req.body?.totalMarks);
     if (!Number.isInteger(totalMarks) || totalMarks <= 0 || totalMarks > MAX_INT32) {
       return res.status(400).json({ error: 'totalMarks must be a positive integer' });
+    }
+
+    if (!req.body?.confirmLower) {
+      const [conflict] = await marksAboveTotals([testExam.id], [{ subjectId: subject.id, totalMarks }]);
+      if (conflict) {
+        return res.status(409).json({
+          code: 'MARKS_ABOVE_TOTAL',
+          markCount: conflict.markCount,
+          error: `${conflict.markCount} mark${conflict.markCount === 1 ? ' is' : 's are'} already above ${totalMarks} for ${subject.name}. Lowering the total leaves ${conflict.markCount === 1 ? 'it' : 'them'} scoring more than the paper is out of.`,
+        });
+      }
     }
 
     const upserted = await prisma.testExamSubjectTotal.upsert({
