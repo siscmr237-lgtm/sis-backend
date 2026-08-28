@@ -3,6 +3,7 @@ const { prisma } = require('../db/prisma');
 const { toE164 } = require('../utils/phone');
 const { sendWhatsAppMessage } = require('../services/twilioWhatsApp');
 const { router: absenceRouter } = require('./whatsappAbsence');
+const { router: feeReminderRouter } = require('./whatsappFeeReminder');
 
 const router = express.Router();
 
@@ -17,16 +18,34 @@ const router = express.Router();
  * exactly one international form, and compute the money from the ledger instead
  * of trusting what the request said it was.
  *
- * Two routes now, /fee-reminder and /payment-confirmation, both reached from the
- * student profile. A third, POST /send, has been REMOVED: it took a free phone
- * number and free message text from the request body and forwarded both, which
- * made it the one endpoint here with no rule about who could be messaged or what
- * they could be told. Nothing in the frontend ever called it, and leaving a
- * general-purpose "message anyone anything" route sitting beside two careful ones
- * is how the next change picks the wrong one.
+ * WHAT IS LEFT IN THIS FILE IS ONE ROUTE, AND IT IS SWITCHED OFF.
+ * /payment-confirmation still sends free TEXT through the old twilio client,
+ * which WhatsApp does not accept for a message a business starts, so it is
+ * gated behind WHATSAPP_PAYMENT_CONFIRMATION_ENABLED and answers 503 by
+ * default. See the note above it.
  *
- * The absence notices are a separate concern and live in ./whatsappAbsence,
- * mounted into this router at the bottom of the file.
+ * The other two are gone or moved:
+ *   POST /send            REMOVED. It took a free phone number and free message
+ *                         text from the request body and forwarded both, making
+ *                         it the one endpoint here with no rule about who could
+ *                         be messaged or what they could be told. Nothing called
+ *                         it.
+ *   POST /fee-reminder    REBUILT, in ./whatsappFeeReminder, on the template
+ *                         plumbing in ../utils/twilioWhatsApp. The version that
+ *                         used to live here checked no consent, wrote no record
+ *                         of what it had sent, and could not have worked.
+ *
+ * The absence notices live in ./whatsappAbsence. Both of those routers are
+ * mounted into this one at the bottom of the file, so everything still answers
+ * under /whatsapp behind the same requireAdmin.
+ *
+ * The helpers below (findStudentByParam, balanceFor, formatFcfa,
+ * resolveRecipient, sendFailure) now serve only the disabled route. They are
+ * kept with it rather than deleted separately, so that switching it back on —
+ * or deleting it — is one decision about one block of code. NEW WORK SHOULD NOT
+ * REACH FOR THEM: the template routes use ../utils/phoneNumber and
+ * ../utils/twilioWhatsApp instead, and a second copy of the same rule is how
+ * the two drift apart.
  */
 
 /**
@@ -146,49 +165,6 @@ function sendFailure(res, e) {
   return res.status(e?.status || 400).json({ error: e?.message || 'Could not send the message.' });
 }
 
-// POST /whatsapp/fee-reminder — { studentId }
-//
-// The balance is read from the ledger here and never taken from the request. The
-// client already displays a figure, and accepting it would let a stale tab quote
-// a parent a number the school has since collected against.
-router.post('/fee-reminder', async (req, res) => {
-  try {
-    const schoolId = req.user.schoolId;
-    const { studentId } = req.body ?? {};
-    if (!String(studentId ?? '').trim()) return res.status(400).json({ error: 'A studentId is required.' });
-
-    const student = await findStudentByParam(schoolId, studentId);
-    if (!student) return res.status(404).json({ error: 'Student not found.' });
-
-    const recipient = resolveRecipient(student);
-    if (recipient.error) return res.status(400).json({ error: recipient.error });
-
-    const { totalCharged, totalPaid, balance } = await balanceFor(schoolId, student.id);
-
-    // Refuse to chase a debt that does not exist. A "balance owed: 0 FCFA"
-    // reminder — or a negative one, which happens legitimately when a family has
-    // overpaid or a charge was reversed — reads as an error to the parent and
-    // costs the school credibility on the messages that DO matter.
-    if (balance <= 0) {
-      return res.status(400).json({
-        error: `${student.firstName} ${student.lastName} has no outstanding balance, so no reminder was sent.`,
-        balance,
-      });
-    }
-
-    const message =
-      `Dear ${recipient.parentName}, this is a reminder from ${student.school.name} regarding ` +
-      `${student.firstName} ${student.lastName} (${student.class}). ` +
-      `Current balance owed: ${formatFcfa(balance)} FCFA. ` +
-      `Please arrange payment at your earliest convenience. Thank you.`;
-
-    const result = await sendWhatsAppMessage(recipient.to, message);
-    res.json({ sent: true, to: recipient.to, message, totalCharged, totalPaid, balance, result });
-  } catch (e) {
-    sendFailure(res, e);
-  }
-});
-
 // POST /whatsapp/payment-confirmation — { studentId, amount }
 //
 // NOTE ON "Remaining balance": this route does NOT write to the ledger, and the
@@ -205,6 +181,25 @@ router.post('/fee-reminder', async (req, res) => {
 // here — but then `amount` has to be validated against something real, because
 // at that point it is the only source for a figure the school is standing behind.
 router.post('/payment-confirmation', async (req, res) => {
+  // OFF UNLESS EXPLICITLY TURNED ON.
+  //
+  // Everything below still sends FREE TEXT through the old client, which
+  // WhatsApp does not accept for a message a business starts — so this cannot
+  // work today, and its natural replacement cannot be built yet either: the
+  // fee_payment_received template (HX9181e008db0baf235e831117869f568f) is still
+  // PENDING approval on this account. Rather than leave a route that fails in a
+  // way that looks like a bug, it announces that it is switched off.
+  //
+  // 503 rather than 404: the endpoint exists and is coming back, and a client
+  // that gets a 404 has no way to tell "not built" from "wrong URL". The
+  // frontend reads this by disabling its control up front, so nobody should
+  // reach here at all.
+  if (String(process.env.WHATSAPP_PAYMENT_CONFIRMATION_ENABLED ?? '').toLowerCase() !== 'true') {
+    return res.status(503).json({
+      code: 'FEATURE_DISABLED',
+      error: 'Payment confirmation messages are not available yet.',
+    });
+  }
   try {
     const schoolId = req.user.schoolId;
     const { studentId, amount } = req.body ?? {};
@@ -264,5 +259,17 @@ router.post('/payment-confirmation', async (req, res) => {
  * file would make the header above it untrue.
  */
 router.use(absenceRouter);
+
+/**
+ * THE FEE REMINDERS, likewise mounted here so they answer at
+ * /whatsapp/fee-reminder behind the same requireAdmin.
+ *
+ * They replace the free-text route that used to live in this file. Same reason
+ * they sit in their own file rather than here: they send an approved TEMPLATE,
+ * log every message to WhatsAppMessage, check consent, and carry a cooldown —
+ * none of which the two routes above do, and mixing the two styles in one file
+ * is how somebody copies the wrong one.
+ */
+router.use(feeReminderRouter);
 
 module.exports = router;

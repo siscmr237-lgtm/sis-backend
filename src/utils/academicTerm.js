@@ -125,10 +125,52 @@ function termHasEnded(academicYear, term, now = new Date()) {
   return end ? now.getTime() >= end.getTime() : false;
 }
 
+/**
+ * How a term is WRITTEN FOR A PARENT. Display only.
+ *
+ * The canonical stored value stays 'Term 1'/'Term 2'/'Term 3' everywhere —
+ * ledger entries, report cards and test/exams are all filtered by exact string
+ * match on it — so this is only ever applied at the moment text is rendered,
+ * never before something is saved or queried.
+ *
+ * It exists because a WhatsApp template puts the term in front of a parent, and
+ * "Term 1" is our database's word, not theirs. Deliberately the SAME mapping as
+ * formatTermLabel in SIS/src/utils/academicTerm.ts: the two sit either side of
+ * the wire and a parent reading "1st Term" in a message should see "1st Term" on
+ * the screen the office is looking at. If one changes, change both.
+ *
+ * An unrecognised value passes through unchanged, so a school that has typed a
+ * custom term into Settings still reads as they entered it rather than as a
+ * blank or a guess.
+ */
+const TERM_LABELS = {
+  'Term 1': '1st Term',
+  'Term 2': '2nd Term',
+  'Term 3': '3rd Term',
+};
+
+function formatTermLabel(term) {
+  const key = String(term ?? '').trim();
+  if (!key) return '';
+  return TERM_LABELS[key] ?? key;
+}
+
+/**
+ * "1st Term 2026/2027" — the term and year as one phrase, for a message.
+ * Either half may be missing; whatever is known is still worth saying.
+ */
+function formatTermAndYear(term, academicYear) {
+  return [formatTermLabel(term), String(academicYear ?? '').trim()]
+    .filter(Boolean)
+    .join(' ');
+}
+
 module.exports = {
   getCurrentTermAndYear,
   resolveSchoolTerm,
   resolveEffectiveSchoolTerm,
   termEndExclusive,
   termHasEnded,
+  formatTermLabel,
+  formatTermAndYear,
 };
