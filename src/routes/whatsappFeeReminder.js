@@ -4,6 +4,7 @@ const { normaliseToWhatsApp, displayNumber } = require('../utils/phoneNumber');
 const { sendTemplate } = require('../utils/twilioWhatsApp');
 const { startOfDayUTC, toDayKey } = require('../utils/attendanceDay');
 const { resolveEffectiveSchoolTerm, formatTermAndYear } = require('../utils/academicTerm');
+const { EXCLUDE_NEVER_SENT, neverLeftServer, RETRY_RESET } = require('../utils/whatsappAttempt');
 
 /**
  * Fee reminders over WhatsApp, on the same plumbing as the absence notices.
@@ -71,7 +72,23 @@ const READY = 'ready';
 const NO_CONSENT = 'no_consent';
 const NO_NUMBER = 'no_number';
 const NOTHING_OUTSTANDING = 'nothing_outstanding';
-const ON_COOLDOWN = 'cooldown';
+/**
+ * TWO REFUSALS THAT USED TO SHARE ONE WORD, and the confusion cost a log dig.
+ *
+ * COOLDOWN_ACTIVE is the behavioural rule: this family was genuinely messaged
+ * inside the last 14 days, so we are choosing not to chase them again yet. It
+ * carries when that was, and when the next one is allowed.
+ *
+ * DUPLICATE_SAME_DAY is the unique index refusing a second row for today, for a
+ * message that DID reach Twilio. It is a race or a double-click, not a policy,
+ * and it says nothing about the fortnight.
+ *
+ * They read identically to a user and mean different things to whoever is
+ * debugging — which is exactly how a retry that was silently impossible came to
+ * be reported as "cooldown" for a parent who had never been contacted at all.
+ */
+const COOLDOWN_ACTIVE = 'cooldown_active';
+const DUPLICATE_SAME_DAY = 'duplicate_same_day';
 
 /**
  * The template's variable slots.
@@ -166,7 +183,10 @@ async function lastRemindersFor(schoolId, studentIds, now = new Date()) {
       purpose: PURPOSE,
       studentId: { in: studentIds },
       createdAt: { gte: cooldownCutoff(now) },
-      NOT: { AND: [{ status: 'failed_to_send' }, { twilioSid: null }] },
+      // See ../utils/whatsappAttempt. The SAME exception the P2002 branch below
+      // applies, from one definition, because these two must never disagree —
+      // when they did, a refused send became an unretryable "cooldown".
+      ...EXCLUDE_NEVER_SENT,
     },
     orderBy: { createdAt: 'desc' },
   });
@@ -217,9 +237,23 @@ function assess(student, balance, lastReminder, now = new Date()) {
   if (!(balance > 0)) return { ...base, state: NOTHING_OUTSTANDING };
   if (lastReminder) {
     const daysAgo = Math.floor((now.getTime() - new Date(lastReminder.createdAt).getTime()) / DAY_MS);
+    // WHICH REFUSAL THIS IS, decided by the SITUATION and not by which guard
+    // happened to catch it first.
+    //
+    // A message already sent today is both "inside the fortnight" and "a
+    // duplicate for today", and the two guards see it at different moments: the
+    // lookback runs before the insert, so it gets there first, while the unique
+    // index only ever fires when a concurrent request slipped in between. If the
+    // label were left to whichever fired, the same situation would be reported
+    // two different ways depending on timing — which is precisely the confusion
+    // that made the original retry bug so hard to see.
+    //
+    // Compared on referenceDate because that is the index's own key: "a row for
+    // today" means exactly what the index means by it.
+    const sameDay = toDayKey(lastReminder.referenceDate) === toDayKey(now);
     return {
       ...base,
-      state: ON_COOLDOWN,
+      state: sameDay ? DUPLICATE_SAME_DAY : COOLDOWN_ACTIVE,
       lastSentAt: lastReminder.createdAt,
       daysAgo,
       nextEligibleAt: new Date(new Date(lastReminder.createdAt).getTime()
@@ -445,11 +479,62 @@ router.post('/fee-reminder', async (req, res) => {
           },
         });
       } catch (e) {
-        if (e.code === 'P2002') {
-          results.push({ ...publicRow(row), sent: false, reason: ON_COOLDOWN, state: ON_COOLDOWN });
+        if (e.code !== 'P2002') throw e;
+
+        // THE COLLISION IS NOT ALWAYS A DUPLICATE.
+        //
+        // The index caught a row for this student, purpose and day. That is the
+        // right thing for it to do — but it cannot see WHY that row is there,
+        // and there are two very different reasons:
+        //
+        //   1. A message that reached Twilio. Refuse: a WhatsApp cannot be
+        //      unsent, and a second copy is the thing this index exists to stop.
+        //   2. A row claimed a moment before a send that Twilio then REFUSED.
+        //      Nothing was delivered. The attempt did not happen, and retrying
+        //      it is not a duplicate message — it is the same attempt resumed.
+        //
+        // Case 2 was previously reported as "cooldown", which was wrong twice
+        // over: no message had been sent, and the fortnight rule had nothing to
+        // do with it. A school was told it had already reminded a parent it had
+        // never reached, and the only way to see otherwise was the provider log.
+        const existing = await prisma.whatsAppMessage.findUnique({
+          where: {
+            studentId_purpose_referenceDate: {
+              studentId: student.id, purpose: PURPOSE, referenceDate,
+            },
+          },
+        });
+
+        if (!neverLeftServer(existing)) {
+          // Anything that reached the provider, and anything still 'queued' —
+          // a queued row is a timeout we never got an answer for and may still
+          // be in flight, so it is treated as sent.
+          results.push({
+            ...publicRow(row),
+            sent: false,
+            reason: DUPLICATE_SAME_DAY,
+            state: DUPLICATE_SAME_DAY,
+          });
           continue;
         }
-        throw e;
+
+        // REUSE the row rather than delete and re-insert. Deleting would give up
+        // the index slot for as long as the two statements take, which is
+        // precisely the race the index was put there to close. Updating holds it
+        // throughout, so a concurrent request still loses.
+        //
+        // The recipient, template and drive date are rewritten as well as the
+        // status: a retry may legitimately carry a corrected number or a new
+        // drive date, and the row must describe the attempt actually in flight.
+        message = await prisma.whatsAppMessage.update({
+          where: { id: existing.id },
+          data: {
+            ...RETRY_RESET,
+            parentId: student.parentId,
+            templateSid: FEE_REMINDER_TEMPLATE_SID,
+            toNumber: row.to,
+          },
+        });
       }
 
       const outcome = await sendTemplate({

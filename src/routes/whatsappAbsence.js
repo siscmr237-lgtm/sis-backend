@@ -4,6 +4,7 @@ const { prisma } = require('../db/prisma');
 const { normaliseToWhatsApp, displayNumber } = require('../utils/phoneNumber');
 const { sendTemplate } = require('../utils/twilioWhatsApp');
 const { startOfDayUTC, toDayKey } = require('../utils/attendanceDay');
+const { EXCLUDE_NEVER_SENT, neverLeftServer, RETRY_RESET } = require('../utils/whatsappAttempt');
 
 /**
  * Admin-triggered WhatsApp absence notices.
@@ -287,6 +288,17 @@ async function absenceRows(schoolId, day, { onlyCodes = null, sectionId = null }
       purpose: PURPOSE,
       referenceDate: day,
       studentId: { in: students.map((s) => s.id) },
+      // A row for a send Twilio REFUSED is not a notice anybody received, so it
+      // must not make this panel say "Already sent today" and it must not stand
+      // in the way of a retry. Without this the refusal is invisible from the
+      // screen: the row exists, the panel reports the notice as sent, and the
+      // parent was never told anything.
+      //
+      // The same predicate the P2002 branch below uses — see
+      // ../utils/whatsappAttempt. One definition on purpose: when the fee
+      // reminder route had these as two, they disagreed, and a refused send
+      // became a retry nobody could make.
+      ...EXCLUDE_NEVER_SENT,
     },
   });
   const byStudent = new Map(messages.map((m) => [m.studentId, m]));
@@ -423,11 +435,42 @@ router.post('/absence-notices', async (req, res) => {
           },
         });
       } catch (e) {
-        if (e.code === 'P2002') {
+        if (e.code !== 'P2002') throw e;
+
+        // THE COLLISION IS NOT ALWAYS A DUPLICATE — the same hole the fee
+        // reminder route had, fixed the same way from the same predicate.
+        //
+        // The index caught a row for this student, purpose and day, but cannot
+        // see why it is there. A row left behind by a send the provider REFUSED
+        // represents a notice nobody received, so retrying it is not a second
+        // message; it is the first one, resumed. Only a row that actually
+        // reached Twilio — or a 'queued' one that may still be in flight after a
+        // timeout — is a real duplicate.
+        const existing = await prisma.whatsAppMessage.findUnique({
+          where: {
+            studentId_purpose_referenceDate: {
+              studentId: student.id, purpose: PURPOSE, referenceDate: day,
+            },
+          },
+        });
+
+        if (!neverLeftServer(existing)) {
           results.push({ ...publicRow(row), sent: false, reason: ALREADY_SENT, state: ALREADY_SENT });
           continue;
         }
-        throw e;
+
+        // Reused, not deleted and re-created: a delete would release the index
+        // slot for the length of two statements, which is the race the index is
+        // there to close.
+        message = await prisma.whatsAppMessage.update({
+          where: { id: existing.id },
+          data: {
+            ...RETRY_RESET,
+            parentId: student.parentId,
+            templateSid: ABSENCE_TEMPLATE_SID,
+            toNumber: row.to,
+          },
+        });
       }
 
       const outcome = await sendTemplate({
