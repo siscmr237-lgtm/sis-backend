@@ -32,7 +32,14 @@ const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).t
 async function getSchoolPeriod(schoolId) {
   const school = await prisma.school.findUnique({
     where: { id: schoolId },
-    select: { academicYear: true, currentTerm: true },
+    // autoTermEnabled IS REQUIRED HERE, and its absence was a real bug.
+    // resolveSchoolTerm branches on it; without it in the select the field reads
+    // undefined, the auto branch never runs, and a school that computes its term
+    // from the calendar was silently stamped with whatever stale value sat in
+    // currentTerm instead. The comment above already promised that auto-computed
+    // and manually-set schools were both handled correctly — this is what makes
+    // that true.
+    select: { academicYear: true, currentTerm: true, autoTermEnabled: true },
   });
   return resolveEffectiveSchoolTerm(school);
 }
@@ -46,7 +53,13 @@ router.get('/current-period', requireAdmin, async (req, res) => {
     const schoolId = req.user.schoolId;
     const school = await prisma.school.findUnique({
       where: { id: schoolId },
-      select: { academicYear: true, currentTerm: true },
+      // The third site with the same omission, and it has to move with the
+      // other two. This drives the Finance page's DEFAULT term filter, so if it
+      // reports a term the stamping no longer uses, the page opens filtered to a
+      // term that has no rows in it and the money looks like it has gone
+      // missing. `term` may be null here (auto school, holiday), which the page
+      // reads as "All" — the right default when no term is running.
+      select: { academicYear: true, currentTerm: true, autoTermEnabled: true },
     });
     res.json(resolveSchoolTerm(school));
   } catch (e) {

@@ -71,16 +71,47 @@ function resolveSchoolTerm(school, date = new Date()) {
   return { academicYear, term: school?.currentTerm ?? null };
 }
 
+/** The term value stamped during the Jul–Aug window. See below. */
+const HOLIDAY_TERM = 'Holiday';
+
 /**
  * Same as resolveSchoolTerm, but never returns a null term — for call sites
  * that structurally require a concrete term value (e.g. tagging a new ledger
- * entry). Falls back to the most recently completed term (Term 3 of the
- * academic year just finished) during the Holiday window.
+ * entry, where LedgerEntry.term is NOT NULL).
+ *
+ * DURING THE HOLIDAY THE TERM IS 'Holiday', NOT 'Term 3'.
+ *
+ * It used to return 'Term 3', which produced a label naming a term that had not
+ * happened. A school that has advanced early to 2026/2027 shows that year all
+ * through August, so the pair rendered as "3rd Term 2026/2027" — and Term 3 of
+ * 2026/2027 runs April to June 2027, eight months in the future. The comment
+ * here claimed it meant "Term 3 of the academic year just finished", but the
+ * year was never adjusted to match, so the two halves described different years.
+ *
+ * THE YEAR IS DELIBERATELY LEFT ALONE, and that is the important half of this
+ * fix. Making the pair truthful by moving the YEAR back instead — to
+ * "3rd Term 2025/2026" — would have been correct as a sentence about the
+ * calendar and wrong as a database write: this value stamps LedgerEntry.
+ * academicYear, so every payment recorded during the holiday would be filed
+ * under the year that just ended and would drop out of the current year's
+ * reports. A wrong label is a display bug; a payment in the wrong year is a
+ * financial one.
+ *
+ * 'Holiday' is the honest answer for both uses at once. It is what
+ * resolveSchoolTerm already means by a null term, it is what the file header
+ * describes ("the new year with no active term until 1 September"), it renders
+ * as "Holiday 2026/2027", and it is already a value this database holds — one
+ * school has stored it as its manual currentTerm for some time and its ledger
+ * rows carry it.
+ *
+ * Note what it is NOT: a term window. termEndExclusive and termRange return
+ * null for it, which is correct — the holiday is not a term and has no marks,
+ * no register and no term-end sweep.
  */
 function resolveEffectiveSchoolTerm(school, date = new Date()) {
   const resolved = resolveSchoolTerm(school, date);
   if (resolved.term) return resolved;
-  return { academicYear: resolved.academicYear, term: 'Term 3' };
+  return { academicYear: resolved.academicYear, term: HOLIDAY_TERM };
 }
 
 /**
