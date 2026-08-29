@@ -954,6 +954,7 @@ model LedgerEntry {
   /// reissue it — a parent may already be holding the old number. See
   /// src/utils/receiptNumber.js.
   receiptNumber        String?
+  whatsappMessages     WhatsAppMessage[]
   academicYear         String
   term                 String
   createdAt            DateTime            @default(now())
@@ -1193,39 +1194,75 @@ model PasswordResetToken {
 // The second is the duplicate guard below, which is the more load-bearing of the
 // two.
 model WhatsAppMessage {
-  id            Int      @id @default(autoincrement())
-  school        School   @relation(fields: [schoolId], references: [id])
-  schoolId      Int
-  student       Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  studentId     Int
+  id                Int          @id @default(autoincrement())
+  school            School       @relation(fields: [schoolId], references: [id])
+  schoolId          Int
+  student           Student      @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  studentId         Int
   /// The guardian this actually went to, as opposed to whoever is on the
   /// student's record TODAY. Nullable because a Parent may be unlinked later
   /// (Student.parentId is ON DELETE SET NULL) and the log of what was sent must
   /// survive that -- a message history that rewrites itself when the guardian
   /// changes is not a history.
-  parent        Parent?  @relation(fields: [parentId], references: [id], onDelete: SetNull)
-  parentId      Int?
+  parent            Parent?      @relation(fields: [parentId], references: [id], onDelete: SetNull)
+  parentId          Int?
   /// Twilio's Content template identifier ("HX..."). Stored per row rather than
   /// read from config at display time because the template's WORDING can be
   /// edited in Twilio's console, and a row needs to say which version of the
   /// message this parent was actually sent.
-  templateSid   String
+  templateSid       String
   /// Why this was sent -- "absence" today. Part of the unique key below, so a
   /// later fee-reminder for the same student on the same day is a different
   /// message and is not blocked by an absence notice already sent.
-  purpose       String
+  purpose           String
   /// The date the message is ABOUT (the register's date), not the date it was
   /// sent -- those differ whenever a register is chased up the next morning.
   /// Normalised to midnight UTC by startOfDayUTC(), the same normaliser
   /// AttendanceRecord.date goes through; without that the unique key below
   /// would key on a timestamp and admit a second notice per day.
-  referenceDate DateTime
+  /// NULLABLE, AND NULL IS MEANINGFUL — it is what takes payment confirmations
+  /// out of the day-based unique index below.
+  ///
+  /// For an absence notice or a fee reminder this is the day the message is
+  /// ABOUT, and (studentId, purpose, referenceDate) is exactly the right guard:
+  /// one notice per student per day per purpose.
+  ///
+  /// A payment confirmation is not a fact about a DAY, it is a fact about one
+  /// PAYMENT, and a family may legitimately pay twice in a morning. Under a
+  /// non-null date those two confirmations collide on that index and the second
+  /// is refused — ordinary behaviour being blocked. Postgres treats NULLs as
+  /// distinct in a unique index, so storing NULL here lets both through while
+  /// leaving the index guarding the other two purposes exactly as before.
+  ///
+  /// Nothing is lost: the date a confirmation is about is the payment's own
+  /// entryDate, on the LedgerEntry this row points at.
+  referenceDate     DateTime?
+  /// THE PAYMENT this confirmation is about. Null for every other purpose.
+  ///
+  /// SetNull rather than Cascade: the message really was sent, and deleting the
+  /// payment afterwards must not erase the record that a parent was told about
+  /// it. The snapshot below survives with it.
+  ledgerEntry       LedgerEntry? @relation(fields: [ledgerEntryId], references: [id], onDelete: SetNull)
+  ledgerEntryId     Int?
+  /// WHAT THE MESSAGE ACTUALLY SAID, frozen at the moment it was sent.
+  ///
+  /// PATCH /ledger/:id can change a payment's amount after the fact. Without
+  /// this, a parent could be holding a WhatsApp receipt for 15,000 FCFA against
+  /// a ledger row that now reads 12,000, with nothing anywhere recording the
+  /// discrepancy. These columns make it detectable by comparing them against
+  /// the row as it stands today.
+  ///
+  /// Deliberately NOT kept in step with later edits, and nothing sends a
+  /// correction. They are a record of what left this server.
+  sentReceiptNumber String?
+  sentAmount        Int?
+  sentBalance       Int?
   /// The number as it was DIALLED, post-normalisation, channel prefix and all
   /// ("whatsapp:+237679379134"). The stored Parent.phone is not enough: it can
   /// be edited afterwards, and the question this row has to answer is which
   /// digits the message actually went to.
-  toNumber      String
-  twilioSid     String?
+  toNumber          String
+  twilioSid         String?
   /// "queued" until the provider answers, then Twilio's own vocabulary --
   /// accepted, sending, sent, delivered, read, failed, undelivered. Kept as
   /// Twilio spells it rather than mapped to an enum of ours: a status we have
@@ -1235,11 +1272,11 @@ model WhatsAppMessage {
   /// "failed_to_send" is the one value of ours, for the case where the HTTP call
   /// itself never got an answer -- no Twilio status exists for a request Twilio
   /// never received.
-  status        String   @default("queued")
-  errorCode     String?
-  errorMessage  String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  status            String       @default("queued")
+  errorCode         String?
+  errorMessage      String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
 
   /// THE DUPLICATE GUARD, and it lives here rather than in a check in the route
   /// on purpose.
@@ -1255,6 +1292,17 @@ model WhatsAppMessage {
   /// "already sent", so the row is claimed before the provider is called and the
   /// loser of the race never reaches Twilio at all.
   @@unique([studentId, purpose, referenceDate])
+  /// ONE CONFIRMATION PER PAYMENT, enforced by the database rather than by a
+  /// check in the route — two clicks in the same second are the case it exists
+  /// for.
+  ///
+  /// Keyed on the payment, not the day, so two payments from one family in one
+  /// morning are two confirmations. Purpose is in the key so a future message
+  /// type could reference a payment without colliding with this one, and
+  /// ledgerEntryId is NULL for every other purpose — NULLs being distinct, this
+  /// index constrains nothing else.
+  @@unique([ledgerEntryId, purpose])
+  @@index([ledgerEntryId])
   @@index([schoolId, referenceDate])
   @@index([twilioSid])
 }
