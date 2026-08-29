@@ -4,6 +4,7 @@ const { prisma } = require('../db/prisma');
 const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
+const { issueReceiptNumber, retireReceiptNumber } = require('../utils/receiptNumber');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
 const { attributionFor, canEdit, canDelete } = require('../utils/attribution');
 const { FEE_GROUPS } = require('../utils/feeCategories');
@@ -444,11 +445,37 @@ router.get('/student-transactions', requireAdmin, async (req, res) => {
           }
         : {}),
     };
+
+    // THE SEARCH ALSO MATCHES A RECEIPT NUMBER, and this is the half that makes
+    // the numbering worth having. A parent rings the office quoting
+    // "2026/2027-0042" off a receipt or a WhatsApp message; a number the
+    // secretary cannot type in and find is worse than no number at all.
+    //
+    // It is a separate OR arm rather than another field on studentFilter,
+    // because the receipt number lives on the TRANSACTION and the rest of that
+    // filter is about the student. Nested inside the student relation it would
+    // have matched nothing.
+    //
+    // `contains`, so a partial is enough — "0042" finds it without anyone
+    // typing the year, which is what people actually do over a phone. Scoped to
+    // this school by the schoolId on the outer where.
+    const searchFilter = q
+      ? {
+        OR: [
+          ...(Object.keys(studentFilter).length && studentFilter.OR ? [{ student: { OR: studentFilter.OR } }] : []),
+          { receiptNumber: { contains: String(q), mode: 'insensitive' } },
+        ],
+      }
+      : {};
+    // The class filter stays a student filter; only the free-text part widens.
+    const classOnly = cls && cls !== 'all' ? { student: { class: String(cls) } } : {};
+
     const where = {
       schoolId,
       studentId: { not: null },
       isFeeStructureCharge: false,
-      ...(Object.keys(studentFilter).length ? { student: studentFilter } : {}),
+      ...classOnly,
+      ...searchFilter,
       ...(dateFrom || dateTo
         ? {
             entryDate: {
@@ -526,6 +553,9 @@ router.get('/student-transactions', requireAdmin, async (req, res) => {
         // Null, never a dash: the placeholder is the reader's decision, and a
         // charge legitimately has no payment method.
         paymentMethod: e.paymentMethod ?? null,
+        // The receipt number, for the column the office reads back to a parent.
+        // Null on every charge, permanently — payments are not a separate table.
+        receiptNumber: e.receiptNumber ?? null,
       };
     });
 
@@ -848,33 +878,42 @@ router.post('/payment', requireAdmin, async (req, res) => {
     }
 
     const { academicYear, term } = await getSchoolPeriod(schoolId);
-    const entry = await prisma.ledgerEntry.create({
-      data: {
-        code: genCode('PMT'),
-        type: 'PAYMENT',
-        schoolId,
-        studentId: student.id,
-        categoryId: null,
-        // The linkage that makes the payment count against its own category.
-        // A fee category uses the same columns CHARGE rows already carry; a
-        // standalone charge is reached by pointing at the charge entry itself.
-        // Exactly one of the three is ever set, and feeKeyOf() reads whichever
-        // it is back out.
-        classLevelFeeId: target.classLevelFeeId ?? null,
-        studentFeeOverrideId: target.studentFeeOverrideId ?? null,
-        settlesEntryId: target.settlesEntryId ?? null,
-        // Notes are optional in the dialog and are no longer pre-filled, so an
-        // empty one falls back to the category being paid. The column is NOT
-        // NULL and this is the label every ledger table shows, so a blank
-        // description would render as an empty row rather than as "no note".
-        description: String(description || '').trim() || target.name,
-        amount: amt,
-        entryDate: new Date(entryDate),
-        paymentMethod: paymentMethod || null,
-        academicYear,
-        term,
-        ...attributionFor(req),
-      },
+    // THE NUMBER AND THE PAYMENT ARE WRITTEN TOGETHER, in one transaction.
+    // The counter is incremented and the row inserted inside the same unit of
+    // work, so an insert that fails takes its number back with it and leaves no
+    // gap in the sequence. This route used to be a bare create; the transaction
+    // exists for the numbering, not for the insert.
+    const entry = await prisma.$transaction(async (tx) => {
+      const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+      return tx.ledgerEntry.create({
+        data: {
+          code: genCode('PMT'),
+          type: 'PAYMENT',
+          receiptNumber,
+          schoolId,
+          studentId: student.id,
+          categoryId: null,
+          // The linkage that makes the payment count against its own category.
+          // A fee category uses the same columns CHARGE rows already carry; a
+          // standalone charge is reached by pointing at the charge entry itself.
+          // Exactly one of the three is ever set, and feeKeyOf() reads whichever
+          // it is back out.
+          classLevelFeeId: target.classLevelFeeId ?? null,
+          studentFeeOverrideId: target.studentFeeOverrideId ?? null,
+          settlesEntryId: target.settlesEntryId ?? null,
+          // Notes are optional in the dialog and are no longer pre-filled, so an
+          // empty one falls back to the category being paid. The column is NOT
+          // NULL and this is the label every ledger table shows, so a blank
+          // description would render as an empty row rather than as "no note".
+          description: String(description || '').trim() || target.name,
+          amount: amt,
+          entryDate: new Date(entryDate),
+          paymentMethod: paymentMethod || null,
+          academicYear,
+          term,
+          ...attributionFor(req),
+        },
+      });
     });
     res.status(201).json(withIdAsCode(entry));
   } catch (e) {
@@ -986,33 +1025,44 @@ router.post('/payments', requireAdmin, async (req, res) => {
     const attribution = attributionFor(req);
 
     // One transaction. Either every fee on the table is recorded or none is.
-    const created = await prisma.$transaction(
-      planned.map(({ target, amount }) => prisma.ledgerEntry.create({
-        data: {
-          code: genCode('PMT'),
-          type: 'PAYMENT',
-          schoolId,
-          studentId: student.id,
-          categoryId: null,
-          // Exactly one of the three is ever set; feeKeyOf() reads whichever it
-          // is back out. The same shape POST /payment writes, so allocation and
-          // every downstream reading of it behave identically.
-          classLevelFeeId: target.classLevelFeeId ?? null,
-          studentFeeOverrideId: target.studentFeeOverrideId ?? null,
-          settlesEntryId: target.settlesEntryId ?? null,
-          // The dialog has no Notes field any more, so the fee being paid is the
-          // label. The column is NOT NULL and this is what every ledger table
-          // shows, so a blank would render as an empty row.
-          description: target.name,
-          amount,
-          entryDate: when,
-          paymentMethod: paymentMethod || null,
-          academicYear,
-          term,
-          ...attribution,
-        },
-      })),
-    );
+    // ONE TRANSACTION, now INTERACTIVE rather than an array of promises.
+    // Either every fee on the table is recorded or none is — unchanged — but
+    // the numbers have to be taken one at a time and in order, and an array
+    // transaction gives no place to await between the creates. Sequential is
+    // also what makes the receipts on one hand-over of money consecutive.
+    const created = await prisma.$transaction(async (tx) => {
+      const rows = [];
+      for (const { target, amount } of planned) {
+        const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+        rows.push(await tx.ledgerEntry.create({
+            data: {
+              code: genCode('PMT'),
+              type: 'PAYMENT',
+              receiptNumber,
+              schoolId,
+              studentId: student.id,
+              categoryId: null,
+              // Exactly one of the three is ever set; feeKeyOf() reads whichever it
+              // is back out. The same shape POST /payment writes, so allocation and
+              // every downstream reading of it behave identically.
+              classLevelFeeId: target.classLevelFeeId ?? null,
+              studentFeeOverrideId: target.studentFeeOverrideId ?? null,
+              settlesEntryId: target.settlesEntryId ?? null,
+              // The dialog has no Notes field any more, so the fee being paid is the
+              // label. The column is NOT NULL and this is what every ledger table
+              // shows, so a blank would render as an empty row.
+              description: target.name,
+              amount,
+              entryDate: when,
+              paymentMethod: paymentMethod || null,
+              academicYear,
+              term,
+              ...attribution,
+            },
+        }));
+      }
+      return rows;
+    });
 
     res.status(201).json({
       recorded: created.length,
@@ -1211,33 +1261,42 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
     }
 
     const { academicYear, term } = await getSchoolPeriod(schoolId);
-    const created = [];
-    for (const c of plan.categories) {
-      // One row per category, each tagged to its own fee, each at that
-      // category's own amount — the same shape POST /ledger/payment writes, so
-      // allocation and every downstream reading of it behave identically.
-      // feeKeyOf() reads these three columns back out; exactly one is ever set.
-      const entry = await prisma.ledgerEntry.create({
-        data: {
-          code: genCode('PMT'),
-          type: 'PAYMENT',
-          schoolId,
-          studentId: student.id,
-          categoryId: null,
-          classLevelFeeId: c.key.startsWith('c') ? Number(c.key.slice(1)) : null,
-          studentFeeOverrideId: c.key.startsWith('o') ? Number(c.key.slice(1)) : null,
-          settlesEntryId: c.key.startsWith('x') ? Number(c.key.slice(1)) : null,
-          description: c.name,
-          amount: c.owing,
-          entryDate: new Date(entryDate),
-          paymentMethod: paymentMethod || null,
-          academicYear,
-          term,
-          ...attributionFor(req),
-        },
-      });
-      created.push(withIdAsCode(entry));
-    }
+    // ONE TRANSACTION FOR THE WHOLE SETTLEMENT. It was a loop of bare
+    // creates; a failure partway through left some categories paid and some
+    // not, and now would also leave numbers issued for rows that never
+    // existed. Both problems close the same way.
+    const created = await prisma.$transaction(async (tx) => {
+      const rows = [];
+      for (const c of plan.categories) {
+        // One row per category, each tagged to its own fee, each at that
+        // category's own amount — the same shape POST /ledger/payment writes, so
+        // allocation and every downstream reading of it behave identically.
+        // feeKeyOf() reads these three columns back out; exactly one is ever set.
+        const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+        const entry = await tx.ledgerEntry.create({
+          data: {
+            code: genCode('PMT'),
+            type: 'PAYMENT',
+            receiptNumber,
+            schoolId,
+            studentId: student.id,
+            categoryId: null,
+            classLevelFeeId: c.key.startsWith('c') ? Number(c.key.slice(1)) : null,
+            studentFeeOverrideId: c.key.startsWith('o') ? Number(c.key.slice(1)) : null,
+            settlesEntryId: c.key.startsWith('x') ? Number(c.key.slice(1)) : null,
+            description: c.name,
+            amount: c.owing,
+            entryDate: new Date(entryDate),
+            paymentMethod: paymentMethod || null,
+            academicYear,
+            term,
+            ...attributionFor(req),
+          },
+        });
+        rows.push(withIdAsCode(entry));
+      }
+      return rows;
+    });
 
     res.status(201).json({ group, recorded: created.length, total: plan.total, entries: created });
   } catch (e) {
@@ -1660,6 +1719,18 @@ router.patch('/:id', requireAdmin, async (req, res) => {
 
     // Only the fields actually supplied are touched, so a caller sending just an
     // amount cannot blank out the description by omission.
+    //
+    // THE RECEIPT NUMBER IS NOT IN THIS ALLOW-LIST, and that is the point. It is
+    // built field by field, so `receiptNumber` in a request body is simply never
+    // read and cannot be edited, cleared or set from outside the issuing path.
+    //
+    // Nor is one reissued when a payment changes. Editing the amount or the date
+    // leaves the number exactly as it was — a parent may already be holding it,
+    // and a receipt that renumbers itself identifies nothing. `academicYear` is
+    // likewise never restamped here, so even moving a payment's date across a
+    // year boundary keeps both the year and the number it was issued under: the
+    // number stays consistent with the row it names, and the school can still
+    // find it by the digits the parent reads out.
     const data = {};
     if (body.description !== undefined) {
       const description = String(body.description).trim();
@@ -1709,7 +1780,33 @@ router.delete('/:id', requireAdmin, async (req, res) => {
       where: { schoolId, OR: [{ code: String(id) }, { id: parseInt(id) || 0 }] },
     });
     if (!entry) return res.status(404).json({ error: 'Not found' });
-    await prisma.ledgerEntry.delete({ where: { id: entry.id } });
+
+    // THE NUMBER IS RETIRED, NOT FREED. Payments are hard deleted — there is no
+    // void and no status column — so without a record left behind, deleting a
+    // numbered payment would leave a hole in the receipt sequence with nothing
+    // anywhere to account for it. A gap is meant to be evidence; an unexplained
+    // one reads as something concealed.
+    //
+    // The counter is NOT rewound and the number is never reissued: a parent may
+    // be holding a receipt with it printed on.
+    //
+    // Both writes in one transaction, so a failure cannot delete the payment
+    // while losing the record of its number.
+    const student = entry.studentId
+      ? await prisma.student.findUnique({
+        where: { id: entry.studentId },
+        select: { firstName: true, lastName: true },
+      })
+      : null;
+
+    await prisma.$transaction(async (tx) => {
+      await retireReceiptNumber(tx, entry, {
+        studentName: student ? `${student.firstName} ${student.lastName}`.trim() : null,
+        adminId: req.user?.id ?? null,
+        adminName: req.user?.name ?? null,
+      });
+      await tx.ledgerEntry.delete({ where: { id: entry.id } });
+    });
     res.json(withIdAsCode(entry));
   } catch (e) {
     res.status(400).json({ error: e.message });
