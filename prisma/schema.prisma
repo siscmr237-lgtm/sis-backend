@@ -954,6 +954,27 @@ model LedgerEntry {
   /// reissue it — a parent may already be holding the old number. See
   /// src/utils/receiptNumber.js.
   receiptNumber        String?
+  /// THE SUBMISSION THIS ROW CAME FROM. Payments only; null on charges and on
+  /// every row written before batching existed.
+  ///
+  /// Pay Fees is ONE act that creates SEVERAL rows — 10,000 Books, 1,000 PTA,
+  /// 30,000 Tuition is a parent handing over 41,000 once. Nothing recorded that
+  /// they belonged together, so a receipt built per row told the family about
+  /// three payments they did not make.
+  ///
+  /// An opaque server-generated token, never shown and never accepted from a
+  /// client: a client-supplied one could merge two submissions or forge a row
+  /// into somebody else's.
+  ///
+  /// EVERY payment path sets one, including the single-payment route, where the
+  /// batch is simply of one. That keeps "a submission" a uniform idea — without
+  /// it a lone payment would have no batch to confirm and no batch to retry.
+  ///
+  /// It groups rows written TOGETHER, not money handed over together. Recording
+  /// Tuition and then remembering Books a minute later is two submissions and
+  /// two messages. That is deliberate: merging on a time window works until two
+  /// cashiers overlap, and then quietly merges two families' payments.
+  paymentBatchId       String?
   whatsappMessages     WhatsAppMessage[]
   academicYear         String
   term                 String
@@ -986,6 +1007,7 @@ model LedgerEntry {
   /// Drives "how much of this charge has been settled?", which the owing endpoint
   /// asks per standalone charge.
   @@index([settlesEntryId])
+  @@index([schoolId, paymentBatchId])
   @@index([createdByAdminId])
 }
 
@@ -1254,6 +1276,9 @@ model WhatsAppMessage {
   ///
   /// Deliberately NOT kept in step with later edits, and nothing sends a
   /// correction. They are a record of what left this server.
+  /// THE SUBMISSION this confirmation covers. One message per Pay Fees
+  /// submission, however many category rows it created.
+  paymentBatchId    String?
   sentReceiptNumber String?
   sentAmount        Int?
   sentBalance       Int?
@@ -1302,7 +1327,17 @@ model WhatsAppMessage {
   /// ledgerEntryId is NULL for every other purpose — NULLs being distinct, this
   /// index constrains nothing else.
   @@unique([ledgerEntryId, purpose])
+  /// ONE CONFIRMATION PER SUBMISSION. The real guard now: a message covers a
+  /// whole batch, so keying only on a row would leave the other rows of that
+  /// batch looking unconfirmed.
+  ///
+  /// The row-level index above is KEPT rather than replaced. It costs nothing,
+  /// ledgerEntryId still answers "which row did this message name", and a
+  /// retry updates the existing row rather than inserting, so neither index
+  /// stands in its way. Both are NULL for every other purpose.
+  @@unique([paymentBatchId, purpose])
   @@index([ledgerEntryId])
+  @@index([paymentBatchId])
   @@index([schoolId, referenceDate])
   @@index([twilioSid])
 }

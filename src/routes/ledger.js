@@ -5,6 +5,8 @@ const { classLevelOf } = require('../utils/classLevels');
 const { withIdAsCode, mapWithIdAsCode } = require('../utils/response');
 const { resolveSchoolTerm, resolveEffectiveSchoolTerm } = require('../utils/academicTerm');
 const { issueReceiptNumber, retireReceiptNumber } = require('../utils/receiptNumber');
+const { newPaymentBatchId } = require('../utils/paymentBatch');
+const { retryableConfirmations } = require('../utils/paymentConfirmationState');
 const { requireAdmin, requireTeacher } = require('../roleGuards');
 const { attributionFor, canEdit, canDelete } = require('../utils/attribution');
 const { FEE_GROUPS } = require('../utils/feeCategories');
@@ -528,6 +530,11 @@ router.get('/student-transactions', requireAdmin, async (req, res) => {
     // look up; and a fee the student no longer follows — they changed class, or
     // were detached since — still names itself correctly, where a lookup
     // against their current structure would come back empty.
+    // Which of these rows should offer to retry an unsent parent receipt. Keyed
+    // on each submission's anchor row, so three fees paid together show one
+    // button, not three.
+    const retryable = await retryableConfirmations(schoolId, entries);
+
     const rows = entries.map((e) => {
       const category =
         e.classLevelFee?.name ??
@@ -556,6 +563,9 @@ router.get('/student-transactions', requireAdmin, async (req, res) => {
         // The receipt number, for the column the office reads back to a parent.
         // Null on every charge, permanently — payments are not a separate table.
         receiptNumber: e.receiptNumber ?? null,
+        // Present only on the anchor row of a submission whose parent receipt
+        // never reached Twilio. See utils/paymentConfirmationState.
+        confirmationRetry: retryable.get(e.id) ?? null,
       };
     });
 
@@ -883,6 +893,10 @@ router.post('/payment', requireAdmin, async (req, res) => {
     // work, so an insert that fails takes its number back with it and leaves no
     // gap in the sequence. This route used to be a bare create; the transaction
     // exists for the numbering, not for the insert.
+    // A BATCH OF ONE. Every payment path stamps a batch, this one included,
+    // so "a submission" stays a uniform idea downstream — without it a lone
+    // payment would have no batch to confirm to a parent and none to retry.
+    const paymentBatchId = newPaymentBatchId();
     const entry = await prisma.$transaction(async (tx) => {
       const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
       return tx.ledgerEntry.create({
@@ -890,6 +904,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
           code: genCode('PMT'),
           type: 'PAYMENT',
           receiptNumber,
+          paymentBatchId,
           schoolId,
           studentId: student.id,
           categoryId: null,
@@ -1030,6 +1045,11 @@ router.post('/payments', requireAdmin, async (req, res) => {
     // the numbers have to be taken one at a time and in order, and an array
     // transaction gives no place to await between the creates. Sequential is
     // also what makes the receipts on one hand-over of money consecutive.
+    // ONE ID FOR EVERY ROW THIS SUBMISSION CREATES — the whole point of the
+    // change. A family handing over 41,000 once produced three rows and, before
+    // this, three separate receipts. Generated OUTSIDE the transaction so every
+    // row inside it shares the one value.
+    const paymentBatchId = newPaymentBatchId();
     const created = await prisma.$transaction(async (tx) => {
       const rows = [];
       for (const { target, amount } of planned) {
@@ -1039,6 +1059,7 @@ router.post('/payments', requireAdmin, async (req, res) => {
               code: genCode('PMT'),
               type: 'PAYMENT',
               receiptNumber,
+              paymentBatchId,
               schoolId,
               studentId: student.id,
               categoryId: null,
@@ -1066,7 +1087,16 @@ router.post('/payments', requireAdmin, async (req, res) => {
 
     res.status(201).json({
       recorded: created.length,
+      // THE SERVER'S TOTAL, summed from what was actually written. Every row is
+      // capped against what is really owed, so this can be less than the cashier
+      // typed — and it is the figure a parent will be told was received. A
+      // receipt quoting the typed number would tell a family they had paid more
+      // than the school banked.
       total: created.reduce((n, e) => n + e.amount, 0),
+      // Handed back so the caller can request ONE confirmation covering the
+      // whole submission, in a SEPARATE request after this one has committed.
+      // Recording money must never wait on WhatsApp, or fail because of it.
+      paymentBatchId,
       entries: mapWithIdAsCode(created),
     });
   } catch (e) {
@@ -1128,9 +1158,17 @@ router.get('/student/:studentId', requireAdmin, async (req, res) => {
       }
     }
 
+    // Which rows should offer to retry a parent receipt that never sent. Keyed
+    // on each batch's ANCHOR row, so one submission shows one button rather than
+    // one per fee paid.
+    const retryable = await retryableConfirmations(schoolId, entries);
+
     res.json({
-      entries: mapWithIdAsCode(entries).map((e) => ({
+      entries: mapWithIdAsCode(entries).map((e, i) => ({
         ...e,
+        // Present ONLY on an anchor row whose confirmation never reached Twilio,
+        // which is almost nowhere — an ordinary payment carries no clutter.
+        confirmationRetry: retryable.get(entries[i].id) ?? null,
         // Null, never a dash: the placeholder is the reader's decision, and a
         // genuinely untagged legacy row must stay distinguishable from a tagged
         // one whose fee has since been deleted.
@@ -1265,6 +1303,9 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
     // creates; a failure partway through left some categories paid and some
     // not, and now would also leave numbers issued for rows that never
     // existed. Both problems close the same way.
+    // Settling a whole group is one act too, so it is one batch and one
+    // receipt, for the same reason Pay Fees is.
+    const paymentBatchId = newPaymentBatchId();
     const created = await prisma.$transaction(async (tx) => {
       const rows = [];
       for (const c of plan.categories) {
@@ -1278,6 +1319,7 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
             code: genCode('PMT'),
             type: 'PAYMENT',
             receiptNumber,
+            paymentBatchId,
             schoolId,
             studentId: student.id,
             categoryId: null,
@@ -1298,7 +1340,9 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
       return rows;
     });
 
-    res.status(201).json({ group, recorded: created.length, total: plan.total, entries: created });
+    res.status(201).json({
+      group, recorded: created.length, total: plan.total, paymentBatchId, entries: created,
+    });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

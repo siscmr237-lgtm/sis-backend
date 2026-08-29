@@ -8,23 +8,31 @@ const { neverLeftServer, RETRY_RESET } = require('../utils/whatsappAttempt');
 /**
  * WhatsApp payment confirmations — the receipt a parent gets after paying.
  *
- * THIS IS THE ONLY TEMPLATE WE SEND THAT QUOTES MONEY, and the body invites the
- * parent to dispute it: "Please contact the school office if this record does
- * not match your own." So every figure in it is something that will be argued
- * about in person, at a counter, against a piece of paper. That shapes the whole
- * file:
+ * ONE MESSAGE PER SUBMISSION, NOT PER ROW. Pay Fees writes a ledger row per fee:
+ * 10,000 Books, 1,000 PTA, 30,000 Tuition is a family handing over 41,000 once.
+ * A confirmation built from a single row would tell them about a third of what
+ * they paid, three times over. Every row of one submission carries the same
+ * LedgerEntry.paymentBatchId, and that batch — not the row — is what this
+ * confirms and what the duplicate guard keys on.
  *
- *   - The amount is the payment row's OWN amount, put through the app's own
- *     money formatter. Never recomputed, never rounded differently, so it is
- *     character-for-character what the finance table and the printed financial
- *     sheet show.
- *   - The date is the payment's OWN entryDate, not today. A receipt sent the
- *     morning after says the money arrived yesterday, because it did.
- *   - The balance is computed at send time, in this request, from the ledger.
- *   - Every value is checked for emptiness and for newlines before anything is
- *     sent, because a gap in a sentence about money is worse than no message.
- *   - What actually went out is snapshotted onto the row, so a later edit to the
- *     payment leaves the discrepancy detectable.
+ * THIS IS THE ONLY TEMPLATE WE SEND THAT QUOTES MONEY, and its body invites the
+ * parent to dispute it: "Please contact the school office if this record does
+ * not match your own." Every figure will be argued about in person, at a
+ * counter, against a piece of paper. So:
+ *
+ *   - the amount is the sum of what the submission ACTUALLY BANKED, read back
+ *     from the rows. Each row is capped against real owing, so a cashier typing
+ *     50,000 against 41,000 outstanding banks 41,000 — and that is what the
+ *     parent is told. Never the typed figure, never the student's lifetime total.
+ *   - the date is the payment's OWN entryDate, not today.
+ *   - the balance is recomputed AFTER the rows are committed.
+ *   - every variable is checked for emptiness and newlines before anything is
+ *     claimed or sent.
+ *
+ * IT IS NEVER SENT FROM INSIDE THE PAYMENT TRANSACTION. Recording money must not
+ * roll back, block, or appear to fail because WhatsApp is unreachable. Pay Fees
+ * commits first and asks for the confirmation in a separate request afterwards;
+ * a failure there is reported quietly and leaves a retry behind.
  */
 
 const router = express.Router();
@@ -43,14 +51,8 @@ const TEMPLATE_SID = process.env.TWILIO_PAYMENT_CONFIRMATION_TEMPLATE_SID
  *
  * Seven. A confirmation arriving weeks after the money changed hands does not
  * reassure anybody — it puzzles them, and a puzzled parent rings the office
- * about a payment that was never in doubt. It also protects against somebody
- * working through an old list and sending a burst of confirmations for payments
- * every family had long since forgotten.
- *
- * Measured from the payment's entryDate, not from when the row was created, so
- * a payment back-dated a fortnight is out of the window even if it was typed in
- * this morning — which is right, because the parent's memory is of the date on
- * the receipt.
+ * about a payment that was never in doubt. Measured from the payment's
+ * entryDate, because that is the date the parent remembers.
  */
 const MAX_AGE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -64,13 +66,15 @@ const NO_CONSENT = 'no_consent';
 const NO_NUMBER = 'no_number';
 const TOO_OLD = 'too_old';
 const ALREADY_SENT = 'already_sent';
+/** Every row capped to zero — nothing was banked, so there is nothing to confirm. */
+const NOTHING_BANKED = 'nothing_banked';
 
 /**
  * The template's seven slots.
  *
  * VERIFIED against the Content API rather than the console — the console's
  * display order is not authoritative. GET /v1/Content/HX9181e0… returns its own
- * sample values in this order:
+ * samples in this order:
  *
  *   {{1}} "Mr Ndongo"                       guardian
  *   {{2}} "50,000 FCFA"                     amount paid
@@ -80,27 +84,22 @@ const ALREADY_SENT = 'already_sent';
  *   {{6}} "25,000 FCFA"                     outstanding balance
  *   {{7}} "Bright Future Bilingual College" school
  *
- * against the body:
+ * NOTE THE CURRENCY IS INSIDE THE VARIABLE — the samples read "50,000 FCFA", not
+ * "50,000" with the unit in the body — so {{2}} and {{6}} carry it or the parent
+ * receives a bare number with no currency at all.
  *
- *   "Dear {{1}}, we confirm that a payment of {{2}} was received on {{3}}
- *    towards the school fees for {{4}}. Receipt number: {{5}}. Outstanding
- *    balance: {{6}}. … {{7}} The Administration. Sent with Lewa - lewa.app"
- *
- * NOTE THE CURRENCY IS INSIDE THE VARIABLE. The samples read "50,000 FCFA", not
- * "50,000" with the unit in the body, so {{2}} and {{6}} must carry the unit or
- * a parent receives a bare number with no currency at all.
- *
- * Getting this order wrong does not produce a broken-looking message. It
- * produces a well-formed one telling a family they paid their own child's name.
+ * {{5}} takes EVERY receipt number the submission produced, comma-separated:
+ * "2026/2027-0010, 2026/2027-0011, 2026/2027-0012". The office search matches
+ * partial numbers, so any one of them read out over the phone finds its row.
  */
 const paymentConfirmationVariables = ({
-  guardianName, amountPaid, dateReceived, studentName, receiptNumber, balance, schoolName,
+  guardianName, amountPaid, dateReceived, studentName, receiptNumbers, balance, schoolName,
 }) => ({
   1: guardianName,
   2: amountPaid,
   3: dateReceived,
   4: studentName,
-  5: receiptNumber,
+  5: receiptNumbers,
   6: balance,
   7: schoolName,
 });
@@ -109,14 +108,13 @@ const paymentConfirmationVariables = ({
  * Refuse to send if any variable is empty or contains a newline.
  *
  * WhatsApp forbids a newline inside a template variable and rejects the whole
- * message, so a school name someone pasted with a line break in it would fail
- * every send with an error naming no cause. An EMPTY value is worse: it is
- * accepted, and the parent reads "a payment of  was received on 27 August" — a
- * gap in a sentence about their money, in a message inviting them to dispute it.
+ * message, so a school name pasted with a line break would fail every send with
+ * an error naming no cause. An EMPTY value is worse: it is accepted, and the
+ * parent reads "a payment of  was received on 29 August" — a gap in a sentence
+ * about their money, in a message inviting them to dispute it.
  *
- * Checked here rather than trusted from the callers because these seven strings
- * come from seven different places — a guardian's name, a formatter, a school
- * record — and only one of them has to be blank.
+ * The joined receipt numbers go through this like everything else, which is what
+ * checks that the join produced something and that no number smuggled in a break.
  */
 function invalidVariable(vars) {
   for (const [slot, value] of Object.entries(vars)) {
@@ -126,6 +124,16 @@ function invalidVariable(vars) {
   }
   return null;
 }
+
+/**
+ * The receipt numbers of a submission, as the message lists them.
+ *
+ * ", " between, so a single-category submission is one number with no trailing
+ * comma and a three-category one reads as a list. Blank numbers are dropped
+ * rather than joined as empty gaps.
+ */
+const joinReceiptNumbers = (rows) =>
+  rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean).join(', ');
 
 /** The date as the parent reads it: "27 August 2026". */
 function formatReceivedDate(value) {
@@ -155,36 +163,85 @@ async function balanceFor(schoolId, studentId) {
   return charged - paid;
 }
 
+/** One payment row, its student and guardian, scoped to this school. */
+const loadPayment = (schoolId, id) => prisma.ledgerEntry.findFirst({
+  where: { schoolId, OR: [{ code: String(id) }, { id: parseInt(id, 10) || 0 }] },
+  include: { student: { include: { parent: true } } },
+});
+
 /**
- * Everything about one payment: whether a confirmation can be sent, and if not,
- * why. Shared by the read route and the send route so the screen can never offer
- * something the send would refuse.
+ * EVERY ROW OF ONE SUBMISSION, in the order their receipt numbers were issued.
  *
- * `entry` must already be scoped to the caller's school.
+ * Ordered by id, which inside the payment transaction is the order the numbers
+ * were taken, so the list in the message reads consecutively.
  */
-function assess(entry, existing, now = new Date()) {
-  const student = entry.student ?? null;
+const loadBatch = (schoolId, paymentBatchId) => prisma.ledgerEntry.findMany({
+  where: { schoolId, paymentBatchId, type: 'PAYMENT' },
+  orderBy: { id: 'asc' },
+  include: { student: { include: { parent: true } } },
+});
+
+/**
+ * The batch a request is asking about, however it named it.
+ *
+ * `paymentBatchId` is the direct route, used by Pay Fees straight after it
+ * commits. `ledgerEntryId` is the recovery route: the retry affordance names the
+ * anchor row, and resolving it back to its batch means a retry covers the whole
+ * submission rather than one third of it.
+ *
+ * A row with no batch at all — written before batching existed, or by hand — is
+ * treated as a batch of one. That keeps old payments confirmable instead of
+ * permanently unreachable.
+ */
+async function resolveBatch(schoolId, { paymentBatchId, ledgerEntryId }) {
+  if (paymentBatchId) {
+    const rows = await loadBatch(schoolId, String(paymentBatchId));
+    return { rows, anchor: rows[0] ?? null, batchId: String(paymentBatchId) };
+  }
+  const entry = await loadPayment(schoolId, ledgerEntryId);
+  if (!entry) return { rows: [], anchor: null, batchId: null };
+  if (!entry.paymentBatchId) return { rows: [entry], anchor: entry, batchId: null };
+  const rows = await loadBatch(schoolId, entry.paymentBatchId);
+  return { rows, anchor: rows[0] ?? entry, batchId: entry.paymentBatchId };
+}
+
+/**
+ * Whether a submission can be confirmed, and if not, why.
+ *
+ * Shared by the read route and the send route so the dialog can never offer
+ * something the send would refuse. Judged on the ANCHOR row for the things that
+ * are properties of the payer — consent, phone, date — and on the whole batch
+ * for the things that are properties of the submission: the total banked and the
+ * receipt numbers.
+ */
+function assess(rows, anchor, existing, now = new Date()) {
+  const student = anchor?.student ?? null;
   const parent = student?.parent ?? null;
   const studentName = student ? `${student.firstName} ${student.lastName}`.trim() : '';
   const guardianName = parent?.name?.trim() || '';
   const rawPhone = parent?.phone ?? '';
   const to = normaliseToWhatsApp(rawPhone);
+  const total = rows.reduce((n, r) => n + (r.amount ?? 0), 0);
+  const receiptNumbers = joinReceiptNumbers(rows);
 
   const base = {
-    ledgerEntryId: entry.id,
-    paymentId: entry.code,
+    ledgerEntryId: anchor?.id ?? null,
+    paymentId: anchor?.code ?? null,
+    paymentBatchId: anchor?.paymentBatchId ?? null,
+    rowCount: rows.length,
     studentName,
     guardianName,
     phone: to ? displayNumber(to) : null,
     storedPhone: String(rawPhone).trim() || null,
-    receiptNumber: entry.receiptNumber ?? null,
-    amount: entry.amount,
-    entryDate: entry.entryDate,
+    receiptNumbers,
+    // The submission total, which is what the message quotes — not any one row.
+    amount: total,
+    entryDate: anchor?.entryDate ?? null,
     to,
   };
 
-  // A confirmation already sent is reported with what it SAID, not with what the
-  // payment says now — those can differ, and the difference is the point of the
+  // Reported with what it SAID, not with what the rows say now — those can
+  // differ once an amount is edited, and the difference is the point of the
   // snapshot.
   if (existing) {
     return {
@@ -197,16 +254,23 @@ function assess(entry, existing, now = new Date()) {
       sentReceiptNumber: existing.sentReceiptNumber,
       errorCode: existing.errorCode,
       errorMessage: existing.errorMessage,
+      /** True when a send was asked for and never reached Twilio — retryable. */
+      retryable: neverLeftServer(existing),
     };
   }
-  if (entry.type !== 'PAYMENT') return { ...base, state: NOT_A_PAYMENT };
+  if (!rows.length) return { ...base, state: NOT_A_PAYMENT };
+  if (rows.some((r) => r.type !== 'PAYMENT')) return { ...base, state: NOT_A_PAYMENT };
   // Staff payroll is money going OUT to an employee. There is no parent at the
-  // other end of it, and a "we confirm your payment was received" message about
-  // somebody's salary is nonsense at best.
-  if (!entry.studentId) return { ...base, state: STAFF_PAYMENT };
-  if (!entry.receiptNumber) return { ...base, state: NO_RECEIPT_NUMBER };
+  // other end, and "we confirm your payment was received" about somebody's
+  // salary is nonsense at best.
+  if (!anchor.studentId) return { ...base, state: STAFF_PAYMENT };
+  // Every row capped to zero: the submission recorded nothing, so there is no
+  // payment to confirm. Distinct from an unpaid balance — this is a receipt for
+  // an act that banked no money.
+  if (total <= 0) return { ...base, state: NOTHING_BANKED };
+  if (!receiptNumbers) return { ...base, state: NO_RECEIPT_NUMBER };
 
-  const ageDays = Math.floor((now.getTime() - new Date(entry.entryDate).getTime()) / DAY_MS);
+  const ageDays = Math.floor((now.getTime() - new Date(anchor.entryDate).getTime()) / DAY_MS);
   if (ageDays > MAX_AGE_DAYS) return { ...base, state: TOO_OLD, ageDays };
 
   if (!parent || !parent.whatsappConsent) return { ...base, state: NO_CONSENT };
@@ -216,14 +280,23 @@ function assess(entry, existing, now = new Date()) {
 
 const publicRow = (row) => { const { to, ...rest } = row; return rest; };
 
-/** The payment, its student and guardian, scoped to this school. */
-const loadPayment = (schoolId, id) => prisma.ledgerEntry.findFirst({
-  where: {
-    schoolId,
-    OR: [{ code: String(id) }, { id: parseInt(id, 10) || 0 }],
-  },
-  include: { student: { include: { parent: true } } },
-});
+/**
+ * The confirmation already written for this submission, if any.
+ *
+ * Looked up by BATCH where there is one — that is the guard that matters — and
+ * by row otherwise, so a batchless legacy payment still finds its own record.
+ */
+function findExisting(batchId, anchor) {
+  if (batchId) {
+    return prisma.whatsAppMessage.findUnique({
+      where: { paymentBatchId_purpose: { paymentBatchId: batchId, purpose: PURPOSE } },
+    });
+  }
+  if (!anchor) return null;
+  return prisma.whatsAppMessage.findUnique({
+    where: { ledgerEntryId_purpose: { ledgerEntryId: anchor.id, purpose: PURPOSE } },
+  });
+}
 
 /** Whether the server could send at all. */
 const configured = () => Boolean(
@@ -247,33 +320,33 @@ function refuseIfDisabled(res) {
 }
 
 /**
- * GET /whatsapp/payment-confirmation/:ledgerEntryId
+ * GET /whatsapp/payment-confirmation/:id
  *
- * What the confirmation dialog shows: who it would reach, on what number, and
- * every figure exactly as the message will phrase it. Sends nothing, writes
- * nothing.
+ * `id` is a paymentBatchId or a payment's own code. Shows who the confirmation
+ * would reach, on what number, and every figure exactly as the message will word
+ * it. Sends nothing, writes nothing.
  */
-router.get('/payment-confirmation/:ledgerEntryId', async (req, res) => {
+router.get('/payment-confirmation/:id', async (req, res) => {
   try {
     const schoolId = req.user.schoolId;
-    const entry = await loadPayment(schoolId, req.params.ledgerEntryId);
+    const key = String(req.params.id);
+    // A UUID is a batch id; anything else is a payment code. Both are accepted
+    // so the dialog can be opened from Pay Fees (which has the batch) or from a
+    // retry affordance (which has the row).
+    const isBatch = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key);
+    const { rows, anchor, batchId } = await resolveBatch(
+      schoolId, isBatch ? { paymentBatchId: key } : { ledgerEntryId: key },
+    );
     // 404, not 403: a payment in another school is indistinguishable from one
     // that does not exist, and saying which would confirm it is real.
-    if (!entry) return res.status(404).json({ error: 'Payment not found.' });
+    if (!anchor) return res.status(404).json({ error: 'Payment not found.' });
 
-    const existing = entry.id
-      ? await prisma.whatsAppMessage.findUnique({
-        where: { ledgerEntryId_purpose: { ledgerEntryId: entry.id, purpose: PURPOSE } },
-      })
-      : null;
-
-    const row = assess(entry, existing);
+    const existing = await findExisting(batchId, anchor);
+    const row = assess(rows, anchor, existing);
     const school = await prisma.school.findUnique({ where: { id: schoolId }, select: { name: true } });
 
-    // The balance only matters for a row that could actually be sent, and it is
-    // a query per call — so it is computed for those and left null otherwise.
     let balance = null;
-    if (row.state === READY) balance = await balanceFor(schoolId, entry.studentId);
+    if (row.state === READY) balance = await balanceFor(schoolId, anchor.studentId);
 
     res.json({
       ...publicRow(row),
@@ -285,10 +358,10 @@ router.get('/payment-confirmation/:ledgerEntryId', async (req, res) => {
       // rather than a button. Every figure here is the one that will be sent.
       preview: row.state === READY ? {
         guardianName: row.guardianName || 'Parent',
-        amountPaid: formatFcfaWithUnit(entry.amount),
-        dateReceived: formatReceivedDate(entry.entryDate),
+        amountPaid: formatFcfaWithUnit(row.amount),
+        dateReceived: formatReceivedDate(anchor.entryDate),
         studentName: row.studentName,
-        receiptNumber: row.receiptNumber,
+        receiptNumbers: row.receiptNumbers,
         balance: formatFcfaWithUnit(Math.max(0, balance ?? 0)),
         schoolName: school?.name ?? '',
       } : null,
@@ -300,61 +373,57 @@ router.get('/payment-confirmation/:ledgerEntryId', async (req, res) => {
 });
 
 /**
- * POST /whatsapp/payment-confirmation  { ledgerEntryId }
+ * POST /whatsapp/payment-confirmation  { paymentBatchId } or { ledgerEntryId }
  *
- * ONE PAYMENT, named directly. Everything else is derived from that row, so
- * there is no amount, no date and no balance in the request body that could
- * disagree with the ledger.
+ * ONE SUBMISSION, named directly. Everything is derived from its rows, so no
+ * amount, date or balance in the request body can disagree with the ledger.
  *
- * NOT CALLED FROM THE PAYMENT-RECORDING PATH, deliberately. Recording money must
- * never fail, or appear to fail, because WhatsApp is unreachable — the payment
- * is the thing that matters and the message is a courtesy on top of it. Sending
- * automatically on record is the eventual intent, and when it happens it must be
- * fire-and-forget AFTER the ledger write has committed, never inside its
- * transaction.
+ * CALLED AFTER THE PAYMENT HAS COMMITTED, never inside its transaction.
+ * Recording money must not roll back, block, or appear to fail because WhatsApp
+ * is unreachable — the payment is what matters and the message is a courtesy on
+ * top of it. Sending automatically on record is the eventual intent; when it
+ * happens it must stay fire-and-forget after the ledger write has committed.
  */
 router.post('/payment-confirmation', async (req, res) => {
   if (refuseIfDisabled(res)) return;
   try {
     const schoolId = req.user.schoolId;
-    const { ledgerEntryId } = req.body ?? {};
-    if (!String(ledgerEntryId ?? '').trim()) {
-      return res.status(400).json({ error: 'A ledgerEntryId is required.' });
+    const { paymentBatchId, ledgerEntryId } = req.body ?? {};
+    if (!String(paymentBatchId ?? '').trim() && !String(ledgerEntryId ?? '').trim()) {
+      return res.status(400).json({ error: 'A paymentBatchId or ledgerEntryId is required.' });
     }
 
-    const entry = await loadPayment(schoolId, ledgerEntryId);
-    if (!entry) return res.status(404).json({ error: 'Payment not found.' });
+    const { rows, anchor, batchId } = await resolveBatch(schoolId, { paymentBatchId, ledgerEntryId });
+    if (!anchor) return res.status(404).json({ error: 'Payment not found.' });
 
-    const existing = await prisma.whatsAppMessage.findUnique({
-      where: { ledgerEntryId_purpose: { ledgerEntryId: entry.id, purpose: PURPOSE } },
-    });
-    const row = assess(entry, existing);
-    if (row.state !== READY) {
+    const existing = await findExisting(batchId, anchor);
+    const row = assess(rows, anchor, existing);
+    // A refusal is a 200 with a reason, not an error status: the payment itself
+    // succeeded, and the caller needs to tell those two apart.
+    if (row.state !== READY && !(row.state === ALREADY_SENT && row.retryable)) {
       return res.status(200).json({ ...publicRow(row), sent: false, reason: row.state });
     }
 
     const school = await prisma.school.findUnique({ where: { id: schoolId }, select: { name: true } });
-    // COMPUTED HERE, in this request, immediately before sending — never carried
-    // in from the screen that opened the dialog.
-    const balance = await balanceFor(schoolId, entry.studentId);
+    // RECOMPUTED HERE, after every row of the submission is committed.
+    const balance = await balanceFor(schoolId, anchor.studentId);
     // Clamped for the MESSAGE only. A credit balance is a real state, but
-    // "Outstanding balance: -15,000 FCFA" is not something to send a parent, and
-    // the school should see the credit and decide what to say. Zero is fine and
-    // is worth sending: "Outstanding balance: 0 FCFA" is good news.
+    // "Outstanding balance: -15,000 FCFA" is not something to send a parent. Zero
+    // is fine and worth sending: "Outstanding balance: 0 FCFA" is good news.
     const shownBalance = Math.max(0, balance);
 
     const variables = paymentConfirmationVariables({
       guardianName: row.guardianName || 'Parent',
-      amountPaid: formatFcfaWithUnit(entry.amount),
-      dateReceived: formatReceivedDate(entry.entryDate),
+      amountPaid: formatFcfaWithUnit(row.amount),
+      dateReceived: formatReceivedDate(anchor.entryDate),
       studentName: row.studentName,
-      receiptNumber: row.receiptNumber,
+      receiptNumbers: row.receiptNumbers,
       balance: formatFcfaWithUnit(shownBalance),
       schoolName: school?.name ?? '',
     });
 
     // Checked before the row is claimed, so a message that could never be
-    // accepted does not consume this payment's one confirmation.
+    // accepted does not consume this submission's one confirmation.
     const bad = invalidVariable(variables);
     if (bad) {
       return res.status(200).json({
@@ -362,39 +431,48 @@ router.post('/payment-confirmation', async (req, res) => {
       });
     }
 
-    // The row is claimed BEFORE the provider is called, so two clicks cannot
-    // both send: one create wins, the other takes P2002.
+    const snapshot = {
+      // THE SNAPSHOT, written with the row rather than after the send, so it
+      // exists even if the process dies mid-request. Never updated to follow a
+      // later edit to the payment — it records what left this server.
+      sentReceiptNumber: row.receiptNumbers,
+      sentAmount: row.amount,
+      sentBalance: shownBalance,
+    };
+
+    // The row is claimed BEFORE the provider is called, so two clicks cannot both
+    // send: one create wins, the other takes P2002.
     let message;
     try {
       message = await prisma.whatsAppMessage.create({
         data: {
           schoolId,
-          studentId: entry.studentId,
-          parentId: entry.student?.parentId ?? null,
-          ledgerEntryId: entry.id,
+          studentId: anchor.studentId,
+          parentId: anchor.student?.parentId ?? null,
+          // The anchor row, kept so the message still names a row; the batch is
+          // what the guard is really on.
+          ledgerEntryId: anchor.id,
+          paymentBatchId: batchId,
           templateSid: TEMPLATE_SID,
           purpose: PURPOSE,
-          // NULL, deliberately — see the column. A confirmation is a fact about
-          // a payment, not about a day, and a date here would collide with the
-          // family's second payment of the morning.
+          // NULL, deliberately — a confirmation is a fact about a submission, not
+          // about a day, and a date here would collide with the family's second
+          // payment of the morning.
           referenceDate: null,
           toNumber: row.to,
           status: 'queued',
-          // THE SNAPSHOT, written with the row rather than after the send, so it
-          // exists even if the process dies mid-request.
-          sentReceiptNumber: row.receiptNumber,
-          sentAmount: entry.amount,
-          sentBalance: shownBalance,
+          ...snapshot,
         },
       });
     } catch (e) {
       if (e.code !== 'P2002') throw e;
-      // The same rule as the other two routes: a row left behind by a send the
-      // provider refused represents a message nobody received, so it is retried
-      // rather than counted as a duplicate.
-      const clash = await prisma.whatsAppMessage.findUnique({
-        where: { ledgerEntryId_purpose: { ledgerEntryId: entry.id, purpose: PURPOSE } },
-      });
+      // EITHER unique index may have fired — the batch one or the row one — so
+      // the conflicting row is looked up the same way it was found above. A row
+      // left behind by a send the provider refused is a message nobody received,
+      // so it is UPDATED and retried rather than counted as a duplicate. That
+      // update is also what stops the retained row-level index refusing a retry
+      // the batch index was meant to allow.
+      const clash = await findExisting(batchId, anchor);
       if (!neverLeftServer(clash)) {
         return res.status(200).json({
           ...publicRow(row), sent: false, reason: ALREADY_SENT, state: ALREADY_SENT,
@@ -406,9 +484,9 @@ router.post('/payment-confirmation', async (req, res) => {
           ...RETRY_RESET,
           toNumber: row.to,
           templateSid: TEMPLATE_SID,
-          sentReceiptNumber: row.receiptNumber,
-          sentAmount: entry.amount,
-          sentBalance: shownBalance,
+          ledgerEntryId: anchor.id,
+          paymentBatchId: batchId,
+          ...snapshot,
         },
       });
     }
@@ -433,7 +511,6 @@ router.post('/payment-confirmation', async (req, res) => {
       twilioSid: updated.twilioSid,
       errorCode: updated.errorCode,
       errorMessage: updated.errorMessage,
-      // Echoed back so the dialog can show exactly what the parent was told.
       sentAmount: updated.sentAmount,
       sentBalance: updated.sentBalance,
       sentReceiptNumber: updated.sentReceiptNumber,
