@@ -18,19 +18,28 @@ const TTL_MS = 5 * 60 * 1000;
  * concurrent instance keeps its own, so this bounds database load rather than
  * eliminating it. That is all it is for.
  */
-let cache = null; // { schools: number, students: number, at: number }
+let cache = null; // { schools: number, students: number, staff: number, at: number }
 
 /**
  * GET /public/stats
  *
  * The ONLY unauthenticated data endpoint in this API, and the only route in this
  * router. It exists for one caller: the marketing page at the site root, which
- * shows a school count and a student count.
+ * shows a school count, a student count and a staff count.
  *
- * WHAT IT MAY RETURN. Exactly two keys, both integers, both aggregate — never a
- * school name, an id, a list, or a breakdown of any kind. Two totals across all
+ * WHAT IT MAY RETURN. Exactly three keys, all integers, all aggregate — never
+ * a school name, an id, a list, or a breakdown of any kind. Totals across all
  * tenants identify nobody; anything finer would, and this route has no session
- * to scope it by. If a future landing page wants more, it does not get it here.
+ * to scope it by. If a future landing page wants more of THAT sort, it does not
+ * get it here.
+ *
+ * `staff` was added for the landing page's stats band, which shows a staff
+ * count beside the other two. It is admitted because it is the same KIND of
+ * value as the two that were already here — one integer, summed over every
+ * tenant, attributable to nobody — and because the alternative was writing the
+ * number into the marketing page by hand, where it would be right on the day it
+ * was typed and wrong from then on. A fourth aggregate would be judged the same
+ * way; a per-school anything still would not.
  *
  * WHY IT CANNOT FAIL. It is rendered into a public page that must load whether
  * or not the database is reachable. So every failure resolves to a 200: a stale
@@ -43,19 +52,20 @@ router.get('/stats', async (_req, res) => {
 
   // Fresh — answered without touching the database at all.
   if (cache && now - cache.at < TTL_MS) {
-    return res.json({ schools: cache.schools, students: cache.students });
+    return res.json({ schools: cache.schools, students: cache.students, staff: cache.staff });
   }
 
   try {
-    // Two independent counts, so they run together rather than one after the
-    // other. Neither depends on the other's result.
-    const [schools, students] = await Promise.all([
+    // Three independent counts, so they run together rather than one after
+    // another. None depends on another's result.
+    const [schools, students, staff] = await Promise.all([
       prisma.school.count(),
       prisma.student.count(),
+      prisma.staff.count(),
     ]);
 
-    cache = { schools, students, at: now };
-    return res.json({ schools, students });
+    cache = { schools, students, staff, at: now };
+    return res.json({ schools, students, staff });
   } catch (err) {
     // Logged rather than swallowed silently: the caller is told nothing is
     // wrong, so this line is the only place an outage is visible.
@@ -65,11 +75,11 @@ router.get('/stats', async (_req, res) => {
     // NOT refreshed here, so the next request retries the database instead of
     // treating the failure as a successful read.
     if (cache) {
-      return res.json({ schools: cache.schools, students: cache.students });
+      return res.json({ schools: cache.schools, students: cache.students, staff: cache.staff });
     }
 
-    // Nothing cached and nothing readable. Still a 200, still exactly two keys.
-    return res.json({ schools: null, students: null });
+    // Nothing cached and nothing readable. Still a 200, still exactly three keys.
+    return res.json({ schools: null, students: null, staff: null });
   }
 });
 
