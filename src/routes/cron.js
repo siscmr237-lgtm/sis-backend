@@ -23,14 +23,22 @@ const { seedReminderConfigs } = require('../utils/reminderDefaults');
 const router = express.Router();
 
 /**
- * WHY vercel.json PINS maxDuration TO 60s.
+ * A NOTE ON HOW LONG THE REMINDER SWEEP MAY RUN.
  *
- * The reminder sweep below walks every approved school and runs six checks
- * against each, so GET /cron is by far the longest-running request this API
- * serves — every ordinary school route answers in milliseconds and is unaffected
- * by the higher ceiling. It is stated explicitly rather than left to the platform
- * default because a truncated sweep FAILS SILENTLY: the schools the function
- * never reached simply get no reminder that day, and the log still shows a 200.
+ * GET /cron below walks every approved school and runs six checks against each,
+ * which makes it by far the longest-running request this API serves — every
+ * ordinary school route answers in milliseconds.
+ *
+ * It runs on whatever maxDuration the platform gives this function; pinning one
+ * in vercel.json was tried and REVERTED, because a "functions" glob that matches
+ * no detected Serverless Function fails the whole deployment, and this project
+ * builds through a rewrite rather than from an api/ directory.
+ *
+ * So the limit is worth knowing about rather than configured: a truncated sweep
+ * FAILS SILENTLY — the schools the function never reached simply get no reminder
+ * that day, and the log still shows a 200. If the school list grows enough for
+ * that to bite, the fix is to page the sweep across several runs, not to raise a
+ * ceiling that cannot be raised here.
  */
 
 /**

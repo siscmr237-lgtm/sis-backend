@@ -5,11 +5,6 @@
       "destination": "/src/index.js"
     }
   ],
-  "functions": {
-    "src/index.js": {
-      "maxDuration": 60
-    }
-  },
   "crons": [
     {
       "path": "/cron/advance-academic-year",
