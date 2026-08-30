@@ -1,5 +1,8 @@
 const express = require('express');
 const { prisma } = require('../db/prisma');
+// The rejection notice. Reads its wording from ReminderConfig, so the team can
+// change it without a deploy — see src/utils/pushNotification.js.
+const { sendReminderToUser } = require('../utils/pushNotification');
 const { requireAdmin, requireTeacher, requireOwner } = require('../roleGuards');
 const { attributionFor } = require('../utils/attribution');
 const { startOfDayUTC, toDayKey } = require('../utils/attendanceDay');
@@ -592,6 +595,37 @@ router.post('/:id/reject', requireOwner, async (req, res) => {
         });
       }),
     ]);
+
+    // ── Tell the teacher ────────────────────────────────────────────────
+    // AFTER the transaction, never inside it. A push that failed mid-transaction
+    // would roll back a rejection the school has already made, and a push sent
+    // inside one that later rolled back would tell a teacher their attendance was
+    // rejected when it was not — a notification cannot be recalled.
+    //
+    // NOT AWAITED FOR THE RESPONSE, and deliberately not allowed to fail it. The
+    // rejection is recorded and the cascade has run; whether a phone was reachable
+    // is not something the admin who clicked Reject should be told about, and it
+    // is certainly not a reason to report the rejection as failed. sendReminderToUser
+    // does not throw, but the catch is here so that stays true if it ever does.
+    //
+    // sendReminderToUser, not sendPushToUser: the words come from the
+    // attendance_rejected row, which means the team can rewrite or silence this
+    // notice from the console like any other. It also means the SCHOOL opt-out
+    // applies to it — an immediate alert is still a notification, and a school
+    // that has switched them off has switched this one off too.
+    //
+    // { staffId } rather than a bare id: AdminUser and Staff have independent id
+    // sequences, so a positional id could deliver this to an administrator who
+    // never submitted anything. See sendPushToUser.
+    sendReminderToUser(
+      { staffId: submission.staffId },
+      'attendance_rejected',
+      '/teacher/attendance',
+      // [date] is the day the rejected register was FOR, not the day it was
+      // rejected. A teacher who submitted three days running needs to know which
+      // one came back.
+      { date: submission.date },
+    ).catch((err) => console.error("attendance rejection notice failed —", err?.message));
 
     res.json({ submission: publicSubmission(updated), studentsMarkedAbsent: students.length });
   } catch (e) {

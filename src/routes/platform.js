@@ -24,6 +24,10 @@ const { supabase, BUCKET } = require('../utils/storage');
 // two accounts and locks both out — see PUT /school-admins/:id.
 const { digitsOnly, isCompletePhone, adminIdsByPhone } = require('../utils/phone');
 const { recordAudit, ACTIONS } = require('../utils/platformAudit');
+// The seed, and the readable label for each key. The wording that actually
+// SENDS comes from the ReminderConfig rows these routes serve, never from this
+// module — see src/utils/reminderDefaults.js.
+const { REMINDER_KEYS, labelForKey, seedReminderConfigs } = require('../utils/reminderDefaults');
 
 const router = express.Router();
 
@@ -1158,6 +1162,159 @@ router.get('/audit', requirePlatformFounder, async (req, res) => {
   });
   await recordAudit(req, ACTIONS.AUDIT_VIEWED, { detail: { take } });
   res.json(entries);
+});
+
+// ── Reminders ───────────────────────────────────────────────────────────────
+// The text of every push reminder, editable without a deploy. That is the whole
+// point of the ReminderConfig table: the cron jobs read their words from it at
+// send time, so a change made here is live on the next run.
+//
+// THE READ IS OPEN TO THE WHOLE TEAM; THE WRITE IS FOUNDER-ONLY. A Member needs
+// to see what the product is telling schools — that is ordinary support work —
+// but this text goes out unreviewed to every school's phones, and it changes
+// with no deploy and no code review standing behind it. So the edit carries
+// requirePlatformFounder, stated on the route rather than at a sub-mount, for
+// the same reason as the team-account routes above.
+
+/**
+ * GET /platform/reminders
+ *
+ * Every reminder, seeded first so this is never an empty screen on a database
+ * where the migration script has not been run. seedReminderConfigs only CREATES
+ * missing rows — it cannot overwrite an edit — so calling it on a read is safe,
+ * idempotent, and safe to race with itself. See src/utils/reminderDefaults.js.
+ *
+ * The readable label rides along rather than being derived in the browser: a key
+ * and its label belong together, and a second mapping in the frontend is one
+ * that would drift the first time a reminder was added.
+ */
+router.get('/reminders', async (req, res) => {
+  try {
+    const created = await seedReminderConfigs(prisma);
+    if (created) console.log(`platform/reminders: seeded ${created} missing reminder(s)`);
+
+    const rows = await prisma.reminderConfig.findMany({ orderBy: { id: 'asc' } });
+    await recordAudit(req, ACTIONS.REMINDERS_VIEWED, { detail: { count: rows.length } });
+
+    res.json(
+      rows.map((r) => ({
+        key: r.key,
+        label: labelForKey(r.key),
+        title: r.title,
+        body: r.body,
+        enabled: r.enabled,
+        updatedAt: r.updatedAt,
+      })),
+    );
+  } catch (e) {
+    console.error('platform reminders list failed', e.code || e.message);
+    res.status(500).json({ error: 'Could not load the reminders.' });
+  }
+});
+
+/**
+ * PUT /platform/reminders/:key
+ *
+ * Body: any of { title, body, enabled }. Each is applied only when PRESENT, so
+ * the enable/disable toggle can send { enabled } on its own without having to
+ * round-trip text it is not changing — which would otherwise be a way for a
+ * stale card to overwrite an edit somebody else had just saved.
+ *
+ * THE KEY IS NEVER CREATED HERE, and never renamed. It is the identifier the
+ * cron jobs join on, so accepting an arbitrary one would let the console create
+ * a row nothing sends and, worse, quietly retire one that everything does. The
+ * key has to be one this build actually knows how to send — REMINDER_KEYS.
+ *
+ * AN EMPTY TITLE OR BODY IS REFUSED. A blank notification is delivered as a
+ * blank notification: the phone shows an empty bubble and the reader learns
+ * nothing. Switching a reminder OFF is what "say nothing" is for, and unlike a
+ * blanked field it is visible in the console and reversible.
+ */
+router.put('/reminders/:key', requirePlatformFounder, async (req, res) => {
+  const key = String(req.params.key || '');
+
+  if (!REMINDER_KEYS.includes(key)) {
+    return res.status(404).json({
+      code: 'NO_SUCH_REMINDER',
+      error: `There is no reminder called "${key}".`,
+    });
+  }
+
+  const data = {};
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'title')) {
+    const title = String(req.body.title ?? '').trim();
+    if (!title) {
+      return res.status(400).json({ code: 'EMPTY_TITLE', error: 'A reminder needs a title.' });
+    }
+    // The operating system truncates a notification title long before this. The
+    // cap is here so a runaway paste cannot become a row nobody can read in the
+    // console either.
+    if (title.length > 200) {
+      return res.status(400).json({ code: 'TITLE_TOO_LONG', error: 'Keep the title under 200 characters.' });
+    }
+    data.title = title;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'body')) {
+    const body = String(req.body.body ?? '').trim();
+    if (!body) {
+      return res.status(400).json({ code: 'EMPTY_BODY', error: 'A reminder needs a message.' });
+    }
+    if (body.length > 1000) {
+      return res.status(400).json({ code: 'BODY_TOO_LONG', error: 'Keep the message under 1000 characters.' });
+    }
+    data.body = body;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'enabled')) {
+    // Coerced, not trusted. A JSON body can carry the STRING "false", which is
+    // truthy — and a reminder that stayed switched on after somebody switched it
+    // off is exactly the failure this toggle exists to prevent.
+    data.enabled = req.body.enabled === true || req.body.enabled === 'true';
+  }
+
+  if (!Object.keys(data).length) {
+    return res.status(400).json({ code: 'NOTHING_TO_UPDATE', error: 'Nothing to change.' });
+  }
+
+  try {
+    let before = await prisma.reminderConfig.findUnique({ where: { key } });
+    if (!before) {
+      // The key is known to this build but has no row — the seed has never run
+      // against this database. Seeding is the honest repair: it creates exactly
+      // the missing rows and touches nothing that already exists.
+      await seedReminderConfigs(prisma);
+      before = await prisma.reminderConfig.findUnique({ where: { key } });
+    }
+
+    const updated = await prisma.reminderConfig.update({ where: { key }, data });
+
+    // Only the fields that actually moved, with their before and after. This log
+    // is the sole record of a change that never touches git — see the note on
+    // REMINDER_UPDATED in src/utils/platformAudit.js.
+    const changed = {};
+    for (const field of Object.keys(data)) {
+      if (before && before[field] !== updated[field]) {
+        changed[field] = { from: before[field], to: updated[field] };
+      }
+    }
+    await recordAudit(req, ACTIONS.REMINDER_UPDATED, { target: key, detail: { key, changed } });
+
+    res.json({
+      key: updated.key,
+      label: labelForKey(updated.key),
+      title: updated.title,
+      body: updated.body,
+      enabled: updated.enabled,
+      updatedAt: updated.updatedAt,
+    });
+  } catch (e) {
+    if (e.code === 'P2025') {
+      return res.status(404).json({ code: 'NO_SUCH_REMINDER', error: 'That reminder does not exist.' });
+    }
+    console.error('platform reminder update failed', e.code || e.message);
+    res.status(500).json({ error: 'Could not update the reminder.' });
+  }
 });
 
 /**

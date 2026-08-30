@@ -8,8 +8,30 @@ const {
   autoApproveOverdue,
   autoApproveOverdueQuietly,
 } = require('../utils/staffAttendance');
+const {
+  checkIncompleteSetup,
+  checkNoStudents,
+  checkAttendancePending,
+  checkOutstandingFees,
+  checkPayrollNotRun,
+  checkAcademicYearTransition,
+  checkAttendanceNotRecorded,
+  isWeekdayInWat,
+} = require('../utils/reminderChecks');
+const { seedReminderConfigs } = require('../utils/reminderDefaults');
 
 const router = express.Router();
+
+/**
+ * WHY vercel.json PINS maxDuration TO 60s.
+ *
+ * The reminder sweep below walks every approved school and runs six checks
+ * against each, so GET /cron is by far the longest-running request this API
+ * serves — every ordinary school route answers in milliseconds and is unaffected
+ * by the higher ceiling. It is stated explicitly rather than left to the platform
+ * default because a truncated sweep FAILS SILENTLY: the schools the function
+ * never reached simply get no reminder that day, and the log still shows a 200.
+ */
 
 /**
  * Cron routes. Mounted BEFORE authMiddleware — a scheduler has no session — so
@@ -250,6 +272,284 @@ router.get('/auto-approve-staff-attendance', async (req, res) => {
       startedAt,
     });
   }
+});
+
+/**
+ * THE REMINDER JOBS.
+ *
+ * Two schedules, because the reminders they carry are answered at different
+ * times of day:
+ *
+ *   GET /cron            06:00 UTC = 07:00 WAT   the morning sweep, six checks
+ *   GET /cron/afternoon  13:00 UTC = 14:00 WAT   attendance not yet recorded
+ *
+ * The afternoon one has to be in the afternoon or it is not a reminder: asking
+ * at 07:00 whether a teacher has recorded attendance "yet today" would be asking
+ * before the school day has started, and every teacher would get it every day.
+ * 14:00 WAT is late enough that the register should be taken and early enough
+ * that there is still a day left to take it in.
+ *
+ * BOTH ARE PROTECTED BY CRON_SECRET, through the same authorised() helper as the
+ * three jobs above — which accepts either `Authorization: Bearer` (Vercel Cron)
+ * or `X-Cron-Secret` (cron-job.org), and refuses everything when the secret is
+ * unset rather than falling open.
+ *
+ * PER-SCHOOL ISOLATION, like every job in this file: one school that throws is
+ * recorded and skipped, and the sweep carries on. A single school with a broken
+ * relation must not cost every other school its reminders for the day.
+ *
+ * NO WORDS LIVE HERE. Every check sends through sendReminderToSchool or
+ * sendReminderToUser, which read their title and body from ReminderConfig at
+ * send time — so the team console edits what these jobs say, with no deploy. See
+ * src/utils/reminderChecks.js, where that rule is written out in full.
+ */
+
+/**
+ * Runs one named check for one school, and never lets it throw.
+ *
+ * The tally it builds is what makes a cron log readable: every check reports
+ * either how many notifications it sent or WHY it sent none, so "nothing
+ * happened today" can be told apart from "something is broken" without opening
+ * the database.
+ */
+/**
+ * Prisma error codes that mean "the connection was not there", as against "the
+ * query was wrong".
+ *
+ * P1001 is the one actually observed: the Supabase pooler drops a connection
+ * under a long sweep, and the check that happens to be in flight fails. Nothing
+ * about the data is wrong and the very same check succeeds a moment later, so a
+ * school losing its reminder for the day over it is a worse outcome than one
+ * extra attempt. P1002 (timed out) and P1017 (server closed the connection) are
+ * the same class of fault and are included for the same reason.
+ *
+ * Deliberately NOT a general retry. A P2025, a bad query, a bug in a check — any
+ * of those would fail identically on a second attempt, and retrying them would
+ * only double the time before the sweep gave up.
+ */
+const TRANSIENT_DB_ERRORS = new Set(['P1001', 'P1002', 'P1017']);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runCheck(tally, name, fn) {
+  const bucket = (tally[name] ||= { sent: 0, schools: 0, skipped: {}, failed: 0, retried: 0 });
+
+  // ONE retry, not a loop. A pooler that is genuinely down will not come back
+  // within a second, and a sweep that retried every check three times would take
+  // three times as long to reach the same answer — on a serverless function with
+  // a wall-clock limit, that is how a partial failure becomes a total one.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const result = await fn();
+      if (result?.sent) {
+        bucket.sent += result.sent;
+        bucket.schools += 1;
+      }
+      if (result?.skipped) {
+        bucket.skipped[result.skipped] = (bucket.skipped[result.skipped] ?? 0) + 1;
+      }
+      return result;
+    } catch (e) {
+      const transient = TRANSIENT_DB_ERRORS.has(e.code);
+      if (transient && attempt === 0) {
+        bucket.retried += 1;
+        console.warn(`cron: check '${name}' hit ${e.code}; retrying once`);
+        // Long enough for the pooler to hand out a fresh connection, short
+        // enough not to matter against a sweep measured in seconds.
+        await wait(500);
+        continue;
+      }
+      bucket.failed += 1;
+      console.error(`cron: check '${name}' failed —`, e.code || e.message);
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Every school the reminder jobs sweep, with the owner createdAt two checks read. */
+function remindableSchools() {
+  return prisma.school.findMany({
+    // ONLY APPROVED SCHOOLS. A school still under review, or sent back for more
+    // information, cannot use the product — requireApprovedSchool refuses every
+    // one of its requests — so reminding it to record attendance or run payroll
+    // would be telling it to do things the app will not let it do.
+    where: { registrationStatus: 'APPROVED' },
+    select: {
+      id: true,
+      name: true,
+      // Read but never trusted as the last word: every send re-reads it live in
+      // sendPushToSchool, so a school switching notifications off mid-sweep takes
+      // effect on the next send rather than the next run. Selected here so a
+      // school that has opted out can be skipped before doing any of the work.
+      notificationsEnabled: true,
+      adminUser: { select: { createdAt: true } },
+    },
+  });
+}
+
+/**
+ * GET /cron  —  the morning sweep, 06:00 UTC / 07:00 WAT.
+ *
+ * Six checks per school, in the order a school meets them: setup, then students,
+ * then the things a running school needs chasing about.
+ *
+ * The reminder rows are seeded once at the top of the run rather than per school.
+ * seedReminderConfigs only creates what is missing and can never overwrite an
+ * edit, so this is the cheap way to guarantee a fresh database sends the right
+ * words on its very first run instead of silently sending nothing.
+ */
+router.get('/', async (req, res) => {
+  if (!authorised(req)) {
+    console.warn('cron: rejected an unauthorised request');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const startedAt = new Date();
+  const tally = {};
+  const failedSchools = [];
+
+  try {
+    await seedReminderConfigs(prisma);
+  } catch (e) {
+    // Not fatal. A missing row is seeded again by loadReminder on the first send
+    // that needs it, so this is an optimisation, not a precondition.
+    console.error('cron: could not seed reminder configs —', e.code || e.message);
+  }
+
+  let schools;
+  try {
+    schools = await remindableSchools();
+  } catch (e) {
+    console.error('cron: could not list schools —', e.code || e.message);
+    return res.status(503).json({ ok: false, error: "Could not list schools", code: e.code || null, startedAt });
+  }
+
+  let optedOut = 0;
+  for (const school of schools) {
+    // The opt-out, checked once before doing any work for this school. Every
+    // send re-checks it anyway — that is where the guarantee lives — but there
+    // is no reason to build a setup checklist for a school that will send
+    // nothing.
+    if (!school.notificationsEnabled) {
+      optedOut += 1;
+      continue;
+    }
+
+    try {
+      await runCheck(tally, 'incomplete_setup', () => checkIncompleteSetup(prisma, school, startedAt));
+      await runCheck(tally, 'no_students', () => checkNoStudents(prisma, school, startedAt));
+      await runCheck(tally, 'attendance_pending', () => checkAttendancePending(prisma, school, startedAt));
+      await runCheck(tally, 'outstanding_fees', () => checkOutstandingFees(prisma, school, startedAt));
+      await runCheck(tally, 'payroll_not_run', () => checkPayrollNotRun(prisma, school, startedAt));
+      await runCheck(tally, 'academic_year_transition', () => checkAcademicYearTransition(prisma, school, startedAt));
+    } catch (e) {
+      // runCheck already swallows a failing check, so reaching here means
+      // something outside the checks went wrong for this school.
+      failedSchools.push({ schoolId: school.id, code: e.code || null, message: e.message });
+      console.error(`cron: school ${school.id} FAILED —`, e.code || e.message);
+    }
+  }
+
+  const totalSent = Object.values(tally).reduce((n, b) => n + b.sent, 0);
+  const summary = {
+    ok: failedSchools.length === 0,
+    job: "morning",
+    startedAt,
+    finishedAt: new Date(),
+    schools: schools.length,
+    optedOut,
+    notificationsSent: totalSent,
+    checks: tally,
+    failedSchools,
+  };
+  console.log(
+    `cron: ${schools.length} school(s) — ${totalSent} notification(s) sent, ` +
+      `${optedOut} opted out, ${failedSchools.length} failed`,
+  );
+  res.status(summary.ok ? 200 : 500).json(summary);
+});
+
+/**
+ * GET /cron/afternoon  —  13:00 UTC / 14:00 WAT.
+ *
+ * One check: teachers who have not recorded attendance today.
+ *
+ * WEEKENDS ARE SKIPPED, and the test is made ONCE for the whole run rather than
+ * per school — it is the same clock for all of them, and it is a WAT weekday
+ * that matters, not a UTC one. A Saturday run returns a clean 200 saying it did
+ * nothing, so the scheduler records a successful run rather than a failure.
+ */
+router.get('/afternoon', async (req, res) => {
+  if (!authorised(req)) {
+    console.warn('cron/afternoon: rejected an unauthorised request');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const startedAt = new Date();
+
+  if (!isWeekdayInWat(startedAt)) {
+    console.log('cron/afternoon: weekend in WAT — nothing to do');
+    return res.json({
+      ok: true,
+      job: "afternoon",
+      startedAt,
+      finishedAt: new Date(),
+      skipped: "weekend",
+      notificationsSent: 0,
+    });
+  }
+
+  const tally = {};
+  const failedSchools = [];
+
+  let schools;
+  try {
+    schools = await remindableSchools();
+  } catch (e) {
+    console.error('cron/afternoon: could not list schools —', e.code || e.message);
+    return res.status(503).json({ ok: false, error: "Could not list schools", code: e.code || null, startedAt });
+  }
+
+  let optedOut = 0;
+  let teachersMissing = 0;
+  for (const school of schools) {
+    if (!school.notificationsEnabled) {
+      optedOut += 1;
+      continue;
+    }
+    try {
+      const result = await runCheck(tally, 'attendance_not_recorded', () =>
+        checkAttendanceNotRecorded(prisma, school, startedAt),
+      );
+      teachersMissing += result?.teachersMissing ?? 0;
+    } catch (e) {
+      failedSchools.push({ schoolId: school.id, code: e.code || null, message: e.message });
+      console.error(`cron/afternoon: school ${school.id} FAILED —`, e.code || e.message);
+    }
+  }
+
+  const totalSent = Object.values(tally).reduce((n, b) => n + b.sent, 0);
+  const summary = {
+    ok: failedSchools.length === 0,
+    job: "afternoon",
+    startedAt,
+    finishedAt: new Date(),
+    schools: schools.length,
+    optedOut,
+    // How many teachers had not recorded, as against how many were actually
+    // reached — the gap between the two is teachers who have never enabled
+    // notifications, which is worth being able to see.
+    teachersMissing,
+    notificationsSent: totalSent,
+    checks: tally,
+    failedSchools,
+  };
+  console.log(
+    `cron/afternoon: ${schools.length} school(s) — ${teachersMissing} teacher(s) without attendance, ` +
+      `${totalSent} notification(s) sent, ${failedSchools.length} failed`,
+  );
+  res.status(summary.ok ? 200 : 500).json(summary);
 });
 
 module.exports = router;

@@ -170,6 +170,10 @@ model Staff {
   /// This person's own daily submissions. See the StaffAttendance model.
   staffAttendance StaffAttendance[]
 
+  /// The browsers this teacher has granted notification permission on. One row
+  /// per DEVICE, not per account — see PushSubscription.
+  pushSubscriptions PushSubscription[]
+
   createdBy        AdminUser? @relation("StaffCreatedBy", fields: [createdByAdminId], references: [id])
   createdByAdminId Int?
   createdByName    String?
@@ -620,6 +624,19 @@ model School {
   autoAdvancedYear          String?
   currentTerm               String
   autoTermEnabled           Boolean                @default(true)
+  /// THE SCHOOL-LEVEL OPT-OUT for push notifications. FALSE means send this
+  /// school's admins and teachers NOTHING — not fewer reminders, not only the
+  /// urgent ones. Every push path checks it, including the immediate
+  /// attendance-rejection notification, which is not a reminder at all.
+  ///
+  /// Separate from ReminderConfig.enabled, and deliberately so: that one is the
+  /// team silencing a single reminder for every school, this one is a school
+  /// silencing everything for itself. Neither implies the other, so both are
+  /// consulted on every send.
+  ///
+  /// Defaults true so the feature arrives switched on and every existing school
+  /// keeps behaving exactly as it does now.
+  notificationsEnabled      Boolean                @default(true)
   motto                     String?
   /// Only ever read to build the honorific on a Fee Drive letter — see the
   /// ProprietorGender enum above. The proprietor's NAME is deliberately not
@@ -689,6 +706,7 @@ model School {
   whatsappMessages          WhatsAppMessage[]
   receiptCounters           ReceiptCounter[]
   retiredReceiptNumbers     RetiredReceiptNumber[]
+  pushSubscriptions         PushSubscription[]
 }
 
 model ChargeCategory {
@@ -1080,6 +1098,10 @@ model AdminUser {
   approvedStaffAttendance StaffAttendance[] @relation("StaffAttendanceApprovedBy")
   rejectedStaffAttendance StaffAttendance[] @relation("StaffAttendanceRejectedBy")
 
+  /// The browsers this account has granted notification permission on. One row
+  /// per DEVICE, not per account — see PushSubscription.
+  pushSubscriptions PushSubscription[]
+
   @@index([memberOfSchoolId])
 }
 
@@ -1423,4 +1445,86 @@ model RetiredReceiptNumber {
 
   @@unique([schoolId, receiptNumber])
   @@index([schoolId, academicYear])
+}
+
+/// THE REMINDER WORDING, in the database rather than in code.
+///
+/// Every reminder the product sends reads its title and body from HERE at send
+/// time. That is the entire reason the table exists: the team edits the words in
+/// the console and the very next send uses them, with no deploy in between.
+///
+/// Which imposes one rule on everything that sends: nothing may hardcode a
+/// title or a body. A cron job that phrased its own message would leave these
+/// rows describing what the system USED to say, and the console would be a
+/// screen that appears to work and changes nothing.
+///
+/// PLACEHOLDERS. Bodies may contain [N] and [date], substituted at send time
+/// from values the caller computes — see substitute() in
+/// src/utils/pushNotification.js. They are stored literally, so the console
+/// shows the team exactly what the code will look for.
+model ReminderConfig {
+  id Int @id @default(autoincrement())
+
+  /// The stable identifier the code joins on ("incomplete_setup"). NEVER edited
+  /// and never displayed raw — the console edits title, body and enabled, and
+  /// renders this as a readable label. Unique because a second row for a key
+  /// would make "which wording is current?" a question with two answers.
+  key String @unique
+
+  title String
+  body  String
+
+  /// The TEAM's switch, and global across every school. Distinct from
+  /// School.notificationsEnabled, which is one school silencing everything for
+  /// itself. Neither implies the other, so both are consulted on every send.
+  enabled Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// ONE ROW PER BROWSER THAT HAS GRANTED NOTIFICATION PERMISSION — a DEVICE, not
+/// a person. An admin with a laptop and a phone has two rows.
+///
+/// endpoint is the push service's own address for exactly one browser, which is
+/// what makes it the natural key: two rows sharing one would send the same
+/// notification twice to the same screen. Re-subscribing after a browser
+/// rotates its keys therefore UPSERTS on endpoint rather than inserting.
+///
+/// adminUserId and staffId are both nullable and exactly one is set. This table
+/// serves two unrelated account tables — AdminUser and Staff — and there is no
+/// shared user row to point at. The database cannot express "exactly one of
+/// these", so POST /push/subscribe is what guarantees it: it derives the owner
+/// from the session rather than accepting one from the client.
+///
+/// schoolId is stored here rather than walked to through whichever owner is
+/// set, because School.notificationsEnabled is checked on EVERY send. The
+/// denormalisation turns "may I send to this device?" into one indexed read.
+model PushSubscription {
+  id Int @id @default(autoincrement())
+
+  /// ON DELETE CASCADE on both owners: a deleted account's devices must not
+  /// outlive it. A stale row would still be found by sendPushToSchool and
+  /// pushed to a browser whose owner no longer has an account.
+  adminUser   AdminUser? @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  adminUserId Int?
+  staff       Staff?     @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  staffId     Int?
+
+  /// RESTRICT, matching every other school FK in this schema. Deleting a school
+  /// has its own deliberate teardown in the platform console.
+  school   School @relation(fields: [schoolId], references: [id])
+  schoolId Int
+
+  endpoint String @unique
+  p256dh   String
+  auth     String
+
+  createdAt DateTime @default(now())
+
+  /// The three lookups this table actually serves: every device in a school,
+  /// and every device belonging to one person (both send paths, and unsubscribe).
+  @@index([schoolId])
+  @@index([adminUserId])
+  @@index([staffId])
 }

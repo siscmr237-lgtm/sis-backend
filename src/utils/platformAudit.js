@@ -46,6 +46,19 @@ const ACTIONS = {
   SCHOOL_STAFF_VIEWED: 'school.staff.viewed',
   ADMINS_VIEWED: 'platform_users.viewed',
   AUDIT_VIEWED: 'audit.viewed',
+  REMINDERS_VIEWED: 'reminders.viewed',
+
+  /**
+   * The wording of a reminder changed, or a reminder was switched on or off.
+   *
+   * Worth logging for a reason the other content actions are not: this text goes
+   * out, unreviewed, to every school's phones on the next scheduled run, and it
+   * changes without a deploy — so the git history that would normally answer
+   * "who wrote this and when" has nothing to say about it. The detail records
+   * the before and the after of every field that moved, which makes this log the
+   * only place a bad edit can be traced back to.
+   */
+  REMINDER_UPDATED: 'reminder.updated',
 
   /**
    * Setting a password on a school account. Two DIFFERENT actions, deliberately

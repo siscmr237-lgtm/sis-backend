@@ -39,6 +39,7 @@ const schoolRouter = require('./routes/school');
 const whatsappRouter = require('./routes/whatsapp');
 const { statusRouter: whatsappStatusRouter } = require('./routes/whatsappAbsence');
 const publicRouter = require('./routes/public');
+const pushRouter = require('./routes/push');
 
 const app = express();
 
@@ -242,6 +243,12 @@ app.use('/staff-attendance', staffAttendanceRouter);
 app.use('/timetable', timetableRouter);
 app.use('/ledger', ledgerRouter);
 app.use('/test-exams', testExamsRouter);
+// Push subscriptions — a browser registering itself for notifications. In the
+// MIXED group because both actor types have one: a teacher gets attendance
+// reminders and rejection notices, an admin gets everything else. The router
+// takes the owning account from the session and never from the body, so there
+// is no role split to make here — see src/routes/push.js.
+app.use('/push', pushRouter);
 
 // Admin-only routers, gated here at the mount rather than route by route.
 //

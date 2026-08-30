@@ -26,7 +26,8 @@
     "multer": "^2.2.0",
     "nodemailer": "^9.0.3",
     "sharp": "^0.35.3",
-    "twilio": "^6.1.0"
+    "twilio": "^6.1.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "nodemon": "^3.1.0",

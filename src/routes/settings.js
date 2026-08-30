@@ -90,6 +90,23 @@ router.put('/', async (req, res) => {
       }
     }
 
+    // THE PUSH NOTIFICATION OPT-OUT, coerced rather than passed through.
+    //
+    // The body is spread straight into school.update above, so this column would
+    // "work" untouched — right up until a client sent the STRING "false", which
+    // Prisma refuses outright (a 500 that says nothing useful) or, in the shape
+    // this route is most likely to meet it, a checkbox value like "on" that is
+    // truthy. A school that switched notifications off and stayed switched on is
+    // exactly the failure this toggle exists to prevent, so the value is decided
+    // here rather than hoped for.
+    //
+    // Only when PRESENT. Every other save on this page — the school name, the
+    // logo, the academic year — posts its own fields and must not be able to
+    // silently re-enable notifications by omitting this one.
+    if (Object.prototype.hasOwnProperty.call(data, 'notificationsEnabled')) {
+      data.notificationsEnabled = data.notificationsEnabled === true || data.notificationsEnabled === 'true';
+    }
+
     const updated = await prisma.school.update({
       where: { id: schoolId },
       data,
