@@ -440,8 +440,28 @@ router.delete('/:id', requireAdmin, async (req, res) => {
     });
     const studentName = `${found.firstName} ${found.lastName}`.trim();
 
+    // ONE RETIREMENT PER NUMBER, NOT PER ROW.
+    //
+    // A receipt number now names a whole submission and is written onto every
+    // row of it, so a student who paid seven fees in one go has seven rows
+    // carrying one number. Retiring per row would attempt seven inserts of that
+    // number and fail on the second — RetiredReceiptNumber is unique on
+    // (schoolId, receiptNumber) — taking the entire deletion down with it.
+    //
+    // Every row of every batch is going here (the whole student is being
+    // removed), so each number retires exactly once, carrying the SUBMISSION's
+    // total rather than whichever row happened to be first. That total is what
+    // the family's receipt says.
+    const byNumber = new Map();
+    for (const entry of numbered) {
+      const key = `${entry.schoolId}::${entry.receiptNumber}`;
+      const seen = byNumber.get(key);
+      if (seen) seen.amount += entry.amount;
+      else byNumber.set(key, { ...entry });
+    }
+
     await prisma.$transaction(async (tx) => {
-      for (const entry of numbered) {
+      for (const entry of byNumber.values()) {
         await retireReceiptNumber(tx, entry, {
           studentName,
           adminId: req.user?.id ?? null,

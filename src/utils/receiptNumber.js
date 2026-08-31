@@ -124,13 +124,31 @@ function parseLegacyReceiptNumber(value) {
  * keeps the prefix it was issued under, because the string is stored, not
  * recomputed. See the note on School.abbreviation.
  *
- * @param {object} tx        Prisma transaction client. NOT the base client.
+ * CALLED ONCE PER SUBMISSION, NOT ONCE PER ROW. This is the rule the whole
+ * batching change rests on, and it is the easy one to get wrong: the two
+ * multi-row payment routes call this ABOVE their loop and write the one number
+ * they get onto every row. Calling it inside the loop is what produced seven
+ * numbers for one hand-over of money and told a parent about seven payments they
+ * had not made.
+ *
+ * @param {object} tx              Prisma transaction client. NOT the base client.
  * @param {number} schoolId
- * @returns {Promise<string>} e.g. "CNPS042"
+ * @param {string} paymentBatchId  The submission this number belongs to. Required:
+ *                                 it is half of what the register enforces.
+ * @returns {Promise<string>}      e.g. "CNPS042"
  */
-async function issueReceiptNumber(tx, schoolId) {
+async function issueReceiptNumber(tx, schoolId, paymentBatchId) {
   if (!tx || typeof tx.$queryRawUnsafe !== 'function') {
     throw new Error('issueReceiptNumber must be given a transaction client.');
+  }
+  // REQUIRED, and checked rather than defaulted. A missing batch id would write
+  // a register row with a null batch, which the unique index treats as distinct
+  // from every other null — so a caller that forgot it could quietly take two
+  // numbers for one submission and nothing would refuse it. The nullable column
+  // exists for backfilled history, not for new allocations.
+  const batchId = String(paymentBatchId ?? '').trim();
+  if (!batchId) {
+    throw new Error('issueReceiptNumber must be given the paymentBatchId of the submission.');
   }
 
   // REFUSED RATHER THAN GUESSED AT. A school with no usable abbreviation cannot
@@ -168,7 +186,29 @@ async function issueReceiptNumber(tx, schoolId) {
   if (!Number.isInteger(sequence) || sequence < 1) {
     throw new Error('Could not allocate a receipt number.');
   }
-  return formatReceiptNumber(abbreviation, sequence);
+  const receiptNumber = formatReceiptNumber(abbreviation, sequence);
+
+  // THE NUMBER IS REGISTERED IN THE SAME BREATH AS IT IS TAKEN.
+  //
+  // LedgerEntry.receiptNumber is no longer unique — it cannot be, now that every
+  // row of one submission carries the same number — so this row is what actually
+  // holds the guarantee. Two unique indexes, and both matter: one number per
+  // submission, one submission per number.
+  //
+  // Inside the caller's transaction, so it rolls back with the payment. A
+  // rollback therefore releases the number completely: the counter unwinds AND
+  // no register row is left claiming it. That is the same property the counter
+  // was designed for, extended to the register so the two cannot disagree.
+  //
+  // A plain create, not an upsert. A conflict here means the same submission is
+  // being numbered twice, or two submissions have landed on one number — both
+  // are bugs, and the correct response is to fail the payment loudly rather than
+  // to absorb it and hand a parent a number that belongs to someone else.
+  await tx.receiptIssue.create({
+    data: { schoolId, receiptNumber, paymentBatchId: batchId },
+  });
+
+  return receiptNumber;
 }
 
 /**

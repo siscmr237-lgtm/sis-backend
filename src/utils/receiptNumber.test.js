@@ -33,10 +33,36 @@ const {
 // It models the ON CONFLICT DO UPDATE faithfully in the one respect the tests
 // care about: the counter only ever goes up, and only ever by one.
 // ---------------------------------------------------------------------------
+let batchSeq = 0;
+/**
+ * A fresh submission id. Real ones are randomUUIDs; these only have to be
+ * distinct, and being readable makes a failure easier to place.
+ */
+const batch = () => `batch-${++batchSeq}`;
+
 function fakeTx({ schools = {}, counters = {} } = {}) {
-  const state = { schools: { ...schools }, counters: { ...counters } };
+  const state = { schools: { ...schools }, counters: { ...counters }, issued: [] };
   return {
     state,
+    // The register. issueReceiptNumber writes one row per number it hands out,
+    // and the two unique indexes on it are what replaced the old unique index on
+    // LedgerEntry.receiptNumber — so the fake enforces both, or these tests would
+    // pass against a schema that cannot.
+    receiptIssue: {
+      async create({ data }) {
+        const clash = state.issued.find(
+          (r) => r.schoolId === data.schoolId
+            && (r.receiptNumber === data.receiptNumber || r.paymentBatchId === data.paymentBatchId),
+        );
+        if (clash) {
+          const err = new Error('Unique constraint failed on ReceiptIssue');
+          err.code = 'P2002';
+          throw err;
+        }
+        state.issued.push({ ...data });
+        return { ...data };
+      },
+    },
     async $queryRawUnsafe(sql, ...params) {
       if (sql.includes('FROM "School"')) {
         const school = state.schools[params[0]];
@@ -60,7 +86,7 @@ const SCHOOL = (id, abbreviation, name = `School ${id}`) => ({ [id]: { abbreviat
 
 test('the first payment for a new school is CNPS001', async () => {
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS001');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS001');
 });
 
 test('the sequence pads to three and then simply gets longer', () => {
@@ -76,9 +102,9 @@ test('the sequence pads to three and then simply gets longer', () => {
 
 test('998, 999 and 1000 come out of the issuer in that shape too', async () => {
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS'), counters: { 1: 997 } });
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS998');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS999');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS1000');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS998');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS999');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS1000');
 });
 
 test('no number ever gains a leading zero it did not have', () => {
@@ -121,9 +147,12 @@ test('the counter does NOT reset in a new academic year', async () => {
   // argument through which a year could reach it — so this asserts on the
   // behaviour that fact produces: numbering simply continues.
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS'), counters: { 1: 15 } });
-  assert.strictEqual(issueReceiptNumber.length, 2, 'issueReceiptNumber takes (tx, schoolId) only');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS016');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS017');
+  assert.strictEqual(
+    issueReceiptNumber.length, 3,
+    'issueReceiptNumber takes (tx, schoolId, paymentBatchId) — no academic year',
+  );
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS016');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS017');
   assert.strictEqual(tx.state.counters[1], 17);
 });
 
@@ -131,9 +160,9 @@ test('two schools keep independent counters and may share an abbreviation', asyn
   // Not globally unique, on purpose: receipts are only ever looked up within one
   // school. Two schools calling themselves SJS both issuing SJS001 is correct.
   const tx = fakeTx({ schools: { ...SCHOOL(1, 'SJS'), ...SCHOOL(2, 'SJS') } });
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'SJS001');
-  assert.strictEqual(await issueReceiptNumber(tx, 2), 'SJS001');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'SJS002');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'SJS001');
+  assert.strictEqual(await issueReceiptNumber(tx, 2, batch()), 'SJS001');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'SJS002');
   assert.strictEqual(tx.state.counters[1], 2);
   assert.strictEqual(tx.state.counters[2], 1);
 });
@@ -145,15 +174,15 @@ test('changing the abbreviation does not renumber anything already issued', asyn
   // receipt in somebody's hands.
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
   const issued = [
-    await issueReceiptNumber(tx, 1),
-    await issueReceiptNumber(tx, 1),
-    await issueReceiptNumber(tx, 1),
+    await issueReceiptNumber(tx, 1, batch()),
+    await issueReceiptNumber(tx, 1, batch()),
+    await issueReceiptNumber(tx, 1, batch()),
   ];
   assert.deepStrictEqual(issued, ['CNPS001', 'CNPS002', 'CNPS003']);
 
   tx.state.schools[1].abbreviation = 'ENPS';
 
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'ENPS004');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'ENPS004');
   // The already-issued strings are values, not views: nothing can reach back
   // and rewrite them.
   assert.deepStrictEqual(issued, ['CNPS001', 'CNPS002', 'CNPS003']);
@@ -165,15 +194,15 @@ test('a rolled-back transaction leaves no gap', async () => {
   // gives its number back. Modelled here by discarding the fake tx's state the
   // way a rollback discards the real one.
   const committed = fakeTx({ schools: SCHOOL(1, 'CNPS') });
-  assert.strictEqual(await issueReceiptNumber(committed, 1), 'CNPS001');
+  assert.strictEqual(await issueReceiptNumber(committed, 1, batch()), 'CNPS001');
 
   const snapshot = { ...committed.state.counters };
   const attempt = fakeTx({ schools: SCHOOL(1, 'CNPS'), counters: snapshot });
-  assert.strictEqual(await issueReceiptNumber(attempt, 1), 'CNPS002');
+  assert.strictEqual(await issueReceiptNumber(attempt, 1, batch()), 'CNPS002');
   // ...and the payment insert fails, so `attempt` is thrown away entirely.
 
   const next = fakeTx({ schools: SCHOOL(1, 'CNPS'), counters: snapshot });
-  assert.strictEqual(await issueReceiptNumber(next, 1), 'CNPS002',
+  assert.strictEqual(await issueReceiptNumber(next, 1, batch()), 'CNPS002',
     'the number the aborted transaction took must be handed out again');
 });
 
@@ -182,11 +211,11 @@ test('a voided payment keeps its gap and retires its number', async () => {
   // number that WAS issued and whose payment was then deleted is never reused.
   // The counter is not rewound, so the next payment skips it.
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS001');
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS002');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS001');
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS002');
   // CNPS002's payment is deleted; retireReceiptNumber records it and the counter
   // is deliberately left where it is.
-  assert.strictEqual(await issueReceiptNumber(tx, 1), 'CNPS003',
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS003',
     'the retired number must not be reissued');
   assert.strictEqual(tx.state.counters[1], 3);
 });
@@ -199,7 +228,7 @@ test('a payment for a school with no abbreviation is refused, and says what is m
   for (const bad of ['', null, '   ', 'C', 'CN PS', 'ABCDEFGHIJK']) {
     const tx = fakeTx({ schools: SCHOOL(7, bad, 'Hilltop Academy') });
     await assert.rejects(
-      () => issueReceiptNumber(tx, 7),
+      () => issueReceiptNumber(tx, 7, batch()),
       (err) => {
         assert.strictEqual(err.code, 'MISSING_SCHOOL_ABBREVIATION');
         assert.match(err.message, /Hilltop Academy/);
@@ -289,20 +318,116 @@ test('a name with nothing usable in it yields no suggestion rather than a bad on
 // A whole Pay Fees submission
 // ---------------------------------------------------------------------------
 
-test('a three-category Pay Fees produces three consecutive numbers for one message', async () => {
-  // One hand-over of money, three fee rows, one WhatsApp message listing all
-  // three numbers. They must be consecutive: the numbers are taken one at a
-  // time inside the submission's single transaction.
+/** {{5}} exactly as the route builds it. Kept in step with joinReceiptNumbers. */
+const joinReceiptNumbers = (rows) => [
+  ...new Set(rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean)),
+].join(', ');
+
+test('a three-category Pay Fees produces ONE number, on all three rows', async () => {
+  // One hand-over of money is one payment. It used to take a number per fee, so
+  // a family paying Tuition, Books and PTA together was told about CNPS010,
+  // CNPS011 and CNPS012 — three payments they had not made. The number is now
+  // taken once, above the loop, and written onto every row.
   const tx = fakeTx({ schools: SCHOOL(1, 'CNPS'), counters: { 1: 9 } });
-  const rows = [];
-  for (const _ of ['Tuition', 'Books', 'PTA']) rows.push({ receiptNumber: await issueReceiptNumber(tx, 1) });
+  const paymentBatchId = batch();
+  const receiptNumber = await issueReceiptNumber(tx, 1, paymentBatchId);
+  const rows = ['Tuition', 'Books', 'PTA'].map((description) => ({ description, receiptNumber, paymentBatchId }));
 
-  assert.deepStrictEqual(rows.map((r) => r.receiptNumber), ['CNPS010', 'CNPS011', 'CNPS012']);
+  assert.deepStrictEqual(rows.map((r) => r.receiptNumber), ['CNPS010', 'CNPS010', 'CNPS010']);
+  // THE COUNTER MOVED ONCE, not three times. This is the assertion that fails if
+  // the allocation is ever put back inside the loop.
+  assert.strictEqual(tx.state.counters[1], 10);
 
-  // {{5}} joins them exactly as the route does.
-  const joined = rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean).join(', ');
-  assert.strictEqual(joined, 'CNPS010, CNPS011, CNPS012');
+  const joined = joinReceiptNumbers(rows);
+  assert.strictEqual(joined, 'CNPS010', 'the parent reads one number, once');
   // The assertions the template variables are put through before sending.
   assert.ok(joined.length > 0, 'must be non-empty');
   assert.ok(!/[\r\n]/.test(joined), 'must be newline-free');
+});
+
+test('the next submission gets the very next number, not one per fee later', async () => {
+  // The counter advancing once per submission is what keeps a family's receipts
+  // consecutive across visits, instead of jumping by however many categories
+  // they happened to pay last time.
+  const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS001'); // seven fees
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS002'); // one fee
+  assert.strictEqual(await issueReceiptNumber(tx, 1, batch()), 'CNPS003');
+});
+
+test('one submission cannot be given two numbers', async () => {
+  // The register's second unique index, and the reason it exists: a write path
+  // that called the issuer twice for one submission would otherwise burn a
+  // number and leave the rows disagreeing about which receipt they belong to.
+  const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
+  const paymentBatchId = batch();
+  assert.strictEqual(await issueReceiptNumber(tx, 1, paymentBatchId), 'CNPS001');
+  await assert.rejects(() => issueReceiptNumber(tx, 1, paymentBatchId), (err) => err.code === 'P2002');
+});
+
+test('a number is registered once and cannot be handed to another submission', async () => {
+  // The old unique index on LedgerEntry, relocated. Two submissions landing on
+  // one number is the failure the whole scheme exists to prevent, so the
+  // database refuses it rather than trusting the counter to be the only caller.
+  const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
+  await issueReceiptNumber(tx, 1, batch());
+  assert.deepStrictEqual(tx.state.issued.map((r) => r.receiptNumber), ['CNPS001']);
+
+  await assert.rejects(
+    () => tx.receiptIssue.create({ data: { schoolId: 1, receiptNumber: 'CNPS001', paymentBatchId: batch() } }),
+    (err) => err.code === 'P2002',
+  );
+});
+
+test('a submission is refused a number if it does not say which submission it is', async () => {
+  // The batch id is half of what the register enforces. A missing one would
+  // write a null, and nulls are distinct under a unique index — so a caller that
+  // forgot it could quietly take two numbers for one payment.
+  const tx = fakeTx({ schools: SCHOOL(1, 'CNPS') });
+  for (const bad of [undefined, null, '', '   ']) {
+    await assert.rejects(() => issueReceiptNumber(tx, 1, bad), /paymentBatchId/);
+  }
+  assert.strictEqual(tx.state.counters[1], undefined, 'no number is consumed');
+});
+
+test('a legacy submission with several numbers still lists them all', async () => {
+  // Three submissions were numbered per fee before this changed, and their rows
+  // genuinely carry different numbers. A confirmation retried against one of
+  // them must say what those rows actually say — picking one would tell the
+  // family the other six receipts do not exist.
+  const rows = [
+    { receiptNumber: 'BKNPS091' }, { receiptNumber: 'BKNPS092' }, { receiptNumber: 'BKNPS093' },
+  ];
+  assert.strictEqual(joinReceiptNumbers(rows), 'BKNPS091, BKNPS092, BKNPS093');
+});
+
+test('deleting one row of a submission does not retire its number', async () => {
+  // The number names the submission. Six rows still carry it, it is still on the
+  // family's receipt and still findable, so there is nothing to retire — and
+  // RetiredReceiptNumber is unique on (schoolId, receiptNumber), so retiring per
+  // row would fail on the second line anyway. Mirrors the count-then-retire in
+  // DELETE /ledger/:id.
+  const rowsInBatch = [
+    { id: 1, amount: 70000 }, { id: 2, amount: 10000 }, { id: 3, amount: 500 },
+  ];
+  const retired = [];
+  const deleteRow = (id) => {
+    const row = rowsInBatch.find((r) => r.id === id);
+    const remaining = rowsInBatch.filter((r) => r.id !== id);
+    if (remaining.length === 0) retired.push({ receiptNumber: 'CNPS010', amount: row.amount });
+    rowsInBatch.splice(0, rowsInBatch.length, ...remaining);
+  };
+
+  deleteRow(2);
+  assert.deepStrictEqual(retired, [], 'two rows still carry the number');
+  deleteRow(3);
+  assert.deepStrictEqual(retired, [], 'one row still carries the number');
+  deleteRow(1);
+  // Retired exactly ONCE, when the last row went — never three times, which the
+  // unique index on RetiredReceiptNumber would refuse anyway.
+  assert.strictEqual(retired.length, 1);
+  // And for what was LEFT of the submission, not its original total: the other
+  // rows were deleted in earlier requests and are already gone by now, so there
+  // is nothing left to sum. See the comment in DELETE /ledger/:id.
+  assert.deepStrictEqual(retired, [{ receiptNumber: 'CNPS010', amount: 70000 }]);
 });

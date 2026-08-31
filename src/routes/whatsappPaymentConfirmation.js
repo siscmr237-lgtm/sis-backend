@@ -88,14 +88,17 @@ const NOTHING_BANKED = 'nothing_banked';
  * "50,000" with the unit in the body — so {{2}} and {{6}} carry it or the parent
  * receives a bare number with no currency at all.
  *
- * {{5}} takes EVERY receipt number the submission produced, comma-separated:
- * "CNPS010, CNPS011, CNPS012". The office search matches partial numbers, so any
- * one of them read out over the phone finds its row.
+ * {{5}} IS THE SUBMISSION'S RECEIPT NUMBER — one number: "CNPS042". A payment is
+ * one act, and the message names it once.
  *
- * The join itself is unchanged by the format change — it always was "whatever
- * the rows carry, in order, separated by a comma and a space", and it takes the
- * shorter numbers exactly as it took the longer ones. What changed is that three
- * of them now fit on a line a parent can read back without losing their place.
+ * It used to list one number per fee, so a family paying Tuition, Books and PTA
+ * together read "CNPS010, CNPS011, CNPS012" and had every reason to think the
+ * school had recorded three payments. A submission is now issued a single number
+ * that all its rows share, so there is one thing to quote and one thing for the
+ * office to search.
+ *
+ * The slot can still hold a list, for the three submissions numbered before this
+ * changed — see joinReceiptNumbers. Nothing issued from now on produces one.
  */
 const paymentConfirmationVariables = ({
   guardianName, amountPaid, dateReceived, studentName, receiptNumbers, balance, schoolName,
@@ -131,19 +134,33 @@ function invalidVariable(vars) {
 }
 
 /**
- * The receipt numbers of a submission, as the message lists them.
+ * The receipt number of a submission, as the message shows it.
  *
- * ", " between, so a single-category submission is one number with no trailing
- * comma and a three-category one reads as "CNPS010, CNPS011, CNPS012". Blank
- * numbers are dropped rather than joined as empty gaps.
+ * ONE NUMBER, ONCE. A submission is now issued a single number and every row it
+ * created carries that same string, so the seven rows of a seven-fee payment
+ * yield "CNPS042" and not "CNPS042" seven times over. DISTINCT is what does
+ * that, and it is the whole change on this side.
  *
- * The result goes through invalidVariable like every other template slot, which
- * is what asserts it is non-empty and free of line breaks. That check is what
- * catches a join that produced nothing at all — a confirmation with no number in
- * it is a receipt the office cannot look up.
+ * IT STILL JOINS, and the join is not dead code. Three submissions recorded
+ * before this change were issued a number per fee, and their rows genuinely
+ * carry different numbers; a confirmation retried against one of those must
+ * still list what those rows actually say rather than silently picking one and
+ * telling the family the other six do not exist. So the shape stays "the
+ * distinct numbers of this submission, in order, comma-separated" — which for
+ * everything issued from now on is exactly one number.
+ *
+ * Order is the rows' own order, not sorted: for a legacy batch that is the order
+ * the numbers were issued in, which is the order they appear on the paper.
+ *
+ * Blank numbers are dropped rather than joined as empty gaps. The result goes
+ * through invalidVariable like every other template slot, which is what asserts
+ * it is non-empty and free of line breaks — that check is what catches a join
+ * that produced nothing at all, and a confirmation with no number in it is a
+ * receipt the office cannot look up.
  */
-const joinReceiptNumbers = (rows) =>
-  rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean).join(', ');
+const joinReceiptNumbers = (rows) => [
+  ...new Set(rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean)),
+].join(', ');
 
 /** The date as the parent reads it: "27 August 2026". */
 function formatReceivedDate(value) {

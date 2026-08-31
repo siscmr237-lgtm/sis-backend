@@ -936,7 +936,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
     // payment would have no batch to confirm to a parent and none to retry.
     const paymentBatchId = newPaymentBatchId();
     const entry = await prisma.$transaction(async (tx) => {
-      const receiptNumber = await issueReceiptNumber(tx, schoolId);
+      const receiptNumber = await issueReceiptNumber(tx, schoolId, paymentBatchId);
       return tx.ledgerEntry.create({
         data: {
           code: genCode('PMT'),
@@ -1090,8 +1090,20 @@ router.post('/payments', requireAdmin, async (req, res) => {
     const paymentBatchId = newPaymentBatchId();
     const created = await prisma.$transaction(async (tx) => {
       const rows = [];
+      // ONE NUMBER FOR THE WHOLE SUBMISSION, TAKEN ONCE, ABOVE THE LOOP.
+      //
+      // This used to sit inside the loop, so a family paying 30,000 Tuition,
+      // 10,000 Books and 1,000 PTA in one hand-over of money was issued three
+      // numbers — and the confirmation they received listed all three, which
+      // reads as three separate payments they do not remember making. It is one
+      // payment. It gets one number, written onto every row it creates.
+      //
+      // The counter therefore advances ONCE per submission rather than once per
+      // fee, which is also what makes the numbers a parent sees consecutive
+      // across visits instead of jumping by however many categories they
+      // happened to pay last time.
+      const receiptNumber = await issueReceiptNumber(tx, schoolId, paymentBatchId);
       for (const { target, amount } of planned) {
-        const receiptNumber = await issueReceiptNumber(tx, schoolId);
         rows.push(await tx.ledgerEntry.create({
             data: {
               code: genCode('PMT'),
@@ -1346,12 +1358,16 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
     const paymentBatchId = newPaymentBatchId();
     const created = await prisma.$transaction(async (tx) => {
       const rows = [];
+      // ONE NUMBER FOR THE WHOLE SETTLEMENT, taken once, above the loop — for
+      // exactly the reason Pay Fees does it. The comment above this transaction
+      // already said "one batch and one receipt"; that was the intent, and until
+      // now the code took a number per category and produced several.
+      const receiptNumber = await issueReceiptNumber(tx, schoolId, paymentBatchId);
       for (const c of plan.categories) {
         // One row per category, each tagged to its own fee, each at that
         // category's own amount — the same shape POST /ledger/payment writes, so
         // allocation and every downstream reading of it behave identically.
         // feeKeyOf() reads these three columns back out; exactly one is ever set.
-        const receiptNumber = await issueReceiptNumber(tx, schoolId);
         const entry = await tx.ledgerEntry.create({
           data: {
             code: genCode('PMT'),
@@ -1882,11 +1898,48 @@ router.delete('/:id', requireAdmin, async (req, res) => {
       : null;
 
     await prisma.$transaction(async (tx) => {
-      await retireReceiptNumber(tx, entry, {
-        studentName: student ? `${student.firstName} ${student.lastName}`.trim() : null,
-        adminId: req.user?.id ?? null,
-        adminName: req.user?.name ?? null,
-      });
+      // THE NUMBER BELONGS TO THE SUBMISSION, SO IT ONLY RETIRES WITH THE LAST
+      // ROW OF IT.
+      //
+      // A number now names a whole submission and is written onto every row that
+      // submission created. Deleting one line of a seven-fee payment leaves six
+      // rows still carrying that number, still on the family's receipt and still
+      // findable — the number has not gone anywhere and retiring it would be a
+      // record that a live receipt had been withdrawn.
+      //
+      // It also could not work: RetiredReceiptNumber is unique on
+      // (schoolId, receiptNumber), so retiring per row would fail outright on the
+      // second line of any batch. That constraint is kept precisely because it
+      // makes this rule impossible to break by accident.
+      //
+      // So: count what would be left. Retire only when nothing would.
+      const siblingsLeft = entry.paymentBatchId
+        ? await tx.ledgerEntry.count({
+          where: { paymentBatchId: entry.paymentBatchId, id: { not: entry.id } },
+        })
+        : 0;
+
+      if (siblingsLeft === 0) {
+        // THE AMOUNT IS WHAT WAS LEFT OF THE SUBMISSION, which is this row.
+        //
+        // Worth being plain about, because it is tempting to write the
+        // submission's original total here and it cannot be done: the other rows
+        // were deleted in earlier requests and are already gone, so by the time
+        // the last one goes there is nothing left to sum. A family's 90,500
+        // dismantled a line at a time therefore retires as whatever the final
+        // line was worth.
+        //
+        // That is a consequence of retiring on the LAST row rather than tearing
+        // down the whole submission on the first — which is the right trade,
+        // since it lets one mistaken line be corrected without withdrawing a
+        // receipt the family is holding. What this row is for is accounting for
+        // the NUMBER, and it does that exactly.
+        await retireReceiptNumber(tx, entry, {
+          studentName: student ? `${student.firstName} ${student.lastName}`.trim() : null,
+          adminId: req.user?.id ?? null,
+          adminName: req.user?.name ?? null,
+        });
+      }
       await tx.ledgerEntry.delete({ where: { id: entry.id } });
     });
     res.json(withIdAsCode(entry));

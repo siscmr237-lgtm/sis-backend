@@ -745,6 +745,7 @@ model School {
   ledgerEntries             LedgerEntry[]
   TestExam                  TestExam[]
   whatsappMessages          WhatsAppMessage[]
+  receiptIssues             ReceiptIssue[]
   receiptCounters           ReceiptCounter[]
   retiredReceiptNumbers     RetiredReceiptNumber[]
   pushSubscriptions         PushSubscription[]
@@ -1081,16 +1082,30 @@ model LedgerEntry {
   /// Only payroll rows carry a payrollMonth, and NULLs are distinct in Postgres,
   /// so this constrains nothing else.
   @@unique([staffId, payrollMonth])
-  /// THE GUARD, and it must live here rather than in a check in the route: two
-  /// cashiers recording payments in the same second is the exact case this
-  /// exists for, and any application-level test can be raced.
-  @@unique([schoolId, receiptNumber])
   /// The same guarantee for the OLD numbers, carried over rather than dropped.
   /// They were unique per school when they were issued and the migration must
   /// not be able to land two rows on one legacy number — a duplicate here would
   /// mean a parent's number resolving to two payments, which is precisely the
   /// failure this column exists to prevent.
   @@unique([schoolId, legacyReceiptNumber])
+  /// NOT UNIQUE ANY MORE, and that is the point of the change rather than an
+  /// oversight.
+  ///
+  /// It was @@unique([schoolId, receiptNumber]) — one row, one number. A receipt
+  /// number now names a SUBMISSION, and a submission is several rows: a family
+  /// handing over 90,500 for seven fees is one payment with one number written
+  /// onto all seven rows. Under the old index the second of those rows was
+  /// refused outright.
+  ///
+  /// THE GUARANTEE DID NOT GO, IT MOVED. "No two submissions in a school share a
+  /// number" is now enforced by the ReceiptIssue table, which holds exactly one
+  /// row per number issued. It has to live there: once a number legitimately
+  /// repeats down this column, no index on this table can express the rule any
+  /// more. See the ReceiptIssue model.
+  ///
+  /// An ordinary index, because the office search and the batch lookups still
+  /// read by this column constantly.
+  @@index([schoolId, receiptNumber])
   @@index([studentId, schoolId])
   @@index([staffId, schoolId])
   @@index([schoolId])
@@ -1486,6 +1501,54 @@ model ReceiptCounter {
   /// issueReceiptNumber targets, and the reason one school can only ever have
   /// one live sequence.
   @@unique([schoolId])
+}
+
+/// ONE ROW PER RECEIPT NUMBER EVER ISSUED. The register of what has been handed
+/// out.
+///
+/// WHY THIS TABLE EXISTS. A receipt number used to identify a LedgerEntry row,
+/// and `@@unique([schoolId, receiptNumber])` on that table was the whole guard:
+/// two cashiers in the same second could not produce the same number because
+/// the database would refuse the second insert.
+///
+/// A number now identifies a SUBMISSION. Paying seven fees in one hand-over of
+/// money is one payment with one number, written onto all seven rows — so the
+/// number legitimately repeats down LedgerEntry.receiptNumber, and that index
+/// had to go. Nothing on LedgerEntry can express "no two submissions share a
+/// number" once the column repeats within a submission; a unique index cannot
+/// state a rule about the DISTINCT values of another column.
+///
+/// So the guarantee moved here rather than being downgraded to a convention.
+/// One row is written per allocation, inside the same transaction that
+/// increments the counter and inserts the payment — so it rolls back with them,
+/// and a released number leaves no row behind.
+///
+/// THE TWO INDEXES ARE THE ENTIRE POINT, and they are not redundant:
+///   - (schoolId, receiptNumber) — no two submissions in a school share a
+///     number. This is the old LedgerEntry guard, relocated intact.
+///   - (schoolId, paymentBatchId) — no submission is given two numbers. New,
+///     and it is what makes "one receipt per submission" a fact the database
+///     holds rather than a property of the write path being correct.
+///
+/// paymentBatchId IS NULLABLE, for history only. Every number issued from now
+/// on has a batch. The rows backfilled when this table was created do not always
+/// have one: 95 payments predate batching entirely, and three older submissions
+/// were issued SEVERAL numbers each — the exact artefact this change exists to
+/// end. Those cannot be described under the new rule without inventing a batch
+/// that never existed, so their registry rows record the number and leave the
+/// batch null. NULLs being distinct in Postgres, they coexist under the unique
+/// index without weakening it for anything issued since.
+model ReceiptIssue {
+  id             Int      @id @default(autoincrement())
+  school         School   @relation(fields: [schoolId], references: [id])
+  schoolId       Int
+  receiptNumber  String
+  /// Null only for the historical rows described above.
+  paymentBatchId String?
+  issuedAt       DateTime @default(now())
+
+  @@unique([schoolId, receiptNumber])
+  @@unique([schoolId, paymentBatchId])
 }
 
 /// A receipt number whose payment no longer exists.
