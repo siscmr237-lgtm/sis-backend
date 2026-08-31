@@ -27,6 +27,26 @@ const {
 const router = express.Router();
 const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
+// The payment routes answer a thrown error with 400 and its message, which is
+// right — those messages are written to be read by the person at the till. This
+// adds a machine-readable code for the failures the dialog should be able to
+// act on rather than merely print.
+//
+// AN ALLOWLIST, not a passthrough of e.code. Prisma attaches its own codes
+// ("P2002" and friends) to anything it throws, and forwarding those would have
+// the frontend branching on our ORM's vocabulary — a code that means nothing to
+// it today and something different after an upgrade.
+//
+// MISSING_SCHOOL_ABBREVIATION is the only member so far: a school with no valid
+// abbreviation cannot be issued a receipt number, so the payment is refused
+// outright rather than recorded without one. The message names the school and
+// says where to fix it; the code lets the dialog link straight to Settings.
+const FORWARDED_PAYMENT_ERROR_CODES = new Set(['MISSING_SCHOOL_ABBREVIATION']);
+const paymentError = (e) => ({
+  ...(FORWARDED_PAYMENT_ERROR_CODES.has(e?.code) ? { code: e.code } : {}),
+  error: e.message,
+});
+
 // The school's currently-active academic year/term, stamped onto every ledger
 // entry at creation time (mirrors how ReportCard captures these per-record —
 // there's no historical Term/AcademicYear model, so "as of creation" is the
@@ -449,23 +469,41 @@ router.get('/student-transactions', requireAdmin, async (req, res) => {
     };
 
     // THE SEARCH ALSO MATCHES A RECEIPT NUMBER, and this is the half that makes
-    // the numbering worth having. A parent rings the office quoting
-    // "2026/2027-0042" off a receipt or a WhatsApp message; a number the
-    // secretary cannot type in and find is worse than no number at all.
+    // the numbering worth having. A parent rings the office quoting "CNPS042"
+    // off a receipt or a WhatsApp message; a number the secretary cannot type
+    // in and find is worse than no number at all.
     //
     // It is a separate OR arm rather than another field on studentFilter,
     // because the receipt number lives on the TRANSACTION and the rest of that
     // filter is about the student. Nested inside the student relation it would
     // have matched nothing.
     //
-    // `contains`, so a partial is enough — "0042" finds it without anyone
-    // typing the year, which is what people actually do over a phone. Scoped to
-    // this school by the schoolId on the outer where.
+    // BOTH NUMBERS ARE MATCHED, the current one and the one the payment carried
+    // before the format changed. Ninety-nine payments were renumbered from
+    // "2026/2027-0042" to "CNPS042", and five of those had already been quoted
+    // to a parent in a WhatsApp message that was delivered — three of them read.
+    // Those families are holding the old number. Searching only the new one
+    // would answer "no such payment" to a parent reading out a number this
+    // system gave them, which is the exact failure the numbering exists to
+    // prevent. One extra OR arm removes it entirely.
+    //
+    // KNOWN AND ACCEPTED: a short query matches across both shapes, so "001"
+    // returns CNPS001 and the legacy 2026/2027-0001 — two different payments.
+    // That is the price of keeping old numbers findable while families still
+    // hold them, it is bounded (no new legacy numbers are ever written), and it
+    // shrinks to nothing as those receipts age out. The alternative — dropping
+    // the old numbers — trades an ambiguity the secretary can resolve by
+    // looking at the row for a dead end they cannot resolve at all.
+    //
+    // `contains`, so a partial is enough — "042" finds it without anyone typing
+    // the prefix, which is what people actually do over a phone. Scoped to this
+    // school by the schoolId on the outer where.
     const searchFilter = q
       ? {
         OR: [
           ...(Object.keys(studentFilter).length && studentFilter.OR ? [{ student: { OR: studentFilter.OR } }] : []),
           { receiptNumber: { contains: String(q), mode: 'insensitive' } },
+          { legacyReceiptNumber: { contains: String(q), mode: 'insensitive' } },
         ],
       }
       : {};
@@ -898,7 +936,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
     // payment would have no batch to confirm to a parent and none to retry.
     const paymentBatchId = newPaymentBatchId();
     const entry = await prisma.$transaction(async (tx) => {
-      const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+      const receiptNumber = await issueReceiptNumber(tx, schoolId);
       return tx.ledgerEntry.create({
         data: {
           code: genCode('PMT'),
@@ -932,7 +970,7 @@ router.post('/payment', requireAdmin, async (req, res) => {
     });
     res.status(201).json(withIdAsCode(entry));
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(400).json(paymentError(e));
   }
 });
 
@@ -1053,7 +1091,7 @@ router.post('/payments', requireAdmin, async (req, res) => {
     const created = await prisma.$transaction(async (tx) => {
       const rows = [];
       for (const { target, amount } of planned) {
-        const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+        const receiptNumber = await issueReceiptNumber(tx, schoolId);
         rows.push(await tx.ledgerEntry.create({
             data: {
               code: genCode('PMT'),
@@ -1100,7 +1138,7 @@ router.post('/payments', requireAdmin, async (req, res) => {
       entries: mapWithIdAsCode(created),
     });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(400).json(paymentError(e));
   }
 });
 
@@ -1313,7 +1351,7 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
         // category's own amount — the same shape POST /ledger/payment writes, so
         // allocation and every downstream reading of it behave identically.
         // feeKeyOf() reads these three columns back out; exactly one is ever set.
-        const receiptNumber = await issueReceiptNumber(tx, schoolId, academicYear);
+        const receiptNumber = await issueReceiptNumber(tx, schoolId);
         const entry = await tx.ledgerEntry.create({
           data: {
             code: genCode('PMT'),
@@ -1344,7 +1382,7 @@ router.post('/student/:studentId/group-settlement', requireAdmin, async (req, re
       group, recorded: created.length, total: plan.total, paymentBatchId, entries: created,
     });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    res.status(400).json(paymentError(e));
   }
 });
 

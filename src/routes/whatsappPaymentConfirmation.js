@@ -89,8 +89,13 @@ const NOTHING_BANKED = 'nothing_banked';
  * receives a bare number with no currency at all.
  *
  * {{5}} takes EVERY receipt number the submission produced, comma-separated:
- * "2026/2027-0010, 2026/2027-0011, 2026/2027-0012". The office search matches
- * partial numbers, so any one of them read out over the phone finds its row.
+ * "CNPS010, CNPS011, CNPS012". The office search matches partial numbers, so any
+ * one of them read out over the phone finds its row.
+ *
+ * The join itself is unchanged by the format change — it always was "whatever
+ * the rows carry, in order, separated by a comma and a space", and it takes the
+ * shorter numbers exactly as it took the longer ones. What changed is that three
+ * of them now fit on a line a parent can read back without losing their place.
  */
 const paymentConfirmationVariables = ({
   guardianName, amountPaid, dateReceived, studentName, receiptNumbers, balance, schoolName,
@@ -129,8 +134,13 @@ function invalidVariable(vars) {
  * The receipt numbers of a submission, as the message lists them.
  *
  * ", " between, so a single-category submission is one number with no trailing
- * comma and a three-category one reads as a list. Blank numbers are dropped
- * rather than joined as empty gaps.
+ * comma and a three-category one reads as "CNPS010, CNPS011, CNPS012". Blank
+ * numbers are dropped rather than joined as empty gaps.
+ *
+ * The result goes through invalidVariable like every other template slot, which
+ * is what asserts it is non-empty and free of line breaks. That check is what
+ * catches a join that produced nothing at all — a confirmation with no number in
+ * it is a receipt the office cannot look up.
  */
 const joinReceiptNumbers = (rows) =>
   rows.map((r) => String(r.receiptNumber ?? '').trim()).filter(Boolean).join(', ');

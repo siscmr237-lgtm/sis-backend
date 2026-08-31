@@ -4,6 +4,7 @@ const { mapWithIdAsCode, withIdAsCode } = require('../utils/response');
 const { resolveParentId, withFlatParent } = require('../utils/parents');
 const { computeFeesStatusForStudents } = require('../utils/feesStatus');
 const { classLevelOf } = require('../utils/classLevels');
+const { retireReceiptNumber } = require('../utils/receiptNumber');
 const { syncStudentFeeCharges } = require('../utils/levelFeeCharges');
 const { getStudentFeeStructure } = require('../utils/studentFees');
 const { FEE_GROUPS, parseFirstInstallmentAmount } = require('../utils/feeCategories');
@@ -404,7 +405,56 @@ router.delete('/:id', requireAdmin, async (req, res) => {
 
   try {
     await prisma.studentMark.deleteMany({ where: { studentId: found.id } });
-    await prisma.ledgerEntry.deleteMany({ where: { studentId: found.id } });
+
+    // THE RECEIPT NUMBERS ARE RETIRED BEFORE THE LEDGER GOES.
+    //
+    // This used to be a bare deleteMany, and a bare deleteMany on a student's
+    // ledger destroys every receipt number they were ever issued with nothing
+    // left anywhere to say those numbers existed. DELETE /ledger/:id has always
+    // retired the number of the single payment it removes; deleting a student
+    // removes the same kind of row, often dozens of them, and had no such step.
+    // The result was a school whose numbering had holes in it that no record
+    // could account for — and a parent who could be holding a receipt whose
+    // number the system would then insist had never been issued.
+    //
+    // A gap is meant to be evidence. This is what makes it evidence rather than
+    // an unexplained absence.
+    //
+    // The counter is NOT rewound and none of these numbers is ever reissued,
+    // exactly as in the single-payment path. See utils/receiptNumber.js.
+    //
+    // TRANSACTIONAL, unlike its siblings above and below. The rest of this route
+    // runs as sequential statements on purpose — the comment above explains why
+    // — but retiring a number and deleting the row it belongs to is the one pair
+    // here that must not come apart: retire-without-delete leaves a number
+    // marked spent while its payment is still live, and delete-without-retire is
+    // the bug this is fixing. Interactive transactions do work on this
+    // connection; the single-payment delete route has relied on one since
+    // receipt numbering shipped.
+    const numbered = await prisma.ledgerEntry.findMany({
+      where: { studentId: found.id, receiptNumber: { not: null } },
+      select: {
+        id: true, schoolId: true, receiptNumber: true, academicYear: true,
+        studentId: true, amount: true, entryDate: true,
+      },
+    });
+    const studentName = `${found.firstName} ${found.lastName}`.trim();
+
+    await prisma.$transaction(async (tx) => {
+      for (const entry of numbered) {
+        await retireReceiptNumber(tx, entry, {
+          studentName,
+          adminId: req.user?.id ?? null,
+          adminName: req.user?.name ?? null,
+          // Distinct from the 'deleted' a single-payment removal records, so the
+          // retired-numbers table can still say WHY a number went: this payment
+          // was not deleted on its own, it went with the student.
+          reason: 'student_deleted',
+        });
+      }
+      await tx.ledgerEntry.deleteMany({ where: { studentId: found.id } });
+    });
+
     await prisma.pickupContact.deleteMany({ where: { studentId: found.id } });
     await prisma.attendanceRecord.deleteMany({ where: { schoolId, type: 'student', personId: found.code } });
     await prisma.reportCard.deleteMany({ where: { schoolId, studentId: found.code } });

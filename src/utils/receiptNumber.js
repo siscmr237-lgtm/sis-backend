@@ -1,60 +1,94 @@
 /**
- * Receipt numbers for payments: "2026/2027-0042".
+ * Receipt numbers for payments: "CNPS001".
  *
  * One place issues them, one place formats them, and nothing else may write
  * LedgerEntry.receiptNumber.
  *
- * THE NUMBER IS PERMANENT. It goes on a paper receipt and, shortly, into a
- * WhatsApp message telling a parent to quote it to the school office. Once a
- * family is holding it, it identifies that payment for good — so editing a
- * payment's amount or date must never reissue or renumber it, and a number that
- * has been used is never handed out again, not even after the payment it named
- * has been deleted.
+ * THE NUMBER IS PERMANENT. It goes on a paper receipt and into a WhatsApp
+ * message telling a parent to quote it to the school office. Once a family is
+ * holding it, it identifies that payment for good — so editing a payment's
+ * amount or date must never reissue or renumber it, and a number that has been
+ * used is never handed out again, not even after the payment it named has been
+ * deleted.
+ *
+ * WHY THERE IS NO YEAR IN IT ANY MORE. The old shape was "2026/2027-0042": the
+ * academic year, then a sequence that restarted at 1 each year. A parent reading
+ * that down a phone line has to read fourteen characters, nine of which are the
+ * same for every receipt the school issued that year, and the secretary has to
+ * type them to find it. The school's own abbreviation and a running number say
+ * the same thing in seven.
+ *
+ * THE PRICE, AND IT IS THE WHOLE DESIGN: with no year in the number, a counter
+ * that reset each year would make this September's CNPS001 collide with last
+ * September's, and the two would be indistinguishable on a receipt. So the
+ * counter NEVER RESETS. It is per SCHOOL and continuous for the life of the
+ * school. See the ReceiptCounter model.
  */
+const { normalizeSchoolAbbreviation, validateSchoolAbbreviation } = require('./schoolAbbreviation');
 
 /**
- * How many digits the sequence is padded to.
+ * The MINIMUM width of the sequence, and minimum is the important word.
  *
- * Four, which covers 9,999 receipts in one school year — far beyond anything
- * these schools issue. It is a MINIMUM width, not a limit: the format below pads
- * up to four and then simply gets longer, so a school that somehow reaches 10000
- * gets "2026/2027-10000" rather than a collision or a wrapped counter. Padding
- * is only there so a sorted list reads in order.
+ * Three, so a school's first receipt is CNPS001 rather than CNPS1. Past 999 the
+ * number is printed as-is: CNPS999 is followed by CNPS1000, not by CNPS0001.
+ *
+ * THAT IS NOT AN OVERSIGHT AND MUST NOT BE "FIXED" INTO WIDER PADDING. The
+ * office search matches on a partial number — typing "001" is what a secretary
+ * actually does with a number read to them over the phone. If the padding grew
+ * to four at the thousandth receipt, CNPS001 and CNPS0001 would be two
+ * different payments differing by one zero, both returned by that same search,
+ * and the secretary would have no way to tell which one the parent meant. A
+ * number that gets one character longer is the cost of never being ambiguous.
  */
-const SEQUENCE_PAD = 4;
+const SEQUENCE_PAD = 3;
 
 /**
- * The academic year label, a hyphen, then the zero-padded sequence.
+ * The school's abbreviation, then the sequence padded to at least SEQUENCE_PAD.
  *
- * The year is the app's OWN label, used exactly as it is stored — "2026/2027",
- * not a reshaped "2026/27". It is taken from the payment row's own
- * `academicYear` column rather than derived from the date, because that column
- * is what every financial report filters on: a receipt whose year disagreed
- * with the report the payment appears in would be worse than no receipt at all.
+ * No separator between them, deliberately. A hyphen or a slash is one more
+ * thing to mishear, one more thing to type, and one more thing for a search to
+ * disagree about; "CNPS001" has exactly one spelling.
  *
- * A consequence worth knowing rather than discovering: a school records its
- * payments under the year it has ADVANCED to, which need not be the year the
- * calendar says the date falls in. A payment dated 11 April 2026, entered while
- * the school was already working in 2026/2027, is numbered 2026/2027-nnnn. That
- * is the app being consistent with itself, not a bug.
+ * The abbreviation is taken from the school row as it stands AT THE MOMENT OF
+ * ISSUE and then frozen into the string. It is never recomputed for a receipt
+ * that already exists — see issueReceiptNumber.
  */
-function formatReceiptNumber(academicYear, sequence) {
-  const year = String(academicYear ?? '').trim();
-  if (!year) throw new Error('A receipt number needs an academic year.');
+function formatReceiptNumber(abbreviation, sequence) {
+  const prefix = normalizeSchoolAbbreviation(abbreviation);
+  const invalid = validateSchoolAbbreviation(prefix);
+  if (invalid) throw new Error(`A receipt number needs a valid school abbreviation. ${invalid}`);
   const n = Number(sequence);
   if (!Number.isInteger(n) || n < 1) throw new Error(`Invalid receipt sequence: ${sequence}`);
-  return `${year}-${String(n).padStart(SEQUENCE_PAD, '0')}`;
+  return `${prefix}${String(n).padStart(SEQUENCE_PAD, '0')}`;
 }
 
-/** Pull the year and sequence back out. Null for anything not in this shape. */
+/**
+ * Pull the prefix and sequence back out. Null for anything not in this shape.
+ *
+ * The boundary between the two halves is the LAST LETTER in the string, which
+ * is unambiguous only because an abbreviation may end in a digit ("C1") while a
+ * sequence is always digits: "C1001" reads here as prefix "C1", sequence 001 —
+ * and would read equally validly as prefix "C1001" with no sequence at all.
+ * This is therefore a BEST-EFFORT reader for display and tests, never the
+ * authority on which school or which sequence a number belongs to. The
+ * authority is the row: the payment carries its own schoolId, and the counter
+ * carries the sequence. Nothing in the issuing path parses a number back apart.
+ */
 function parseReceiptNumber(value) {
+  const m = /^([A-Z0-9]*[A-Z])(\d+)$/.exec(String(value ?? '').trim().toUpperCase());
+  if (!m) return null;
+  return { abbreviation: m[1], sequence: Number(m[2]) };
+}
+
+/** The old shape, "2026/2027-0042", kept only so migrated rows can be recognised. */
+function parseLegacyReceiptNumber(value) {
   const m = /^(\d{4}\/\d{4})-(\d+)$/.exec(String(value ?? '').trim());
   if (!m) return null;
   return { academicYear: m[1], sequence: Number(m[2]) };
 }
 
 /**
- * Take the next number for this school and academic year.
+ * Take the next number for this school.
  *
  * MUST BE CALLED WITH A TRANSACTION CLIENT, and that transaction must be the one
  * the payment is inserted in. The whole design rests on it:
@@ -73,39 +107,68 @@ function parseReceiptNumber(value) {
  *     the atomicity is the point and it should be visible in the code, not a
  *     property of whatever the query builder happens to compile to.
  *
- *   - IT SERIALISES CONCURRENT PAYMENTS within one school and year: the row lock
- *     this takes is held until the transaction commits, so a second insert
- *     waits. That is intended. At school volumes — tens of payments a day, not
+ *   - IT SERIALISES CONCURRENT PAYMENTS within one school: the row lock this
+ *     takes is held until the transaction commits, so a second insert waits.
+ *     That is intended. At school volumes — tens of payments a day, not
  *     thousands a second — it is correct and cheap, and it is the property that
  *     makes the numbering gapless. Do not "optimise" it into a sequence, a
  *     read-then-write, or an advisory-lock-free scheme.
  *
- * @param {object} tx            Prisma transaction client. NOT the base client.
+ * NO ACADEMIC YEAR. The counter is keyed on the school alone and never resets;
+ * a payment recorded on the first day of a new academic year gets the number
+ * after the last one issued in the old. That is the point — see the header.
+ *
+ * THE ABBREVIATION IS READ INSIDE THE TRANSACTION, from the school row, and is
+ * baked into the returned string. A school that changes its abbreviation later
+ * changes only what its NEXT receipt looks like; every receipt already issued
+ * keeps the prefix it was issued under, because the string is stored, not
+ * recomputed. See the note on School.abbreviation.
+ *
+ * @param {object} tx        Prisma transaction client. NOT the base client.
  * @param {number} schoolId
- * @param {string} academicYear  Exactly as it will be stored on the payment.
- * @returns {Promise<string>}    e.g. "2026/2027-0042"
+ * @returns {Promise<string>} e.g. "CNPS042"
  */
-async function issueReceiptNumber(tx, schoolId, academicYear) {
+async function issueReceiptNumber(tx, schoolId) {
   if (!tx || typeof tx.$queryRawUnsafe !== 'function') {
     throw new Error('issueReceiptNumber must be given a transaction client.');
   }
-  const year = String(academicYear ?? '').trim();
-  if (!year) throw new Error('A receipt number needs an academic year.');
+
+  // REFUSED RATHER THAN GUESSED AT. A school with no usable abbreviation cannot
+  // be given a receipt number, and inventing one — falling back to the school
+  // id, or to the first letters of the name — would put a prefix on a parent's
+  // receipt that matches nothing the school calls itself. The payment fails
+  // with a message naming exactly what is missing, and the whole transaction
+  // rolls back, so no number is consumed.
+  const schoolRows = await tx.$queryRawUnsafe(
+    'SELECT "abbreviation", "name" FROM "School" WHERE "id" = $1',
+    schoolId,
+  );
+  const school = schoolRows?.[0];
+  if (!school) throw new Error(`No such school: ${schoolId}`);
+  const abbreviation = normalizeSchoolAbbreviation(school.abbreviation);
+  const invalid = validateSchoolAbbreviation(abbreviation);
+  if (invalid) {
+    const err = new Error(
+      `${school.name || 'This school'} has no valid abbreviation set, so a receipt number cannot be issued. `
+      + `${invalid} Set it in School Settings before recording payments.`,
+    );
+    err.code = 'MISSING_SCHOOL_ABBREVIATION';
+    throw err;
+  }
 
   const rows = await tx.$queryRawUnsafe(
-    `INSERT INTO "ReceiptCounter" ("schoolId", "academicYear", "lastSequence", "createdAt", "updatedAt")
-     VALUES ($1, $2, 1, NOW(), NOW())
-     ON CONFLICT ("schoolId", "academicYear")
+    `INSERT INTO "ReceiptCounter" ("schoolId", "lastSequence", "createdAt", "updatedAt")
+     VALUES ($1, 1, NOW(), NOW())
+     ON CONFLICT ("schoolId")
      DO UPDATE SET "lastSequence" = "ReceiptCounter"."lastSequence" + 1, "updatedAt" = NOW()
      RETURNING "lastSequence"`,
     schoolId,
-    year,
   );
   const sequence = Number(rows?.[0]?.lastSequence);
   if (!Number.isInteger(sequence) || sequence < 1) {
     throw new Error('Could not allocate a receipt number.');
   }
-  return formatReceiptNumber(year, sequence);
+  return formatReceiptNumber(abbreviation, sequence);
 }
 
 /**
@@ -147,5 +210,6 @@ module.exports = {
   retireReceiptNumber,
   formatReceiptNumber,
   parseReceiptNumber,
+  parseLegacyReceiptNumber,
   SEQUENCE_PAD,
 };
