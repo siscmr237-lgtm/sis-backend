@@ -161,4 +161,33 @@ async function sendAdminInvite({ to, name, schoolName, link }) {
   });
 }
 
-module.exports = { sendSignupOtp, sendPasswordResetLink, sendTeacherInvite, sendAdminInvite };
+// The internal alert that a parent has replied on WhatsApp.
+//
+// THE ONLY FUNCTION HERE THAT MAILS THE TEAM RATHER THAN A USER, which is why it
+// takes a finished subject and body instead of the fields to build one. The four
+// above own their wording because each is one fixed message with a couple of
+// names slotted in; this one's wording depends on whether a guardian matched, on
+// how many did, and on what a stranger typed, so it is composed in
+// utils/inboundAlert.js where it can be tested without an SMTP server.
+//
+// `text` is sent alongside the HTML rather than left out. Alerts get read on
+// phones, in notification previews and in clients with images off, and a
+// plain-text alternative is what makes the parent's actual message legible in
+// all three.
+async function sendInboundWhatsAppAlert({ to, subject, html, text }) {
+  await transporter.sendMail({
+    from: `"SIS Support" <${process.env.MAIL_USERNAME}>`,
+    to,
+    subject,
+    html,
+    text,
+  });
+}
+
+module.exports = {
+  sendSignupOtp,
+  sendPasswordResetLink,
+  sendTeacherInvite,
+  sendAdminInvite,
+  sendInboundWhatsAppAlert,
+};

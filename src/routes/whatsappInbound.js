@@ -25,6 +25,7 @@ const express = require('express');
 const { prisma } = require('../db/prisma');
 const { isValidTwilioRequest } = require('../utils/twilioSignature');
 const { matchPhoneToStudents, threadKey } = require('../utils/whatsappInbox');
+const { notifyInboundWhatsApp } = require('../utils/inboundAlert');
 
 const router = express.Router();
 
@@ -143,11 +144,51 @@ router.post('/', express.urlencoded({ extended: false }), async (req, res) => {
       }
     });
 
+    // ───────────────────────────────────────────────────────────────────────
+    // 3. TELL THE TEAM. Best-effort, and it cannot touch anything above.
+    // ───────────────────────────────────────────────────────────────────────
+    //
+    // The message is stored by this point, which is the only thing that had to
+    // happen. Everything from here is a convenience on top of an inbox that is
+    // already the real record.
+    //
+    // WHY THIS IS BEFORE res.send() AND NOT AFTER IT. "Fire and forget after
+    // responding" is the natural shape for a best-effort side task, and on a
+    // normal server it would be the right one. It does not work here, for the
+    // same reason the write above had to move in front of the response: Vercel
+    // SUSPENDS the function once the response is sent, so a promise left running
+    // afterwards is not a background task, it is a coin flip. The email would
+    // send in local development, appear to work in review, and mostly never
+    // arrive in production — the failure mode this route has already been bitten
+    // by once.
+    //
+    // So it is awaited, and the danger that creates is handled where it lives,
+    // inside notifyInboundWhatsApp:
+    //
+    //   - IT NEVER THROWS. Every failure is caught and logged there. Nothing it
+    //     does can reach the catch below, where a mail-server outage would be
+    //     mistaken for a failed write, answered with a 500, and turn into Twilio
+    //     redelivering a message that is already stored.
+    //   - IT NEVER HANGS. The send is raced against a hard cap (5s), so the
+    //     worst a dead or slow SMTP server can cost this response is that cap —
+    //     well inside Twilio's 15-second webhook timeout, on top of one indexed
+    //     lookup and one insert.
+    //
+    // Its return value is deliberately ignored. Whether the email went out has
+    // no bearing on what Twilio is told: the parent's message is safe either
+    // way, and a 500 here would ask for a redelivery that could not help.
+    await notifyInboundWhatsApp({ fromRaw, body, matches });
+
     return respondEmpty(res);
   } catch (e) {
     if (e?.code === 'P2002') {
       // Twilio replaying something already stored. Expected, frequent, and
       // exactly what the unique index is for — a 200, not a retry.
+      //
+      // AND NO SECOND EMAIL. The alert above is never reached on this path, by
+      // construction: the create throws before it. That is what makes "one email
+      // per inbound message" true rather than "one per delivery attempt" — a
+      // webhook Twilio redelivers four times is one message, and one email.
       return respondEmpty(res);
     }
     // Anything else: say so, and let Twilio bring it back. Better a redelivery
