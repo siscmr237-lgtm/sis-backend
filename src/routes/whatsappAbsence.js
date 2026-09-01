@@ -580,21 +580,41 @@ statusRouter.post('/:secret', express.urlencoded({ extended: false }), async (re
     const rawCode = String(req.body?.ErrorCode ?? '').trim();
     const errorCode = rawCode && rawCode !== '0' ? rawCode : null;
 
-    // updateMany, not update: the SID is not a unique column, and a callback for
-    // a message this app never sent — or one already cleaned up — must be a
-    // no-op rather than a thrown P2025 in the log.
-    const { count } = await prisma.whatsAppMessage.updateMany({
-      where: { twilioSid: sid },
-      data: {
-        status,
-        errorCode,
-        // Only overwrite the message when there is a new error to describe.
-        // Twilio sends no text with a status change, and blanking the existing
-        // one on the way past would erase why a failed message failed.
-        ...(errorCode ? { errorMessage: `WhatsApp reported error ${errorCode}.` } : {}),
-      },
-    });
-    if (!count) console.warn(`whatsapp/status: no row for MessageSid ${sid}`);
+    const data = {
+      status,
+      errorCode,
+      // Only overwrite the message when there is a new error to describe.
+      // Twilio sends no text with a status change, and blanking the existing
+      // one on the way past would erase why a failed message failed.
+      ...(errorCode ? { errorMessage: `WhatsApp reported error ${errorCode}.` } : {}),
+    };
+
+    // BOTH OUTBOUND TABLES, because there are now two kinds of thing we send and
+    // Twilio reports on them through this one URL.
+    //
+    // WhatsAppMessage holds template sends. OutboundWhatsAppReply holds the
+    // free-form replies the Messages console sends, and sendFreeform sets the
+    // same StatusCallback on them. Updating only the first would leave every
+    // reply sitting at 'queued' forever — the exact silent-failure this route
+    // exists to prevent, reintroduced for the newer table.
+    //
+    // Not a hypothetical: Twilio's synchronous API ACCEPTS a message addressed to
+    // an unroutable number and reports the failure here, asynchronously, minutes
+    // later. For a reply, this callback is the only thing that will ever say it
+    // did not arrive.
+    //
+    // updateMany, not update: the SID is not unique in either table, and a
+    // callback for a message this app never sent — or one already cleaned up —
+    // must be a no-op rather than a thrown P2025 in the log. A SID matches at
+    // most one of the two, so both run unconditionally and one of them is
+    // ordinarily a no-op.
+    const [templates, replies] = await Promise.all([
+      prisma.whatsAppMessage.updateMany({ where: { twilioSid: sid }, data }),
+      prisma.outboundWhatsAppReply.updateMany({ where: { twilioSid: sid }, data }),
+    ]);
+    if (!templates.count && !replies.count) {
+      console.warn(`whatsapp/status: no row for MessageSid ${sid}`);
+    }
   } catch (e) {
     console.error('whatsapp/status: could not record a delivery update —', e.code || e.message);
   }

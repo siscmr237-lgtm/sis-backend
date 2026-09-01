@@ -37,8 +37,10 @@ const { router: paymentConfirmationRouter } = require('./whatsappPaymentConfirma
  * resolveRecipient, sendFailure, and a private copy of the money formatter. Only
  * the formatter survived, promoted to ../utils/money, because the figure in a
  * message has to match the finance table and the printed sheet character for
- * character. src/services/twilioWhatsApp.js is now unreferenced; it is left in
- * place rather than deleted in the same change that rewrote its last caller.
+ * character. src/services/twilioWhatsApp.js, which used to send free text
+ * through the twilio npm package, has been deleted: its job is now sendFreeform
+ * in ../utils/twilioWhatsApp, beside the template sender, sharing the same
+ * Messaging Service, status callback and never-throws contract.
  */
 
 const router = express.Router();

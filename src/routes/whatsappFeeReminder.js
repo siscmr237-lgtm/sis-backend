@@ -21,6 +21,7 @@ const { EXCLUDE_NEVER_SENT, neverLeftServer, RETRY_RESET } = require('../utils/w
  * This replaces a free-TEXT route that had no consent check, wrote no record of
  * what it sent, and could not have worked anyway: WhatsApp requires an approved
  * TEMPLATE for a message a business starts, which the old services/twilioWhatsApp
+ * (since deleted -- see ../utils/twilioWhatsApp)
  * had no way to express.
  */
 

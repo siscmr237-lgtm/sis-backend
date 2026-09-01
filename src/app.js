@@ -35,6 +35,8 @@ const academicYearRouter = require('./routes/academicYear');
 const cronRouter = require('./routes/cron');
 const platformAuthRouter = require('./routes/platformAuth');
 const platformRouter = require('./routes/platform');
+const platformMessagesRouter = require('./routes/platformMessages');
+const whatsappInboundRouter = require('./routes/whatsappInbound');
 const schoolRouter = require('./routes/school');
 const whatsappRouter = require('./routes/whatsapp');
 const { statusRouter: whatsappStatusRouter } = require('./routes/whatsappAbsence');
@@ -42,6 +44,24 @@ const publicRouter = require('./routes/public');
 const pushRouter = require('./routes/push');
 
 const app = express();
+
+// TRUST THE PROXY IN FRONT OF US. Vercel terminates TLS at its edge and forwards
+// an ordinary HTTP request to the function, so without this `req.protocol` reads
+// "http" on requests that arrived over HTTPS and `req.ip` is the proxy's address
+// rather than the caller's.
+//
+// `1` rather than `true`: it trusts exactly ONE hop — the proxy we actually have
+// — instead of believing whatever X-Forwarded-For a client chooses to send. With
+// `true`, anyone can prepend an address to that header and be believed.
+//
+// This is a correctness fix, not a tidy-up. The Twilio inbound webhook validates
+// a signature computed over the exact URL Twilio called, and a URL rebuilt with
+// the wrong scheme fails every genuine webhook while looking identical to an
+// attack. That route does not rely on this setting alone — it reads
+// X-Forwarded-Proto explicitly, for the reasons written out in
+// utils/twilioSignature.js — but everything else that asks Express about the
+// scheme should get the true answer too.
+app.set('trust proxy', 1);
 
 const ALLOWED_ORIGINS = [
   // The live frontend. Both the apex and the www host are listed because a
@@ -174,6 +194,18 @@ app.use('/public', publicRouter);
 // down, and reached first because it is registered first.
 app.use('/whatsapp/status', whatsappStatusRouter);
 
+// Inbound WhatsApp from parents. PUBLIC for the same reason as its neighbour
+// above -- Twilio has no session -- but authenticated differently: by the
+// X-Twilio-Signature on every request rather than by a secret in the path. The
+// status URL is generated per message by code we control, so a secret can ride
+// in it; this one is a single fixed URL registered by hand in the Twilio
+// Console, where a secret could never be rotated without an outage.
+//
+// MUST stay above authMiddleware. Behind it every reply a parent sends is a
+// 401, Twilio retries each with backoff, and the inbox stays empty while
+// appearing to work.
+app.use('/whatsapp/inbound', whatsappInboundRouter);
+
 // All routes below this line are protected
 app.use(authMiddleware);
 
@@ -182,6 +214,13 @@ app.use(authMiddleware);
 // it. requirePlatformActor is the second of the two directions: an admin or
 // teacher token is a perfectly valid session and would otherwise pass straight
 // through authMiddleware into this router.
+// The two-way WhatsApp inbox. Inside the same requirePlatformActor guard, so
+// reading is open to any internal account; SENDING carries requirePlatformFounder
+// on its own route -- see routes/platformMessages.js.
+//
+// Registered before the general platform router so '/platform/messages' is not
+// swallowed by any parameterised route it might grow.
+app.use('/platform/messages', requirePlatformActor, platformMessagesRouter);
 app.use('/platform', requirePlatformActor, platformRouter);
 
 // ── THE SCHOOL API ──────────────────────────────────────────────────────────

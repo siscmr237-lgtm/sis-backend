@@ -1695,3 +1695,140 @@ model PushSubscription {
   @@index([adminUserId])
   @@index([staffId])
 }
+
+/// ---------------------------------------------------------------------------
+/// THE TWO-WAY INBOX. A parent's REPLY, and what the team says back.
+/// ---------------------------------------------------------------------------
+///
+/// DELIBERATELY NOT LAYERED ONTO WhatsAppMessage. That table is the log of
+/// outbound TEMPLATE sends: it hangs off a student, a purpose and a
+/// paymentBatchId, it carries the frozen snapshot of what a template said, and
+/// its unique indexes exist to stop the same notice going twice. An inbound
+/// message has none of those things — no student it is "about", no template, no
+/// duplicate to guard against — and forcing it in would mean nullable columns on
+/// both sides and indexes that mean one thing for one kind of row. It stays
+/// exactly as it is.
+///
+/// THE THREAD KEY IS THE PHONE NUMBER, in the normalised "whatsapp:+237..." form
+/// that normaliseToWhatsApp produces, stored on both tables under names that
+/// differ only by direction. That is what lets one query per side, ordered by
+/// time, interleave into a single conversation. It is the phone number and not
+/// the student on purpose: the person typing is a phone, and who they turn out
+/// to be is a best-effort guess made afterwards, which can be wrong, plural, or
+/// nothing at all.
+model InboundWhatsAppMessage {
+  id             Int                    @id @default(autoincrement())
+  /// Twilio's own SID for the inbound message.
+  ///
+  /// UNIQUE, and that is the whole idempotency story. Twilio retries a webhook
+  /// that does not answer 200, so the same message arrives more than once as a
+  /// matter of routine — a duplicate row would show the office the same reply
+  /// twice and make the 24-hour window look fresher than it is. The database
+  /// refuses the second insert rather than the route checking first, because a
+  /// check-then-insert is exactly what two concurrent retries race through.
+  twilioSid      String                 @unique
+  /// EXACTLY WHAT TWILIO SENT, channel prefix and all, before anything touched
+  /// it. Kept beside the normalised form for the same reason WhatsAppMessage
+  /// keeps toNumber: when a match goes wrong, the only useful question is what
+  /// actually arrived, and a normaliser that mangled it would have erased the
+  /// evidence of its own mistake.
+  fromRaw        String
+  /// The thread key. normaliseToWhatsApp(fromRaw) — the same function every
+  /// outgoing send uses to decide where a message goes, so a reply threads
+  /// against the number the school messaged rather than a second spelling of it.
+  ///
+  /// NULLABLE, because normaliseToWhatsApp returns null rather than guessing at
+  /// a number it cannot read, and a message that arrived is a fact whether or
+  /// not its sender's number parses. Such a row has no thread and shows in the
+  /// list under its raw number.
+  fromNormalised String?
+  body           String
+  receivedAt     DateTime               @default(now())
+  /// Null means unread. A timestamp rather than a boolean so it is possible to
+  /// tell WHEN the office saw it, which a bare `true` cannot answer a week later.
+  readAt         DateTime?
+  matches        InboundWhatsAppMatch[]
+
+  /// The conversation list and the thread view, which are the only two reads.
+  @@index([fromNormalised, receivedAt])
+  @@index([receivedAt])
+}
+
+/// WHO THIS NUMBER TURNED OUT TO BE — zero, one, or several rows per message.
+///
+/// SEVERAL IS THE NORMAL CASE, not an edge case: siblings share a guardian, so
+/// one phone reaches every child that guardian has enrolled. Recording one match
+/// would mean picking a child arbitrarily and showing the office a reply
+/// attributed to the wrong one. Recording none is equally valid and is displayed
+/// plainly as unmatched rather than hidden — a stranger, a wrong number, or a
+/// parent whose number was never written down are all things the team needs to
+/// see, not things to filter out.
+///
+/// DELIBERATELY DENORMALISED, AND WITH NO FOREIGN KEYS except to the message
+/// itself. Same reasoning as RetiredReceiptNumber, and the same hard-won lesson:
+/// a FK from here to Student would either cascade the record of a conversation
+/// away when a student is deleted, or block the deletion. Neither is right. The
+/// ids are kept as plain columns for looking up while the rows still exist, and
+/// the names are copied in as text so the inbox still reads sensibly when they
+/// do not.
+///
+/// A SNAPSHOT OF THE MATCH AS IT WAS MADE, at the moment the message arrived. It
+/// is not re-derived on read and does not follow later edits — if a guardian's
+/// number is corrected next week, this row goes on saying who the message
+/// matched when it landed, which is what somebody investigating it needs.
+model InboundWhatsAppMatch {
+  id          Int                    @id @default(autoincrement())
+  message     InboundWhatsAppMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  messageId   Int
+  /// Cascade above is the one FK here and it is right: a match describes a
+  /// message, and without that message it describes nothing.
+  schoolId    Int?
+  schoolName  String?
+  studentId   Int?
+  studentName String?
+  parentId    Int?
+  parentName  String?
+
+  /// One row per message per student. Guards a re-match, and makes the
+  /// several-siblings case a set rather than a list that can gain duplicates.
+  @@unique([messageId, studentId])
+  @@index([schoolId])
+}
+
+/// A FREE-FORM REPLY the team sent back.
+///
+/// A DIFFERENT TWILIO CALL from everything else this app sends, and a different
+/// permission. Every other outbound message is an approved Content template
+/// addressed by ContentSid, because WhatsApp requires one for a message a
+/// business STARTS. This is a reply inside an open conversation, sent as plain
+/// Body text, which WhatsApp permits only within 24 hours of the customer's last
+/// inbound message. See sendFreeform and the window check in the reply route.
+///
+/// Kept apart from WhatsAppMessage for the same reason the inbound table is:
+/// there is no student, no purpose and no template here, and no duplicate to
+/// guard against — the team may legitimately send three messages in a row.
+model OutboundWhatsAppReply {
+  id                   Int      @id @default(autoincrement())
+  /// What was typed into the To field, and the normalised thread key beside it —
+  /// the same pair, and the same reasoning, as the inbound table above.
+  toRaw                String
+  toNormalised         String
+  body                 String
+  /// WRITTEN BEFORE THE TWILIO CALL, like every other send in this app, so a
+  /// send that fails or never answers is a visible row rather than nothing at
+  /// all. 'queued' until the provider answers, then Twilio's own vocabulary;
+  /// 'failed_to_send' is ours, for a request that never got a reply.
+  status               String   @default("queued")
+  twilioSid            String?
+  errorCode            String?
+  errorMessage         String?
+  sentAt               DateTime @default(now())
+  /// WHO SENT IT. A plain id and a copied name rather than a relation, so the
+  /// record of what was said to a parent survives the account that said it being
+  /// disabled or renamed. Sending is Founder-only — see the reply route.
+  sentByPlatformUserId Int?
+  sentByName           String?
+
+  @@index([toNormalised, sentAt])
+  @@index([twilioSid])
+}
