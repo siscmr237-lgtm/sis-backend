@@ -928,7 +928,27 @@ model LedgerEntry {
   /// the student's total charged always equals the level's current fee
   /// structure. That is what makes a fee change apply to EXISTING charges
   /// rather than only future ones.
-  classLevelFee        ClassLevelFee?      @relation(fields: [classLevelFeeId], references: [id], onDelete: Cascade)
+  /// SET NULL, NEVER CASCADE. This was Cascade, and Cascade here meant that
+  /// deleting a fee took every PAYMENT recorded against it with it — silently,
+  /// with no receipt retired and no trace left. That is not a hypothetical: an
+  /// ordinary "copy this level's fee structure" in classes.js deletes and
+  /// recreates a level's fees, and it destroyed a real 50,000 FCFA payment for a
+  /// real family whose parent was holding a delivered WhatsApp receipt for it.
+  ///
+  /// A payment is an accounting record of money the school actually received. It
+  /// must outlive the fee category it happened to be tagged to. Orphaned, it
+  /// falls to feeKeyOf() returning null, which computeOwingByCategory already
+  /// handles as untaggedPaid — the money still counts in totalPaid and is still
+  /// spent, just oldest-first rather than against its own category.
+  ///
+  /// THE STRUCTURAL CHARGES ARE A DIFFERENT MATTER and are NOT protected by
+  /// this. They used to be cleaned up BY the cascade, and orphaned they would
+  /// survive as untagged one-off debts — 2,017,500 FCFA of fees families do not
+  /// owe. A foreign key cannot tell a CHARGE row from a PAYMENT row, so every
+  /// site that deletes a ClassLevelFee now deletes its structural charges
+  /// explicitly first. See deleteLevelFeeCharges in utils/levelFeeCharges.js;
+  /// removing that call reintroduces the phantom debt, not the data loss.
+  classLevelFee        ClassLevelFee?      @relation(fields: [classLevelFeeId], references: [id], onDelete: SetNull)
   classLevelFeeId      Int?
   /// True only on the row that bills the class level's fee STRUCTURE — the one
   /// syncLevelFeeCharges owns and rewrites when the level's amount changes.
@@ -948,7 +968,11 @@ model LedgerEntry {
   /// classLevelFeeId / studentFeeOverrideId is set on a fee-linked charge: the
   /// first while a student follows their class, the second once they have their
   /// own structure. Both null means a one-off charge, outside any fee structure.
-  studentFeeOverride   StudentFeeOverride? @relation(fields: [studentFeeOverrideId], references: [id], onDelete: Cascade)
+  /// SET NULL for the same reason as classLevelFeeId above, and it matters just
+  /// as much: 51 of the receipted payments on this system hang off an override
+  /// rather than a class-level fee, and detaching or re-billing a student
+  /// deletes StudentFeeOverride rows routinely.
+  studentFeeOverride   StudentFeeOverride? @relation(fields: [studentFeeOverrideId], references: [id], onDelete: SetNull)
   studentFeeOverrideId Int?
   /// The short label shown wherever this entry is listed — for a charge raised by
   /// hand this is its NAME ("Broken window", "Trip"). Required, and long-standing.

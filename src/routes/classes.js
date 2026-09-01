@@ -8,7 +8,7 @@ const {
   parseFirstInstallmentAmount,
 } = require('../utils/feeCategories');
 const { feeSetupPayload, clearNoFeesDeclaration } = require('../utils/levelFees');
-const { syncLevelFeeCharges } = require('../utils/levelFeeCharges');
+const { syncLevelFeeCharges, deleteLevelFeeCharges, repointPaymentsByName } = require('../utils/levelFeeCharges');
 const { applyLevelFeeToOverriddenStudents } = require('../utils/studentOverrideCharges');
 const { ensureDefaultTestExamsForYear } = require('../utils/defaultTestExams');
 
@@ -107,9 +107,10 @@ router.get('/levels/:level/fees', async (req, res) => {
 //
 // Replaces the level's whole fee structure in one request: a fee present without
 // an id is created, one with an id is updated, and any existing fee the caller
-// omits is DELETED (taking its charges with it via the FK cascade). Saving the
-// set as a unit is what makes deleting a category work — a patch-style endpoint
-// would leave omitted fees silently in force.
+// omits is DELETED, taking its structural CHARGES with it but never its
+// PAYMENTS — see deleteLevelFeeCharges for why those are two different answers.
+// Saving the set as a unit is what makes deleting a category work — a
+// patch-style endpoint would leave omitted fees silently in force.
 //
 // Then re-bills: every student of the level has their charge for each fee set to
 // the new amount, so a change applies to EXISTING charges and not merely future
@@ -188,6 +189,18 @@ router.put('/levels/:level/fees', async (req, res) => {
     // Removals first, so a fee can be deleted and another renamed to its name in
     // the same save without tripping the (schoolId, classLevel, name) unique.
     if (removedIds.length) {
+      // The structural charges go with the fee; the PAYMENTS do not.
+      // classLevelFeeId is ON DELETE SET NULL now, so without this call those
+      // charges would survive as one-off debts nobody owes — and under the old
+      // Cascade the payments were being destroyed outright. See
+      // deleteLevelFeeCharges.
+      //
+      // The orphan map is DISCARDED here, deliberately: an admin removing a fee
+      // from the list is removing that category, not renaming it, so there is
+      // nothing honest to re-point its payments at. They go untagged, where the
+      // money still counts toward what the family has paid and is spent
+      // oldest-first.
+      await deleteLevelFeeCharges(prisma, schoolId, removedIds);
       await prisma.classLevelFee.deleteMany({ where: { id: { in: removedIds }, schoolId } });
     }
     for (const p of parsed) {
@@ -312,9 +325,19 @@ router.post('/levels/:level/no-fees', async (req, res) => {
     }
 
     if (fees.length) {
+      // Declaring a level free removes its fees, so its structural charges go
+      // too — explicitly now, since the FK is SET NULL and would otherwise leave
+      // them behind as one-off debts these families do not owe.
+      //
+      // Orphans discarded: this level charges nothing from here on, so there is
+      // no category to re-point a payment at. Payments already made go untagged
+      // and keep counting toward what the family has paid. They are emphatically
+      // NOT deleted — this level being free from now on says nothing about money
+      // it has already received, and under the old Cascade every one of those
+      // payments was destroyed by this line.
+      await deleteLevelFeeCharges(prisma, schoolId, fees.map((f) => f.id));
       await prisma.classLevelFee.deleteMany({ where: { schoolId, classLevel: level } });
-      // The deletions cascade to their charges; this clears anything the sync
-      // still considers outstanding for the level.
+      // Clears anything the sync still considers outstanding for the level.
       await syncLevelFeeCharges(prisma, schoolId, level);
     }
 
@@ -457,6 +480,30 @@ router.post('/fees/copy', async (req, res) => {
       try {
         const rebill = await prisma.$transaction(
           async (tx) => {
+            // THIS IS THE LINE THAT DESTROYED A REAL PAYMENT.
+            //
+            // Copying a fee structure onto a level deletes and recreates that
+            // level's fees. While LedgerEntry.classLevelFeeId was ON DELETE
+            // CASCADE, the delete took every payment tagged to those fees with
+            // it — including a 50,000 FCFA payment whose parent was holding a
+            // delivered WhatsApp receipt quoting its number. No retirement
+            // record, no trace, nothing to find afterwards.
+            //
+            // The FK is SET NULL now, so no route can destroy a payment that way
+            // again. What still has to be done by hand is the half of the
+            // cascade that was actually wanted: removing the structural charges,
+            // which would otherwise survive as debts these families do not owe.
+            const doomed = await tx.classLevelFee.findMany({
+              where: { schoolId, classLevel: target },
+              select: { id: true },
+            });
+            const { orphansByName } = await deleteLevelFeeCharges(
+              tx, schoolId, doomed.map((f) => f.id),
+            );
+
+            // DELETE THEN CREATE, in that order and not the other way round:
+            // (schoolId, classLevel, name) is unique and both generations carry
+            // the same names, so they cannot coexist even for a statement.
             await tx.classLevelFee.deleteMany({ where: { schoolId, classLevel: target } });
             await tx.classLevelFee.createMany({
               data: sourceFees.map((f) => ({
@@ -468,6 +515,18 @@ router.post('/fees/copy', async (req, res) => {
                 firstInstallmentAmount: f.firstInstallmentAmount,
               })),
             });
+
+            // NOW the replacements exist and the orphaned payments can be
+            // pointed at them by name — the one site where that is the right
+            // thing to do, because this level is not losing its fees, it is
+            // having them replaced. Without this the money would survive but go
+            // untagged, and every category on the level would read unpaid while
+            // the payments sat in the general pool.
+            const replacements = await tx.classLevelFee.findMany({
+              where: { schoolId, classLevel: target },
+              select: { id: true, name: true },
+            });
+            await repointPaymentsByName(tx, orphansByName, replacements);
             // Same rule as a normal save: a level that charges something is not
             // a free level, so a stale declaration cannot outlive it.
             if (sourceFees.some((f) => f.amount > 0)) {

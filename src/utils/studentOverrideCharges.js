@@ -189,7 +189,8 @@ async function syncStudentOverrideCharges(prisma, schoolId, studentId) {
 /**
  * Replaces a student's override snapshot and detaches them if they were not
  * already. `fees` is the COMPLETE structure: an existing override fee the caller
- * omits is deleted, taking its charges with it via the FK cascade.
+ * omits is deleted, taking its structural CHARGES with it — but never its
+ * PAYMENTS. See deleteOverrideFeeCharges.
  */
 async function setStudentFeeOverride(prisma, schoolId, studentId, fees) {
   const existing = await prisma.studentFeeOverride.findMany({
@@ -201,6 +202,12 @@ async function setStudentFeeOverride(prisma, schoolId, studentId, fees) {
 
   const removeIds = existing.filter((r) => !keepNames.has(r.name)).map((r) => r.id);
   if (removeIds.length) {
+    // The structural charges go with the fee; the payments stay.
+    // LedgerEntry.studentFeeOverrideId is ON DELETE SET NULL now, so this line
+    // no longer destroys the money a family handed over against a category the
+    // admin has since removed — but the charges it used to clear have to be
+    // cleared here instead, or they survive as debts nobody owes.
+    await deleteOverrideFeeCharges(prisma, schoolId, removeIds);
     await prisma.studentFeeOverride.deleteMany({ where: { id: { in: removeIds }, schoolId } });
   }
 
@@ -227,10 +234,10 @@ async function setStudentFeeOverride(prisma, schoolId, studentId, fees) {
 
 /**
  * Re-attaches a student to their class level's fee structure, discarding their
- * custom setup. The override rows go, and their structural charges with them via
- * the cascade; the level sync then bills them the standard fees. Payments and
- * one-off charges survive, so a student who had paid a reduced fee may come back
- * as Owing against the full one — which is the honest result of re-attaching.
+ * custom setup. The override rows go, and their structural charges with them;
+ * the level sync then bills them the standard fees. Payments and one-off charges
+ * survive, so a student who had paid a reduced fee may come back as Owing
+ * against the full one — which is the honest result of re-attaching.
  */
 async function removeStudentFeeOverride(prisma, schoolId, studentId) {
   const student = await prisma.student.findFirst({
@@ -239,14 +246,25 @@ async function removeStudentFeeOverride(prisma, schoolId, studentId) {
   });
   if (!student) return null;
 
-  // BEFORE the delete, and not merely for tidiness: LedgerEntry.studentFeeOverride
-  // is onDelete: Cascade, so any PAYMENT still pointing at an override row would
-  // be DELETED along with it — re-attaching a student would erase the record of
-  // money they had handed over. Moving them onto the class-level key first both
-  // saves the rows and keeps each payment credited to the same named fee.
+  // BEFORE the delete, and this used to be the only thing standing between a
+  // re-attachment and permanent data loss: LedgerEntry.studentFeeOverrideId was
+  // onDelete: Cascade, so any PAYMENT still pointing at an override row was
+  // DELETED along with it. Miss this call and re-attaching a student erased the
+  // record of money they had handed over.
+  //
+  // The FK is SET NULL now, so that is no longer the last line of defence — but
+  // this stays and stays FIRST, because it does something the FK cannot: it
+  // keeps each payment credited to the same NAMED fee on the class-level side,
+  // instead of merely surviving as untagged money.
   await retagPaymentsBetweenFeeStructures(
     prisma, schoolId, studentId, 'classLevel', classLevelOf(student.class),
   );
+
+  // The structural charges the overrides billed, which the cascade used to take.
+  const overrides = await prisma.studentFeeOverride.findMany({
+    where: { schoolId, studentId }, select: { id: true },
+  });
+  await deleteOverrideFeeCharges(prisma, schoolId, overrides.map((o) => o.id));
 
   await prisma.studentFeeOverride.deleteMany({ where: { schoolId, studentId } });
   await prisma.student.update({ where: { id: studentId }, data: { feesOverridden: false } });
@@ -301,10 +319,45 @@ async function applyLevelFeeToOverriddenStudents(prisma, schoolId, classLevel, f
   return { applied: eligible.length, feeName, amount: fee.amount, students: eligible.map((s) => s.id) };
 }
 
+/**
+ * Remove the structural CHARGE rows billing a set of override fees, leaving the
+ * payments alone.
+ *
+ * The override-side twin of deleteLevelFeeCharges, and it exists for the same
+ * reason. LedgerEntry.studentFeeOverrideId was ON DELETE CASCADE, which meant
+ * deleting an override fee deleted the PAYMENTS made against it as well as the
+ * charges — 51 of the receipted payments on this system hang off an override, and
+ * detaching or re-billing a student deletes override rows routinely.
+ *
+ * The FK is SET NULL now, so no payment can be destroyed that way. But SET NULL
+ * cannot tell a charge from a payment, and an orphaned structural charge comes
+ * back through feeKeyOf() as a one-off debt the family does not owe. So the
+ * charges are removed explicitly, here, and only the charges.
+ *
+ * NO RE-POINTING BY NAME. Unlike the class-level copy, an override fee being
+ * deleted is not being replaced by an equivalent — the student is either losing
+ * that category or leaving the override structure entirely, and in the latter
+ * case retagPaymentsBetweenFeeStructures has already moved the payments to the
+ * class-level side before this runs.
+ */
+async function deleteOverrideFeeCharges(prisma, schoolId, overrideIds) {
+  if (!overrideIds.length) return { chargesDeleted: 0 };
+  const { count } = await prisma.ledgerEntry.deleteMany({
+    where: {
+      schoolId,
+      type: 'CHARGE',
+      isFeeStructureCharge: true,
+      studentFeeOverrideId: { in: overrideIds },
+    },
+  });
+  return { chargesDeleted: count };
+}
+
 module.exports = {
   retagPaymentsBetweenFeeStructures,
   syncStudentOverrideCharges,
   setStudentFeeOverride,
   removeStudentFeeOverride,
   applyLevelFeeToOverriddenStudents,
+  deleteOverrideFeeCharges,
 };

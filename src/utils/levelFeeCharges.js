@@ -30,8 +30,8 @@ const genCode = (prefix) => `${prefix}${Math.random().toString(36).slice(2, 7).t
  * student's history littered with adjustment rows and make "what is this level's
  * fee?" a question you had to sum up rather than read.
  *
- * Deleting a fee removes its charges via the FK's ON DELETE CASCADE, so this
- * function does not need to clean those up.
+ * Deleting a fee no longer removes its charges by itself — see
+ * deleteLevelFeeCharges below, which every deletion site must call first.
  */
 async function syncLevelFeeCharges(prisma, schoolId, classLevel) {
   const fees = await prisma.classLevelFee.findMany({
@@ -182,4 +182,135 @@ async function syncStudentFeeCharges(prisma, schoolId, studentId) {
   return syncLevelFeeCharges(prisma, schoolId, level);
 }
 
-module.exports = { syncLevelFeeCharges, syncStudentFeeCharges };
+/**
+ * Remove the structural CHARGE rows billing a set of class-level fees, and
+ * re-point the PAYMENTS made against those fees at their replacements by name.
+ *
+ * CALL THIS IMMEDIATELY BEFORE DELETING ANY ClassLevelFee. It is not optional
+ * and it is not a tidy-up: it is the half of the old ON DELETE CASCADE that is
+ * still wanted.
+ *
+ * WHY THE CASCADE HAD TO GO. LedgerEntry.classLevelFeeId used to be ON DELETE
+ * CASCADE, so deleting a fee deleted every row pointing at it — the structural
+ * charges, which was intended, AND the PAYMENTS, which was catastrophic and
+ * unnoticed. An ordinary "copy this level's fee structure onto another level"
+ * deletes and recreates a level's fees, and it destroyed a real 50,000 FCFA
+ * payment whose parent was holding a delivered WhatsApp receipt quoting its
+ * number. The FK is now SET NULL, so no payment can ever be destroyed that way
+ * again.
+ *
+ * WHY THIS FUNCTION THEN HAS TO EXIST. SET NULL is indiscriminate — a foreign
+ * key cannot tell a CHARGE from a PAYMENT. Left to it, the structural charges
+ * would survive with a null fee link, and feeKeyOf() returning null puts them in
+ * computeOwingByCategory's `oneOffs` bucket: they would come back as one-off
+ * debts families do not owe. Measured on live data at the time of the change,
+ * that was 2,017,500 FCFA of debt invented out of nothing. So the charges are
+ * deleted explicitly here, and only the charges.
+ *
+ * WHY IT ALSO RE-POINTS PAYMENTS. A payment orphaned by SET NULL is not lost —
+ * untaggedPaid still counts it in totalPaid and still spends it — but it is
+ * spent oldest-first instead of against the category it was actually for, so a
+ * level whose fees were merely copied over would show every category unpaid
+ * while the money sat in a general pool. Matching BY NAME is the same join
+ * retagPaymentsBetweenFeeStructures already uses when a student moves between a
+ * class structure and a personal one: "Tuition" paid under the old fee becomes
+ * "Tuition" under the new one. A payment whose category has no counterpart is
+ * left to go untagged, which is the honest outcome — that category no longer
+ * exists.
+ *
+ * IT RETURNS THE ORPHANS RATHER THAN RE-POINTING THEM ITSELF, keyed by the name
+ * of the fee they were paid against. That is not indirection for its own sake:
+ * where a level's fees are being REPLACED the new rows cannot exist yet, because
+ * (schoolId, classLevel, name) is unique and the two generations share every
+ * name — the old rows have to be gone before the new ones can be written. So the
+ * caller deletes, creates, and then hands this map to repointPaymentsByName.
+ * Callers that are removing fees outright simply discard it, and those payments
+ * stay honestly untagged.
+ *
+ * @param {object} client     Prisma client or transaction client.
+ * @param {number} schoolId
+ * @param {number[]} feeIds   The fees about to be deleted.
+ * @returns {Promise<{ chargesDeleted: number, orphansByName: Map<string, number[]> }>}
+ */
+async function deleteLevelFeeCharges(client, schoolId, feeIds) {
+  if (!feeIds.length) return { chargesDeleted: 0, orphansByName: new Map() };
+
+  // The doomed fees' names, read while their names and ids are both still
+  // available. After the delete there is nothing left to match a payment on.
+  const doomed = await client.classLevelFee.findMany({
+    where: { schoolId, id: { in: feeIds } },
+    select: { id: true, name: true },
+  });
+  const nameOf = new Map(doomed.map((f) => [f.id, f.name]));
+
+  const payments = await client.ledgerEntry.findMany({
+    where: { schoolId, type: 'PAYMENT', classLevelFeeId: { in: feeIds } },
+    select: { id: true, classLevelFeeId: true },
+  });
+
+  const orphansByName = new Map();
+  for (const payment of payments) {
+    const name = nameOf.get(payment.classLevelFeeId);
+    if (!name) continue;
+    if (!orphansByName.has(name)) orphansByName.set(name, []);
+    orphansByName.get(name).push(payment.id);
+  }
+
+  // ONLY THE STRUCTURAL CHARGES. isFeeStructureCharge is what separates the rows
+  // syncLevelFeeCharges owns from an extra charge an admin raised by hand
+  // against the same category — that one is a real debt somebody entered
+  // deliberately, and it survives with a null fee link, exactly like a payment.
+  const { count: chargesDeleted } = await client.ledgerEntry.deleteMany({
+    where: { schoolId, type: 'CHARGE', isFeeStructureCharge: true, classLevelFeeId: { in: feeIds } },
+  });
+
+  return { chargesDeleted, orphansByName };
+}
+
+/**
+ * Point payments orphaned by a fee replacement at the fee that replaced them,
+ * matching BY NAME.
+ *
+ * The other half of deleteLevelFeeCharges, used only where a level's fees were
+ * REPLACED rather than removed — copying one level's structure onto another is
+ * the case. "Tuition" paid under the old fee becomes "Tuition" under the new
+ * one, which is the same join retagPaymentsBetweenFeeStructures already uses to
+ * move a student between a class structure and a personal one.
+ *
+ * Without this the payments would survive but go untagged, and the level would
+ * read as though every category on it were unpaid while the money sat in the
+ * general pool — technically counted, but wrong on every screen the office
+ * looks at.
+ *
+ * A name with no counterpart is LEFT ALONE. That category genuinely no longer
+ * exists on this level, and pointing its payments at some other fee would be
+ * inventing an attribution nobody made.
+ *
+ * @param {object} client
+ * @param {Map<string, number[]>} orphansByName  From deleteLevelFeeCharges.
+ * @param {object[]} replacements                [{ id, name }] of the new fees.
+ */
+async function repointPaymentsByName(client, orphansByName, replacements) {
+  if (!orphansByName?.size) return { retagged: 0, leftUntagged: 0 };
+  const idByName = new Map(replacements.map((f) => [f.name, f.id]));
+
+  let retagged = 0;
+  let leftUntagged = 0;
+  for (const [name, paymentIds] of orphansByName) {
+    const replacementId = idByName.get(name);
+    if (!replacementId) { leftUntagged += paymentIds.length; continue; }
+    const { count } = await client.ledgerEntry.updateMany({
+      where: { id: { in: paymentIds } },
+      data: { classLevelFeeId: replacementId },
+    });
+    retagged += count;
+  }
+  return { retagged, leftUntagged };
+}
+
+module.exports = {
+  syncLevelFeeCharges,
+  syncStudentFeeCharges,
+  deleteLevelFeeCharges,
+  repointPaymentsByName,
+};
