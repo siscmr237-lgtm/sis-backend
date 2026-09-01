@@ -22,8 +22,33 @@ const { requirePlatformFounder } = require('../roleGuards');
 const { displayNumber } = require('../utils/phoneNumber');
 const { sendFreeform } = require('../utils/twilioWhatsApp');
 const { replyWindow, threadKey, WINDOW_HOURS } = require('../utils/whatsappInbox');
+const { buildParentProfile, promptingSchool } = require('../utils/parentProfile');
+const { signLogoUrls } = require('../utils/schoolLogo');
 
 const router = express.Router();
+
+/**
+ * WHICH MOMENT "PROMPTED" IS RECKONED AGAINST: the thread's LATEST inbound
+ * message, not its first.
+ *
+ * The question the console asks is "what were they answering", and a thread is
+ * not one exchange — a parent who was sent a fee reminder in August and an
+ * absence notice in September has replied to both in the same thread, because
+ * WhatsApp threads by phone number and has no notion of which message a reply
+ * belongs to. Anchoring on the first inbound would caption the whole
+ * conversation with a school that last wrote months ago; anchoring on the
+ * latest says what the most recent thing they said was in answer to, which is
+ * what somebody opening the inbox is looking at.
+ *
+ * It is a GUESS either way, and it is labelled as one on screen. See
+ * utils/parentProfile.js.
+ */
+const promptAnchor = (inbound) => {
+  const last = inbound.reduce((latest, m) => (
+    !latest || new Date(m.receivedAt) > new Date(latest.receivedAt) ? m : latest
+  ), null);
+  return last ? new Date(last.receivedAt) : null;
+};
 
 /**
  * A conversation as the list shows it. Built from the inbound rows, because a
@@ -104,6 +129,40 @@ router.get('/', async (_req, res) => {
       .map(([key, b]) => conversationRow(key, b.inbound, b.outbound, b.matches))
       .sort((a, b) => new Date(b.lastMessageAt ?? 0) - new Date(a.lastMessageAt ?? 0));
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // The prompting school per row, and one signed logo URL per school.
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // The mobile list draws an avatar on every row, and School.logo is a private
+    // storage path rather than a URL, so something has to sign it. Done here,
+    // once for the distinct schools, rather than by the client calling
+    // /platform/schools/:id/logo-url per row — see utils/schoolLogo.js.
+    //
+    // ADDITIVE. Every field the desktop list already reads is untouched; these
+    // are new keys alongside them, so a client that ignores them behaves exactly
+    // as it did.
+    const prompts = await Promise.all(
+      conversations.map((c) => promptingSchool(c.phone, promptAnchor(byKey.get(c.phone).inbound))),
+    );
+
+    const promptSchoolIds = [...new Set(prompts.filter(Boolean).map((p) => p.schoolId))];
+    const schoolRows = promptSchoolIds.length
+      ? await prisma.school.findMany({
+        where: { id: { in: promptSchoolIds } },
+        select: { id: true, logo: true },
+      })
+      : [];
+    const logos = await signLogoUrls(schoolRows);
+
+    conversations.forEach((c, i) => {
+      const p = prompts[i];
+      // Null is a real answer — the parent wrote in unprompted — and the client
+      // says so in words rather than drawing an empty avatar.
+      c.promptingSchool = p
+        ? { ...p, logoUrl: logos.get(p.schoolId) ?? null }
+        : null;
+    });
+
     res.json({
       conversations,
       unreadTotal: conversations.reduce((n, c) => n + c.unreadCount, 0),
@@ -168,11 +227,38 @@ router.get('/:phone', async (req, res) => {
 
     const window = await replyWindow(key);
 
+    // The detail panel's data: every school this number matches with its child
+    // count, and which school prompted the conversation. Read live rather than
+    // from the stored match snapshot — see utils/parentProfile.js for why, and
+    // for why all of it is labelled as inferred rather than presented as fact.
+    const profile = await buildParentProfile({ phone: key, at: promptAnchor(inbound) });
+
+    // The header's avatar, and the panel's per-school logos. At most a handful
+    // of schools, signed in one pass.
+    const logoTargets = [
+      ...profile.schools.map((s) => s.schoolId),
+      ...(profile.promptingSchool ? [profile.promptingSchool.schoolId] : []),
+    ].filter((id) => Number.isInteger(id));
+    const schoolRows = logoTargets.length
+      ? await prisma.school.findMany({
+        where: { id: { in: [...new Set(logoTargets)] } },
+        select: { id: true, logo: true },
+      })
+      : [];
+    const logos = await signLogoUrls(schoolRows);
+
     res.json({
       phone: key,
       displayPhone: displayNumber(key),
       matches,
       messages,
+      profile: {
+        ...profile,
+        schools: profile.schools.map((s) => ({ ...s, logoUrl: logos.get(s.schoolId) ?? null })),
+        promptingSchool: profile.promptingSchool
+          ? { ...profile.promptingSchool, logoUrl: logos.get(profile.promptingSchool.schoolId) ?? null }
+          : null,
+      },
       // The reply box reads this. It is recomputed server-side at send time as
       // well — see the reply route — because a thread can sit open on a screen
       // for hours and the deadline passes while somebody is typing.

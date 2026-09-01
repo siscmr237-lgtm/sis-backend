@@ -1,0 +1,31 @@
+-- An index for "which school prompted this reply".
+--
+-- One index, no column added, no row read or rewritten. The Messages console
+-- asks utils/parentProfile.js, once per conversation on every load: what is the
+-- most recent message THIS NUMBER was sent, strictly before the parent wrote?
+-- Until now WhatsAppMessage had no index on toNumber at all — it is indexed by
+-- student, by school-and-date, by ledger entry and by Twilio SID, because every
+-- previous reader of this table came at it from the student's side.
+--
+-- COMPOSITE, AND THE COLUMN ORDER IS THE POINT. The query is an equality on
+-- toNumber with an ordering on createdAt:
+--
+--   WHERE "toNumber" = $1 AND "createdAt" < $2 ORDER BY "createdAt" DESC LIMIT 1
+--
+-- Leading with toNumber narrows to one number's sends; createdAt then supplies
+-- the ordering within that group, so the planner walks straight to the answer
+-- instead of sorting everything the number was ever sent. The reverse order
+-- would index the whole table by time and make the number a filter applied
+-- afterwards, which is the same scan with extra steps.
+--
+-- ADDED WHILE THE TABLE IS TINY — seventeen rows at the time of writing, where
+-- this changes nothing anybody could measure. It is here for the shape the
+-- query has rather than for its cost today: the console runs it once PER
+-- CONVERSATION, so without an index the work grows with the messages sent
+-- multiplied by the conversations open, and the first anyone would notice is
+-- an inbox that had quietly become slow.
+--
+-- IF NOT EXISTS, like every other guard in this directory, so the file is
+-- re-runnable and a database where it was applied by hand is not a conflict.
+CREATE INDEX IF NOT EXISTS "WhatsAppMessage_toNumber_createdAt_idx"
+    ON "WhatsAppMessage"("toNumber", "createdAt");

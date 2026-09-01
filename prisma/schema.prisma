@@ -1475,6 +1475,21 @@ model WhatsAppMessage {
   @@index([ledgerEntryId])
   @@index([paymentBatchId])
   @@index([schoolId, referenceDate])
+  /// "WHICH SCHOOL PROMPTED THIS REPLY" — the inbox's lookup, and the only
+  /// query that reads this table by the number rather than by the student.
+  ///
+  /// utils/parentProfile.js asks, once per conversation on every load of the
+  /// Messages console: the most recent send to THIS number STRICTLY BEFORE the
+  /// parent's message. Composite and in this order because that is exactly the
+  /// shape of it — an equality on toNumber narrows to one number's sends, and
+  /// createdAt then supplies the ordering, so the answer is the first row read
+  /// rather than a sort over everything that number was ever sent.
+  ///
+  /// Added when the table held seventeen rows, where it changes nothing
+  /// measurable. It is here for the shape it will be later: the console reads
+  /// this once per conversation, so an unindexed scan would grow with the
+  /// product of the messages sent and the conversations open.
+  @@index([toNumber, createdAt])
   @@index([twilioSid])
 }
 
