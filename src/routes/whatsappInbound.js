@@ -29,6 +29,18 @@ const { matchPhoneToStudents, threadKey } = require('../utils/whatsappInbox');
 const router = express.Router();
 
 /**
+ * The success answer: an EMPTY TwiML document.
+ *
+ * Empty is the important word. A non-empty TwiML body is an instruction to
+ * Twilio to reply to the parent on our behalf, so anything accidentally left in
+ * here would send a stray message to a real family. The content type matters
+ * too: Twilio parses the response as TwiML when told to, and this says "nothing
+ * to send back".
+ */
+const respondEmpty = (res) =>
+  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+
+/**
  * THE BODY PARSER IS ON THE ROUTE, and it runs BEFORE validation.
  *
  * Two separate reasons, both load-bearing:
@@ -64,22 +76,30 @@ router.post('/', express.urlencoded({ extended: false }), async (req, res) => {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 2. Answer 200 immediately, then do the work.
+  // 2. STORE THE MESSAGE, AND ONLY THEN ANSWER.
   // ─────────────────────────────────────────────────────────────────────────
   //
-  // Same reasoning as the status callback: Twilio retries anything that is not a
-  // 200, with backoff. A slow or failing write here does not lose the message —
-  // it turns one webhook into a queue of duplicates while the real problem is
-  // somewhere else entirely. The work below is best-effort and its failure is
-  // logged rather than returned.
+  // THIS ORDER IS NOT NEGOTIABLE ON SERVERLESS, and it was written the other way
+  // round first. The sibling route /whatsapp/status answers 200 immediately and
+  // does its work afterwards, on the reasoning that Twilio retries a non-200 and
+  // a slow write should not turn one callback into a queue of duplicates. That
+  // reasoning is sound on a server that keeps running after it replies.
   //
-  // An empty TwiML document rather than JSON. A non-empty TwiML body is an
-  // instruction to Twilio to reply to the parent on our behalf, and an accidental
-  // one would send a stray message to a real family. Content-Type matters:
-  // Twilio parses the response as TwiML when told to, and this says "I have
-  // nothing to send back."
-  res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
-
+  // This API runs as Vercel functions, which are SUSPENDED once the response is
+  // sent. Work scheduled after res.send() may simply never happen. Measured
+  // against production: three signed webhooks, three 200s, and zero rows stored.
+  // The parent's message was gone, and the endpoint looked healthy from outside
+  // — which is the worst possible combination.
+  //
+  // So the write is awaited. It is one indexed lookup and one insert, well
+  // inside Twilio's own timeout, and the cost of the extra few hundred
+  // milliseconds is nothing against losing what a family said.
+  //
+  // A FAILURE ANSWERS 500 SO TWILIO RETRIES. That is the opposite of the status
+  // route's choice and deliberately so: a dropped status update is recoverable —
+  // another one follows, and it is only metadata — while a dropped inbound
+  // message is gone for good. Retries are safe here because twilioSid is unique,
+  // so a replay of one already stored is a no-op rather than a duplicate.
   try {
     const twilioSid = String(req.body?.MessageSid ?? req.body?.SmsSid ?? '').trim();
     const fromRaw = String(req.body?.From ?? '').trim();
@@ -89,8 +109,10 @@ router.post('/', express.urlencoded({ extended: false }), async (req, res) => {
     const body = String(req.body?.Body ?? '');
 
     if (!twilioSid || !fromRaw) {
+      // Nothing to store and nothing a retry would fix, so this one IS a 200 —
+      // making Twilio redeliver a malformed payload forever helps nobody.
       console.warn('whatsapp/inbound: a validly-signed request had no MessageSid or From');
-      return;
+      return respondEmpty(res);
     }
 
     // NORMALISED WITH THE SAME FUNCTION EVERY OUTGOING SEND USES, so a reply
@@ -120,12 +142,18 @@ router.post('/', express.urlencoded({ extended: false }), async (req, res) => {
         });
       }
     });
+
+    return respondEmpty(res);
   } catch (e) {
     if (e?.code === 'P2002') {
-      // The retry case. Expected, frequent, and not a problem.
-      return;
+      // Twilio replaying something already stored. Expected, frequent, and
+      // exactly what the unique index is for — a 200, not a retry.
+      return respondEmpty(res);
     }
+    // Anything else: say so, and let Twilio bring it back. Better a redelivery
+    // than a parent's message quietly lost.
     console.error('whatsapp/inbound: could not store an inbound message —', e.code || e.message);
+    return res.status(500).json({ error: 'Could not store the message.' });
   }
 });
 

@@ -566,16 +566,30 @@ statusRouter.post('/:secret', express.urlencoded({ extended: false }), async (re
   const ok = expected.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
   if (!ok) return res.status(404).json({ error: 'Not found' });
 
-  // ALWAYS 200, and always quickly. Twilio retries a non-200 with backoff, so a
-  // failure here does not lose the update — it turns one callback into a queue
-  // of duplicates, for every message, while the real problem is elsewhere. The
-  // work below is best-effort and its failure is logged, not returned.
-  res.status(200).json({ ok: true });
-
+  // ALWAYS 200, whatever happens below. Twilio retries a non-200 with backoff,
+  // so a failure here does not lose the update — it turns one callback into a
+  // queue of duplicates, for every message, while the real problem is elsewhere.
+  // A delivery status is also recoverable in a way an inbound message is not:
+  // another callback follows, and it is only metadata. So the failure is logged,
+  // not returned.
+  //
+  // BUT THE WORK IS AWAITED FIRST, and that part is not optional. This used to
+  // answer and then work, which is safe only on a server that keeps running
+  // after it replies. This API runs as Vercel functions, which are SUSPENDED
+  // once the response is sent, so work scheduled afterwards may never happen —
+  // measured, on the sibling inbound route: three requests, three 200s, zero
+  // rows written. Every delivery update this route exists to record was being
+  // dropped in exactly the same way, and the endpoint looked perfectly healthy
+  // from outside.
+  //
+  // The work is two indexed updates. Awaiting it costs a few hundred
+  // milliseconds and is the difference between the message log being true and
+  // being decorative.
   try {
     const sid = String(req.body?.MessageSid ?? req.body?.SmsSid ?? '').trim();
     const status = String(req.body?.MessageStatus ?? req.body?.SmsStatus ?? '').trim();
-    if (!sid || !status) return;
+    // Nothing to record, and nothing a retry would fix.
+    if (!sid || !status) return res.status(200).json({ ok: true });
 
     const rawCode = String(req.body?.ErrorCode ?? '').trim();
     const errorCode = rawCode && rawCode !== '0' ? rawCode : null;
@@ -615,8 +629,12 @@ statusRouter.post('/:secret', express.urlencoded({ extended: false }), async (re
     if (!templates.count && !replies.count) {
       console.warn(`whatsapp/status: no row for MessageSid ${sid}`);
     }
+    return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('whatsapp/status: could not record a delivery update —', e.code || e.message);
+    // Still 200 — see above. A retry storm over a database blip would be worse
+    // than the lost update, and the next status change brings a fresh callback.
+    return res.status(200).json({ ok: true });
   }
 });
 
