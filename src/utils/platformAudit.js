@@ -103,6 +103,24 @@ const ACTIONS = {
    * question the log has to answer is no longer just "who opened it, and when"
    * but "who closed it again, and why did they have to".
    */
+  /**
+   * The OTP step waived for a school that signed up and never got past it.
+   *
+   * Its own action, and the one in this file that records a CREDENTIAL FACT
+   * being asserted rather than a status being moved. The column it writes is
+   * AdminUser.emailVerified, which until now only that account could set, and
+   * only by reading a code sent to the address itself. After this row exists,
+   * the platform has said the address is theirs on their behalf -- so the
+   * detail carries the address, which is the only thing that makes the claim
+   * checkable afterwards.
+   *
+   * Kept apart from SCHOOL_APPROVED for the same reason approve and revert are
+   * kept apart: flattening them into one "status changed" would make "did
+   * anybody ever prove this email?" unanswerable without reading every detail
+   * column in the table.
+   */
+  SCHOOL_EMAIL_VERIFICATION_WAIVED: 'school.email_verification_waived',
+
   SCHOOL_APPROVED: 'school.approved',
   SCHOOL_REVERTED_TO_PENDING: 'school.reverted_to_pending',
 

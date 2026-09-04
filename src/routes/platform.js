@@ -372,6 +372,140 @@ router.get('/schools/:id/logo-url', async (req, res) => {
 });
 
 /**
+ * POST /platform/schools/:id/skip-email-verification
+ *
+ * The step BEFORE approve: a school that filled in the signup form and never
+ * came back with the code from its inbox, moved on by hand.
+ *
+ * WHY THE BUTTON EXISTS. Every signup writes its real AdminUser and School the
+ * moment the form is submitted — nothing is held back waiting on an OTP — so a
+ * school that never opens the email is not lost, it is sitting in the console
+ * marked Failed Registration with everything it typed. What it cannot do is
+ * move: routeForSnapshot in the client sends any admin whose email is unproven
+ * to /school/verify-email whatever their status column says, so the school is
+ * held at the code screen and its details page is unreachable. That happens for
+ * reasons that have nothing to do with the school — a code in a spam folder, a
+ * mistyped address they can no longer receive at, an address that was right and
+ * a provider that dropped the message — and it is the team, not the school, who
+ * can see it has happened.
+ *
+ * TWO WRITES, and both are needed to actually move anybody:
+ *
+ *   AdminUser.emailVerified -> true. This is the one that unblocks the school,
+ *   because it is what the client gate checks first and what /auth/otp/*
+ *   refuses a second run of.
+ *
+ *   School FAILED -> INCOMPLETE. The same transition POST /auth/otp/verify-
+ *   signup owns, expressed the same way — an updateMany with the status in the
+ *   WHERE clause, so the database decides it and a school that is already
+ *   PENDING or APPROVED cannot be dragged backwards by this call, whatever
+ *   raced it.
+ *
+ * The two together land the school on /school/onboarding: the details form,
+ * which is where a signup that had gone normally would have arrived. Nothing
+ * here approves anything — INCOMPLETE still has to become PENDING by the
+ * school submitting its details, and PENDING still has to be approved by a
+ * person. This route skips one step and only that one.
+ *
+ * NOT FOUNDER-ONLY, matching approve and revert. What it grants is the right to
+ * fill in a form, and every school on the other end of it is one the team can
+ * already see, approve, or delete outright.
+ *
+ * IT IS AUDITED WITH THE ADDRESS. This is the only route in the console that
+ * asserts a credential fact on somebody's behalf: after it, the row says the
+ * address is proven when nobody proved it. Recording which address was waived
+ * is what makes that checkable later — see SCHOOL_EMAIL_VERIFICATION_WAIVED.
+ *
+ * AN ALREADY-VERIFIED ACCOUNT IS REFUSED rather than quietly re-verified. There
+ * is no such thing as verifying an email twice, so a call for one is a console
+ * looking at a stale page, and answering it with the true state is more use
+ * than a success that changed nothing. That is the opposite of approve's
+ * alreadyApproved, and deliberately: two people clicking Approve at once both
+ * meant the same thing, whereas this arrives when the school has in the
+ * meantime gone and read its own email.
+ */
+router.post('/schools/:id/skip-email-verification', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Bad id.' });
+
+  try {
+    const school = await prisma.school.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        name: true,
+        registrationStatus: true,
+        // THE OWNER, which is the only account this route may touch. School
+        // .adminUserId is a single required relation, so there is exactly one
+        // and no way to name a different account through this endpoint. The
+        // invited administrators under School.admins are deliberately out of
+        // reach: they never went through signup and have no OTP step to skip.
+        adminUser: { select: { id: true, name: true, email: true, emailVerified: true } },
+      },
+    });
+    if (!school) return res.status(404).json({ error: 'School not found.' });
+
+    const owner = school.adminUser;
+    // Read ONCE, before either write. Both the response and the audit row
+    // report where this school came FROM, and reading that off the loaded
+    // record after the updateMany has run makes the answer depend on whether
+    // the record is a snapshot or a live view of the row -- a distinction
+    // nothing else here has to care about, and one that would change the
+    // meaning of the audit trail if it ever moved.
+    const statusBefore = school.registrationStatus;
+    if (!owner) {
+      return res.status(409).json({
+        code: 'NO_OWNER',
+        error: 'This school has no owning account, so there is no email to verify.',
+      });
+    }
+
+    if (owner.emailVerified) {
+      return res.status(409).json({
+        code: 'ALREADY_VERIFIED',
+        error: 'This account has already verified its email.',
+        registrationStatus: statusBefore,
+      });
+    }
+
+    await prisma.adminUser.update({
+      where: { id: owner.id },
+      data: { emailVerified: true },
+    });
+
+    // FAILED only. An unverified email on any other status is a school that
+    // got further before something went odd, and the honest answer there is to
+    // leave the status where it is: the email write above is what was actually
+    // holding them, and this one has nothing left to correct.
+    const { count } = await prisma.school.updateMany({
+      where: { id, registrationStatus: 'FAILED' },
+      data: { registrationStatus: 'INCOMPLETE' },
+    });
+
+    const registrationStatus = count > 0 ? 'INCOMPLETE' : statusBefore;
+
+    await recordAudit(req, ACTIONS.SCHOOL_EMAIL_VERIFICATION_WAIVED, {
+      target: `school:${id}`,
+      detail: {
+        name: school.name,
+        adminUserId: owner.id,
+        // The address nobody proved. Not a secret — the console shows it on the
+        // school page — and without it this row cannot be checked against
+        // anything later.
+        email: owner.email,
+        from: statusBefore,
+        to: registrationStatus,
+      },
+    });
+
+    res.json({ advanced: true, emailVerified: true, registrationStatus });
+  } catch (e) {
+    console.error('platform /schools/:id/skip-email-verification failed', e.code || e.message);
+    res.status(503).json({ code: 'SERVER_UNAVAILABLE', error: 'Could not move this school past email verification.' });
+  }
+});
+
+/**
  * POST /platform/schools/:id/approve
  *
  * The decision that opens a school's dashboard. The only write in this file
