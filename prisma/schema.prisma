@@ -169,6 +169,8 @@ model Staff {
   /// WHO ADDED THIS STAFF MEMBER. See the note on AdminUser.role.
   /// This person's own daily submissions. See the StaffAttendance model.
   staffAttendance StaffAttendance[]
+  /// The student register rows this person took. See AttendanceRecord.
+  markedAttendance AttendanceRecord[] @relation("AttendanceRecordMarkedByTeacher")
 
   /// The browsers this teacher has granted notification permission on. One row
   /// per DEVICE, not per account — see PushSubscription.
@@ -238,6 +240,30 @@ model AttendanceRecord {
   createdByAdminId Int?
   createdByName    String?
 
+  /// WHICH TEACHER TOOK THIS STUDENT'S REGISTER, as a real foreign key rather
+  /// than the name string above.
+  ///
+  /// NULL means a school admin recorded it directly, and that is the whole
+  /// reason this exists: the rejection cascade has to be able to find exactly
+  /// the rows one teacher wrote on one day and delete only those. createdByName
+  /// cannot do that job — it is a display string, it is null on every row
+  /// written before attribution existed, and two teachers can share a name.
+  ///
+  /// ON DELETE SET NULL: a staff member leaving must not delete the register
+  /// they took. The row survives as "recorded by nobody we still have", which
+  /// is the honest answer and also makes it immune to the cascade.
+  markedByTeacher        Staff? @relation("AttendanceRecordMarkedByTeacher", fields: [markedByTeacherStaffId], references: [id], onDelete: SetNull)
+  markedByTeacherStaffId Int?
+
+  /// TRUE once a school admin has marked or changed this row by hand.
+  ///
+  /// A latch, never cleared. It is what protects an admin's correction from
+  /// being swept away when the teacher's submission for that day is later
+  /// rejected — see POST /staff-attendance/:id/reject, which deletes only rows
+  /// where this is false. An admin who has looked at a student and made a
+  /// decision outranks a claim the school has just refused.
+  adminOverride          Boolean @default(false)
+
   /// One record per person per DAY. Attendance is a yes/no fact about a date, so
   /// a second row for the same person and day is never a second fact — it is a
   /// duplicate that double-counts in every percentage derived from it, including
@@ -250,6 +276,8 @@ model AttendanceRecord {
   @@index([schoolId, date])
   @@index([schoolId, personId])
   @@index([createdByAdminId])
+  /// The rejection cascade's query, exactly: one teacher's rows on one day.
+  @@index([markedByTeacherStaffId, date])
 }
 
 /// Whether a staff member was at work. Two values, deliberately: this is the
@@ -272,6 +300,13 @@ enum StaffAttendanceApproval {
   PENDING
   APPROVED
   REJECTED
+  /// Nobody answered before the day closed. The midnight-WAT sweep in
+  /// src/routes/cron.js sets this, and it is a DISTINCT value rather than
+  /// APPROVED-with-a-null-approver because the screens have to be able to say
+  /// which of the two happened without inferring it from a pair of other
+  /// columns. A teacher marking themselves ABSENT also lands here directly:
+  /// an absence is not a claim anybody needs to agree to.
+  AUTO_APPROVED
 }
 
 /// A STAFF MEMBER'S OWN SUBMISSION for one day, and what became of it.
@@ -299,7 +334,25 @@ model StaffAttendance {
   /// the same calendar day, which is the one thing it exists to prevent.
   date           DateTime
   status         StaffAttendanceStatus
-  /// WHEN IT WAS SUBMITTED, and the only clock the 48-hour auto-approval reads.
+  /// THE MOMENT THE PERSON INDICATED THEY WERE HERE — not when the row was
+  /// written, and not the start of the school day. NULL for an ABSENT record,
+  /// where there is no arrival to record, and NULL is therefore meaningful
+  /// rather than missing: a PRESENT row without one predates this column.
+  ///
+  /// Set to now() both when a teacher taps "I am present today" and when an
+  /// admin marks them present from the Staff Attendance tab. In the second case
+  /// it is the moment the OFFICE recorded it, which is the only arrival time
+  /// anybody actually knows — markedByAdmin below is what tells the two apart.
+  arrivalTime    DateTime?
+  /// TRUE when the school recorded this ABOUT somebody rather than the person
+  /// submitting it themselves. Such a row needs no approval — the school is
+  /// already the approver — so it is written APPROVED and never sits PENDING.
+  ///
+  /// This is the column that replaces the old parallel register of
+  /// AttendanceRecord rows with type = 'staff'. One table now answers "was this
+  /// person at work", with a flag saying who said so.
+  markedByAdmin  Boolean                 @default(false)
+  /// WHEN IT WAS SUBMITTED, and the only clock the older 48-hour sweep read.
   /// Deliberately its own column rather than leaning on createdAt: createdAt is
   /// a row-lifecycle timestamp that any future backfill, import or repair would
   /// move, and moving it would silently reset somebody's approval window.

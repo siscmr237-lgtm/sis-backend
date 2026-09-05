@@ -95,21 +95,29 @@ async function checkNoStudents(prisma, school, now) {
 
 // ── 3. attendance_pending ───────────────────────────────────────────────────
 /**
- * Staff attendance submissions that have been PENDING for more than 24 hours.
+ * Staff attendance submissions still waiting on a decision, hours before the
+ * day closes on them.
  *
- * ADMINS ONLY. Approving is the owner's job, and a teacher's phone buzzing about
+ * ADMINS ONLY. Deciding is the school's job, and a teacher's phone buzzing about
  * approvals they cannot give is noise that teaches people to ignore the app.
  *
- * The 24-hour threshold is deliberately SHORTER than the 48-hour auto-approval
- * window in ./staffAttendance.js, and that relationship is the whole design: the
- * reminder has to arrive while the school can still act. Reminding at 48 hours
- * would arrive as the sweep was approving the rows anyway, which is not a
- * reminder, it is a notification that the decision has been taken away.
+ * THE WINDOW MUST BE SHORTER THAN THE REST OF THE SCHOOL DAY, and that
+ * relationship is the whole design: the reminder has to arrive while the school
+ * can still act. It used to be 24 hours against a 48-hour auto-approval window;
+ * both numbers changed when approval moved to a midnight sweep, and 24 hours
+ * against a same-day close would have meant this reminder could never fire at
+ * all — every row it looked for had been closed the night before.
+ *
+ * THREE HOURS, READ BY THE AFTERNOON JOB. That job runs at 14:00 WAT, so this
+ * catches anything submitted before 11:00 — the morning's registers — and leaves
+ * most of the working day to answer them before midnight closes them
+ * automatically. It is deliberately NOT in the 07:00 job any more: at seven in
+ * the morning there is nothing to be pending yet.
  *
  * PENDING_REMINDER_HOURS is exported so the admin screen can name the same
  * number if it ever wants to.
  */
-const PENDING_REMINDER_HOURS = 24;
+const PENDING_REMINDER_HOURS = 3;
 
 async function checkAttendancePending(prisma, school, now) {
   const cutoff = new Date(now.getTime() - PENDING_REMINDER_HOURS * 60 * 60 * 1000);

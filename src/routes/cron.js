@@ -3,11 +3,11 @@ const { prisma } = require('../db/prisma');
 const { advanceYearIfDue } = require('../utils/academicYear');
 const { applyTermEndZeros } = require('../utils/termEndZeros');
 const {
-  AUTO_APPROVE_AFTER_HOURS,
-  autoApproveCutoff,
-  autoApproveOverdue,
+  closingDay,
+  autoApprovePendingThrough,
   autoApproveOverdueQuietly,
 } = require('../utils/staffAttendance');
+const { toDayKey } = require('../utils/attendanceDay');
 const {
   checkIncompleteSetup,
   checkNoStudents,
@@ -215,10 +215,24 @@ router.get('/apply-term-end-zeros', async (req, res) => {
 });
 
 /**
- * GET /cron/auto-approve-staff-attendance
+ * GET /cron/auto-approve-staff-attendance   —   23:00 UTC = 00:00 WAT
  *
- * A staff attendance submission the school never answered is taken as accepted
- * once it has waited 48 hours. This is what does that.
+ * MIDNIGHT CLOSES THE DAY. A submission the school never answered before the
+ * school day ended is taken as accepted, and this is what does that.
+ *
+ * A DAY, NOT A WAITING PERIOD. This replaced a 48-hour timer, and the change
+ * matters: a timer meant Monday's register could still be sitting PENDING on
+ * Wednesday, so "was this teacher in on Monday" had no answer for two days.
+ * Closing at midnight means every past day is settled, always, and the calendar
+ * on the admin screen can colour a cell without qualifying it.
+ *
+ * TEACHERS WHO SUBMITTED NOTHING GET NO ROW. There is deliberately no
+ * create-the-missing-absences pass here. A row in this table is a statement
+ * somebody made; nobody made one, and inventing an ABSENT record would put words
+ * in their mouth and hand the school a record it never took. The calendar shows
+ * a dash for them, which is the honest rendering of "no record", and the Staff
+ * Attendance tab offers Mark Present / Mark Absent for an admin who wants to
+ * turn that dash into a fact.
  *
  * NOT PROTECTED BY A ROLE — protected by CRON_SECRET, like its two neighbours,
  * and that distinction is the whole reason this router is mounted ABOVE
@@ -227,9 +241,16 @@ router.get('/apply-term-end-zeros', async (req, res) => {
  * refused for not holding a secret only the scheduler has. Which also means a
  * teacher cannot approve their own submission early by finding this URL.
  *
- * submittedAt is the ONLY clock read. createdAt is a row-lifecycle timestamp
- * that a backfill, an import or a repair would move, and moving it would
- * silently reset somebody's window — see autoApproveOverdue.
+ * THE DATE COLUMN IS THE CLOCK, not submittedAt. What decides whether a
+ * submission is closed is which DAY it was for, and whether that day is over —
+ * not how long the row has been sitting there. A teacher who submits Monday's
+ * register late on Monday evening is closed at Monday midnight along with
+ * everyone else, which is the point.
+ *
+ * The sweep takes everything up to AND INCLUDING the closing day, so a night
+ * the scheduler did not fire repairs itself on the next successful run. Nothing
+ * else ever revisits a past day, so without that a single missed run would leave
+ * a day PENDING forever.
  *
  * ONE updateMany across every school rather than a per-school loop, because
  * unlike the two jobs above there is nothing school-specific to decide: the
@@ -237,15 +258,17 @@ router.get('/apply-term-end-zeros', async (req, res) => {
  * — whichever runs first moves the rows out of PENDING and the rest match
  * nothing.
  *
- * NOT ON A VERCEL SCHEDULE OF ITS OWN. It wants to run hourly, and this
- * project's plan would not take a third scheduled job: adding one had the
- * deployment refused outright rather than merely losing the schedule. So the
- * sweep is invoked from three places instead, and this endpoint stays as the
- * one an external scheduler or a person can call directly:
+ * INVOKED FROM THREE PLACES, because this project's plan would not take another
+ * Vercel schedule — adding one had the deployment refused outright rather than
+ * merely losing the schedule:
  *
+ *   an external scheduler at 23:00 UTC     this endpoint, with CRON_SECRET
  *   the nightly apply-term-end-zeros job   guarantees it for a school nobody opened
  *   every admin/teacher read of staff attendance   covers a school anybody is using
- *   this endpoint                          for anything else, with CRON_SECRET
+ *
+ * The last two use autoApproveOverdueQuietly, which sweeps only days STRICTLY
+ * BEFORE today — a read path must never close a day an admin is at that moment
+ * looking at in order to approve.
  */
 router.get('/auto-approve-staff-attendance', async (req, res) => {
   if (!authorised(req)) {
@@ -255,17 +278,17 @@ router.get('/auto-approve-staff-attendance', async (req, res) => {
 
   const startedAt = new Date();
   try {
-    const approved = await autoApproveOverdue(prisma, startedAt);
+    const day = closingDay(startedAt);
+    const approved = await autoApprovePendingThrough(prisma, day, startedAt);
     const summary = {
       ok: true,
       startedAt,
       finishedAt: new Date(),
-      windowHours: AUTO_APPROVE_AFTER_HOURS,
-      cutoff: autoApproveCutoff(startedAt),
+      closedThrough: toDayKey(day),
       approved,
     };
     console.log(
-      `cron/auto-approve-staff-attendance: ${approved} submission(s) approved after ${AUTO_APPROVE_AFTER_HOURS}h`,
+      `cron/auto-approve-staff-attendance: ${approved} submission(s) auto-approved through ${toDayKey(day)}`,
     );
     return res.json(summary);
   } catch (e) {
@@ -447,7 +470,11 @@ router.get('/', async (req, res) => {
     try {
       await runCheck(tally, 'incomplete_setup', () => checkIncompleteSetup(prisma, school, startedAt));
       await runCheck(tally, 'no_students', () => checkNoStudents(prisma, school, startedAt));
-      await runCheck(tally, 'attendance_pending', () => checkAttendancePending(prisma, school, startedAt));
+      // attendance_pending is NOT here: it moved to the afternoon job when
+      // approval became a midnight sweep. At 07:00 WAT nothing has been
+      // submitted yet, and everything from yesterday was closed at midnight —
+      // so this check could only ever have reported nothing. See the note on
+      // PENDING_REMINDER_HOURS in src/utils/reminderChecks.js.
       await runCheck(tally, 'outstanding_fees', () => checkOutstandingFees(prisma, school, startedAt));
       await runCheck(tally, 'payroll_not_run', () => checkPayrollNotRun(prisma, school, startedAt));
       await runCheck(tally, 'academic_year_transition', () => checkAcademicYearTransition(prisma, school, startedAt));
@@ -531,6 +558,10 @@ router.get('/afternoon', async (req, res) => {
         checkAttendanceNotRecorded(prisma, school, startedAt),
       );
       teachersMissing += result?.teachersMissing ?? 0;
+      // The other half of the same question, and the reason both live at 14:00:
+      // who has not recorded their day, and whose record nobody has answered.
+      // Both still have the rest of the afternoon to be acted on.
+      await runCheck(tally, 'attendance_pending', () => checkAttendancePending(prisma, school, startedAt));
     } catch (e) {
       failedSchools.push({ schoolId: school.id, code: e.code || null, message: e.message });
       console.error(`cron/afternoon: school ${school.id} FAILED —`, e.code || e.message);

@@ -9,6 +9,7 @@ const {
   startOfDayUTC, toDayKey, eachDay, termRange, consistencyOf,
   CONSISTENCY_CUTOFF, MAX_RANGE_DAYS, TERMS,
 } = require('../utils/attendanceDay');
+const { watDay, staffName } = require('../utils/staffAttendance');
 const { classLevelOf } = require('../utils/classLevels');
 
 const router = express.Router();
@@ -328,10 +329,26 @@ router.post('/mark', async (req, res) => {
     // exactly the people hired to take it. The single-record edit paths further
     // down (PUT /:id, DELETE /:id) are where that rule belongs, and where it is.
     //
-    // Attribution is therefore written on CREATE only. The update branch leaves
-    // both columns alone, so "Done by …" keeps naming whoever first recorded
-    // that day rather than whoever last touched it.
+    // The DISPLAY attribution is therefore written on CREATE only. The update
+    // branch leaves both columns alone, so "Done by …" keeps naming whoever
+    // first recorded that day rather than whoever last touched it.
+    //
+    // THE TWO STRUCTURAL COLUMNS BELOW ARE DIFFERENT and are rewritten every
+    // time. They are not credit, they are what other code keys on:
+    //
+    //   markedByTeacherStaffId   what the rejection cascade deletes by. It has
+    //                            to name whoever stands behind the row AS IT NOW
+    //                            READS, or rejecting a teacher would spare rows
+    //                            they had just overwritten.
+    //   adminOverride            a latch that protects an admin's correction
+    //                            from that same cascade. Set true whenever an
+    //                            admin writes here, and — being a latch — never
+    //                            set back to false by a teacher's later save.
     const attribution = attributionFor(req);
+    const teacher = isTeacher(req.user);
+    const structural = teacher
+      ? { markedByTeacherStaffId: req.user.id }
+      : { markedByTeacherStaffId: null, adminOverride: true };
     const ops = records.map((r) => {
       const s = byCode.get(String(r.studentId));
       const status = r.present ? 'present' : 'absent';
@@ -341,7 +358,7 @@ router.post('/mark', async (req, res) => {
             schoolId, type: 'student', personId: s.code, date: day,
           },
         },
-        update: { status, personName: `${s.firstName} ${s.lastName}`.trim() },
+        update: { status, personName: `${s.firstName} ${s.lastName}`.trim(), ...structural },
         create: {
           code: genCode('ATT'),
           schoolId,
@@ -350,6 +367,8 @@ router.post('/mark', async (req, res) => {
           personName: `${s.firstName} ${s.lastName}`.trim(),
           date: day,
           status,
+          adminOverride: !teacher,
+          ...structural,
           ...attribution,
         },
       });
@@ -436,6 +455,228 @@ router.post('/bulk', async (req, res) => {
     res.json(mapWithIdAsCode(results));
   } catch (e) {
     res.status(400).json({ error: e.message });
+  }
+});
+
+/**
+ * THE TEACHERS WHOSE REGISTER A CLASS IS, resolved the one way this codebase
+ * resolves it: Class.classTeacherId, the pastoral assignment.
+ *
+ * NOT the subject teachers in ClassSubjectTeacher. Somebody who teaches this
+ * class mathematics on a Tuesday does not take its attendance, and listing them
+ * on the day view would invite an admin to approve or chase the wrong person.
+ * Same rule as getTeacherClassNames and studentsForStaff — see the note there;
+ * three readers of "whose class is this" have to agree or the reject cascade
+ * sweeps a different set from the one the screen showed.
+ *
+ * A class can carry more than one, and the day view lists all of them.
+ */
+async function classTeachers(schoolId, className) {
+  const classes = await prisma.class.findMany({
+    where: { schoolId, name: String(className), classTeacherId: { not: null } },
+    select: { classTeacher: { select: { id: true, code: true, firstName: true, lastName: true } } },
+  });
+  const byId = new Map();
+  for (const c of classes) if (c.classTeacher) byId.set(c.classTeacher.id, c.classTeacher);
+  return [...byId.values()];
+}
+
+/**
+ * WHAT COLOUR A CALENDAR CELL IS, from the one place that decides it.
+ *
+ *   none          nobody recorded anything     grey, a dash
+ *   all-present   every student marked in      green
+ *   some-absent   at least one marked absent   red
+ *
+ * PARTIAL DAYS COUNT AS RECORDED, not as blank. A register with three of thirty
+ * students marked is a register somebody started, and colouring it grey would
+ * hide that from the person whose job is to notice. If any of what was recorded
+ * is an absence the cell is red; otherwise it is green, and the counts travel
+ * alongside so the detail view can say "12 of 30".
+ */
+function cellState(recorded, present) {
+  if (!recorded) return 'none';
+  return recorded === present ? 'all-present' : 'some-absent';
+}
+
+// ---------------------------------------------------------------------------
+// GET /attendance/calendar?class=&from=&to=   (any admin)
+//
+// One cell per day for one class — what the admin calendar renders.
+//
+// AGGREGATED HERE RATHER THAN IN THE CLIENT. The alternative is shipping every
+// student's every cell for a month and having the screen count them, which is
+// the same data an order of magnitude larger and a second copy of the
+// green/red/grey rule living in TypeScript. The sheet endpoint already does the
+// per-student view; this is deliberately the other shape.
+//
+// DAYS WITH NO STUDENTS AT ALL still appear, as 'none'. A class that was empty
+// on a given day is not a day that failed to happen, and dropping it would leave
+// gaps in a calendar grid that has to line up with a month.
+// ---------------------------------------------------------------------------
+router.get('/calendar', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const className = String(req.query.class || '').trim();
+    if (!className) {
+      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'A class is required.' });
+    }
+
+    const from = startOfDayUTC(req.query.from);
+    const to = startOfDayUTC(req.query.to);
+    if (!from || !to) {
+      return res.status(400).json({ code: 'INVALID_DATE', error: 'A valid date range is required.' });
+    }
+    const days = eachDay(from, to);
+    if (!days.length) return res.status(400).json({ code: 'INVALID_DATE', error: 'Invalid date range.' });
+
+    const students = await prisma.student.findMany({
+      where: { schoolId, class: className },
+      select: { code: true },
+    });
+    const codes = students.map((s) => s.code);
+
+    const records = codes.length
+      ? await prisma.attendanceRecord.findMany({
+          where: {
+            schoolId,
+            type: 'student',
+            personId: { in: codes },
+            date: { gte: days[0], lte: days[days.length - 1] },
+          },
+          select: { date: true, status: true },
+        })
+      : [];
+
+    const tally = new Map();
+    for (const r of records) {
+      const key = toDayKey(r.date);
+      const t = tally.get(key) ?? { recorded: 0, present: 0 };
+      t.recorded += 1;
+      if (isPresent(r.status)) t.present += 1;
+      tally.set(key, t);
+    }
+
+    res.json({
+      class: className,
+      from: toDayKey(from),
+      to: toDayKey(to),
+      studentCount: codes.length,
+      truncated: days.length >= MAX_RANGE_DAYS,
+      days: days.map((d) => {
+        const key = toDayKey(d);
+        const t = tally.get(key) ?? { recorded: 0, present: 0 };
+        return {
+          date: key,
+          state: cellState(t.recorded, t.present),
+          recorded: t.recorded,
+          present: t.present,
+          absent: t.recorded - t.present,
+          total: codes.length,
+        };
+      }),
+    });
+  } catch (e) {
+    console.error('attendance calendar error', e);
+    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /attendance/day?class=&date=   (any admin)
+//
+// One day of one class, in full: the teachers responsible for it and what each
+// of them said about their own day, then every student and who recorded them.
+//
+// THE TWO HALVES ANSWER DIFFERENT QUESTIONS and that is why they are one
+// response. "Was this register taken by somebody the school accepts was here?"
+// is the top half; "and what does it say?" is the bottom. Split across two
+// requests, a screen would render the second before the first and show a
+// register whose author turns out, a moment later, to have been rejected.
+//
+// A teacher with no StaffAttendance row for the day appears with record: null.
+// Nothing ever creates those rows retroactively — see the midnight sweep — so
+// null is the permanent, correct answer for a day somebody said nothing, and the
+// screen shows a dash rather than dropping the person.
+// ---------------------------------------------------------------------------
+router.get('/day', requireAdmin, async (req, res) => {
+  try {
+    const schoolId = req.user.schoolId;
+    const className = String(req.query.class || '').trim();
+    if (!className) {
+      return res.status(400).json({ code: 'MISSING_FIELDS', error: 'A class is required.' });
+    }
+    const day = startOfDayUTC(req.query.date);
+    if (!day) return res.status(400).json({ code: 'INVALID_DATE', error: 'A valid date is required.' });
+
+    const [teachers, students] = await Promise.all([
+      classTeachers(schoolId, className),
+      prisma.student.findMany({
+        where: { schoolId, class: className },
+        select: { code: true, firstName: true, lastName: true },
+        orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+      }),
+    ]);
+
+    const [staffRows, records] = await Promise.all([
+      teachers.length
+        ? prisma.staffAttendance.findMany({
+            where: { schoolId, date: day, staffId: { in: teachers.map((t) => t.id) } },
+          })
+        : [],
+      students.length
+        ? prisma.attendanceRecord.findMany({
+            where: {
+              schoolId, type: 'student', date: day,
+              personId: { in: students.map((s) => s.code) },
+            },
+            select: {
+              personId: true, status: true, createdByName: true,
+              adminOverride: true, markedByTeacherStaffId: true,
+              markedByTeacher: { select: { firstName: true, lastName: true } },
+            },
+          })
+        : [],
+    ]);
+
+    const staffById = new Map(staffRows.map((r) => [r.staffId, r]));
+    const byCode = new Map(records.map((r) => [r.personId, r]));
+
+    res.json({
+      date: toDayKey(day),
+      class: className,
+      teachers: teachers.map((t) => {
+        const r = staffById.get(t.id) ?? null;
+        return {
+          staffId: t.id,
+          staffCode: t.code,
+          name: staffName(t),
+          recordId: r?.id ?? null,
+          status: r?.status ?? null,
+          approvalStatus: r?.approvalStatus ?? null,
+          arrivalTime: r?.arrivalTime ?? null,
+          markedByAdmin: r?.markedByAdmin ?? false,
+        };
+      }),
+      students: students.map((s) => {
+        const r = byCode.get(s.code) ?? null;
+        return {
+          studentId: s.code,
+          name: `${s.firstName} ${s.lastName}`.trim(),
+          // Null means no register was taken for this student that day — which
+          // is not the same as absent, and must not render as it.
+          present: r ? isPresent(r.status) : null,
+          recordedBy: r
+            ? (r.markedByTeacher ? staffName(r.markedByTeacher) : (r.createdByName ?? 'School admin'))
+            : null,
+          byTeacher: r ? r.markedByTeacherStaffId != null : false,
+          adminOverride: r?.adminOverride ?? false,
+        };
+      }),
+    });
+  } catch (e) {
+    console.error('attendance day error', e);
+    res.status(500).json({ code: 'SERVER_ERROR', error: 'Something went wrong on our end.' });
   }
 });
 
